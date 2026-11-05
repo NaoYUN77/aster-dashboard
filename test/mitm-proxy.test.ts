@@ -352,17 +352,17 @@ test("deployment example, MITM overlay, and allowlist stay aligned without real 
     .split("\n")
     .filter((line) => !line.trimStart().startsWith("#"))
     .join("\n");
-  assert.match(overlay, /NODE_EXTRA_CA_CERTS: \/run\/aster\/mitmproxy-ca\.pem/);
+  assert.match(overlay, /NODE_EXTRA_CA_CERTS: \/run\/aster-mitm\/mitmproxy-ca\.pem/);
   assert.match(overlay, /NODE_USE_ENV_PROXY: "1"/);
   assert.match(overlay, /HTTPS_PROXY: http:\/\/aster-mitm:14322/);
   assert.match(overlay, /HTTP_PROXY: http:\/\/aster-mitm:14322/);
   assert.match(overlay, /NO_PROXY: localhost,127\.0\.0\.1,::1,aster-mitm/);
-  assert.match(overlay, /ASTER_MITM_TOKEN_FILE: \/run\/aster\/mitm-proxy-token/);
+  assert.match(overlay, /ASTER_MITM_TOKEN_FILE: \/run\/aster-mitm\/mitm-proxy-token/);
   assert.match(
     overlay,
     /source: \$\{ASTER_MITM_PROXY_TOKEN:-\$\{HOME:-\/root\}\/Aster\/secrets\/openbao\/mitm-proxy-token\}/,
   );
-  assert.match(overlay, /target: \/run\/aster\/mitm-proxy-token/);
+  assert.match(overlay, /target: \/run\/aster-mitm\/mitm-proxy-token/);
   assert.match(overlay, /name: aster_mitm_clients/);
   assert.match(overlay, /ipv4_address: 10\.89\.143\.3/);
   assert.ok(!/aster_default/.test(overlay), "the app must not join a shared network");

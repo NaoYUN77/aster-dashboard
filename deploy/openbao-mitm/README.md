@@ -102,7 +102,7 @@ MITM 只把客户端**显式发出**的 `__vault_<NAME>__` 换成 OpenBao 中的
 
 > **生产 CA 信任正式做法**：
 > - 严禁在生产环境使用 `ssl_insecure` 或 `NODE_TLS_REJECT_UNAUTHORIZED=0`（应用配置校验 `readConfig` 与 `configureEnvProxy` 也会直接拒绝 `NODE_TLS_REJECT_UNAUTHORIZED=0`）。
-> - 将 `aster-mitm` 生成的纯公钥证书导出到 `~/Aster/secrets/openbao/mitmproxy-ca.pem`（仅包含 `-----BEGIN CERTIFICATE-----`，不含 `PRIVATE KEY`），通过 `docker-compose.mitm.yml` 只读挂载到容器内 `/run/aster/mitmproxy-ca.pem`，并设置 `NODE_EXTRA_CA_CERTS=/run/aster/mitmproxy-ca.pem`。
+> - 将 `aster-mitm` 生成的纯公钥证书导出到 `~/Aster/secrets/openbao/mitmproxy-ca.pem`（仅包含 `-----BEGIN CERTIFICATE-----`，不含 `PRIVATE KEY`），通过 `docker-compose.mitm.yml` 只读挂载到容器内 `/run/aster-mitm/mitmproxy-ca.pem`，并设置 `NODE_EXTRA_CA_CERTS=/run/aster-mitm/mitmproxy-ca.pem`。
 > - 若生产机器上证书放在其他路径，可通过环境变量 `ASTER_MITM_CA_CERT=/actual/path/to/ca-cert.pem` 覆盖挂载源路径；代理 token 同理用 `ASTER_MITM_PROXY_TOKEN=/actual/path/to/mitm-proxy-token` 覆盖。两个挂载都设置了 `create_host_path: false`，文件缺失时 `docker compose up` 直接失败，而不是创建空目录。
 
 ## 1. 启动或核对 OpenBao 与 MITM（若尚未运行）
@@ -167,8 +167,8 @@ ASTER_OPENBAO_SECRETS=$HOME/Aster/secrets/openbao ./bootstrap.sh
 - `HTTPS_PROXY=http://aster-mitm:14322`、`HTTP_PROXY=http://aster-mitm:14322`（本身不含凭据；`configureEnvProxy()` 启动时把 token 注入 URL userinfo）
 - `NO_PROXY=localhost,127.0.0.1,::1,aster-mitm`（只保留回环与代理自身；OpenBao 不在应用的任何可达网络上）
 - `NODE_USE_ENV_PROXY=1`（配合应用启动时的 `configureEnvProxy()` 与 `TelegramClient` 的 `HttpsAgent({ keepAlive: true, proxyEnv })`，使 LLM、`web_search`/`web_fetch`、MCP 与 grammY Telegram Bot API 全部走代理）
-- `NODE_EXTRA_CA_CERTS=/run/aster/mitmproxy-ca.pem`（只读挂载 `${ASTER_MITM_CA_CERT:-~/Aster/secrets/openbao/mitmproxy-ca.pem}`）
-- `ASTER_MITM_TOKEN_FILE=/run/aster/mitm-proxy-token`（只读挂载 `${ASTER_MITM_PROXY_TOKEN:-~/Aster/secrets/openbao/mitm-proxy-token}`）
+- `NODE_EXTRA_CA_CERTS=/run/aster-mitm/mitmproxy-ca.pem`（只读挂载 `${ASTER_MITM_CA_CERT:-~/Aster/secrets/openbao/mitmproxy-ca.pem}`）
+- `ASTER_MITM_TOKEN_FILE=/run/aster-mitm/mitm-proxy-token`（只读挂载 `${ASTER_MITM_PROXY_TOKEN:-~/Aster/secrets/openbao/mitm-proxy-token}`）
 - 只加入内部网络 `aster_mitm_clients`（固定地址 `10.89.143.3`）；没有默认网络，也没有直连公网的路由
 
 ## 3. 验证与验收步骤
@@ -195,7 +195,7 @@ docker exec aster-production-personal-agent-1 node -e '
   const fs = require("node:fs");
   const proxy = new URL(process.env.HTTPS_PROXY);
   proxy.username = "aster";
-  proxy.password = fs.readFileSync("/run/aster/mitm-proxy-token", "utf8").trim();
+  proxy.password = fs.readFileSync("/run/aster-mitm/mitm-proxy-token", "utf8").trim();
   process.env.HTTPS_PROXY = process.env.HTTP_PROXY = proxy.toString();
   require("node:http").setGlobalProxyFromEnv(process.env);
   fetch("https://api.deepseek.com/v1/models", {
@@ -208,7 +208,7 @@ docker exec aster-production-personal-agent-1 node -e '
   const fs = require("node:fs");
   const proxy = new URL(process.env.HTTPS_PROXY);
   proxy.username = "aster";
-  proxy.password = fs.readFileSync("/run/aster/mitm-proxy-token", "utf8").trim();
+  proxy.password = fs.readFileSync("/run/aster-mitm/mitm-proxy-token", "utf8").trim();
   process.env.HTTPS_PROXY = process.env.HTTP_PROXY = proxy.toString();
   require("node:http").setGlobalProxyFromEnv(process.env);
   fetch("https://api.deepseek.com/v1/tools/search", {
@@ -226,7 +226,7 @@ docker exec aster-production-personal-agent-1 node -e '
   const fs = require("node:fs");
   const proxy = new URL(process.env.HTTPS_PROXY);
   proxy.username = "aster";
-  proxy.password = fs.readFileSync("/run/aster/mitm-proxy-token", "utf8").trim();
+  proxy.password = fs.readFileSync("/run/aster-mitm/mitm-proxy-token", "utf8").trim();
   process.env.HTTPS_PROXY = process.env.HTTP_PROXY = proxy.toString();
   require("node:http").setGlobalProxyFromEnv(process.env);
   fetch("https://example.com/", {
@@ -267,7 +267,7 @@ docker exec aster-production-personal-agent-1 node -e '
   const fs = require("node:fs");
   const proxy = new URL(process.env.HTTPS_PROXY);
   proxy.username = "aster";
-  proxy.password = fs.readFileSync("/run/aster/mitm-proxy-token", "utf8").trim();
+  proxy.password = fs.readFileSync("/run/aster-mitm/mitm-proxy-token", "utf8").trim();
   process.env.HTTPS_PROXY = process.env.HTTP_PROXY = proxy.toString();
   require("node:http").setGlobalProxyFromEnv(process.env);
   fetch("http://10.89.82.2:8200/v1/sys/health", { signal: AbortSignal.timeout(5000) })
@@ -281,7 +281,7 @@ docker exec aster-production-personal-agent-1 node -e '
   const fs = require("node:fs");
   const proxy = new URL(process.env.HTTPS_PROXY);
   proxy.username = "aster";
-  proxy.password = fs.readFileSync("/run/aster/mitm-proxy-token", "utf8").trim();
+  proxy.password = fs.readFileSync("/run/aster-mitm/mitm-proxy-token", "utf8").trim();
   process.env.HTTPS_PROXY = process.env.HTTP_PROXY = proxy.toString();
   require("node:http").setGlobalProxyFromEnv(process.env);
   fetch("https://10.89.82.2:8200/v1/sys/health", { signal: AbortSignal.timeout(5000) })

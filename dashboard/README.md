@@ -83,3 +83,18 @@ file written by the model's bash tool is visible to a script at `/workspace/<nam
 - Sandbox sessions are connection-scoped and not replayed: a reconnect starts new sessions.
 - Cancelling a request stops its RPC execution. A command whose outcome is unknown is reported as
   such and never re-run automatically.
+
+## With MITM (internal network)
+
+Docker drops host port publishes when every network on the app is `internal: true`.
+Use the extra overlay so a host-network `console-ingress` owns loopback `127.0.0.1:8787`
+and forwards to the app at `10.89.143.3:8787`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.mitm.yml \
+  -f dashboard/docker-compose.dashboard.yml -f dashboard/docker-compose.mitm.yml \
+  --env-file dashboard/.env up -d --no-build
+```
+
+Set `CONSOLE_INGRESS_TARGET` only if the MITM client address is not `10.89.143.3:8787`.
+

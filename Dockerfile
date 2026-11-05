@@ -25,6 +25,8 @@ COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 # The local console page is served from the image; it is static and needs no build step.
 COPY --chown=node:node dashboard/web ./dashboard/web
+# Loopback ingress used when the app has no publishable network (dashboard/docker-compose.mitm.yml).
+COPY --chown=node:node dashboard/console-ingress.mjs ./dashboard/console-ingress.mjs
 USER node
 VOLUME ["/data"]
 CMD ["flock", "--no-fork", "--nonblock", "/data/app.lock", "node", "dist/src/main.js"]
