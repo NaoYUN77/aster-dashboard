@@ -119,7 +119,7 @@ export class PtcExecutor implements PtcHost {
     return { ...this.options.probe.checks, usable: this.usable };
   }
 
-  async openSession(sessionId: string, jobId: string, workspaceReady: boolean): Promise<PtcWorkspaceState> {
+  async openSession(sessionId: string, jobId: string, workspaceReady: boolean, _cwd?: string): Promise<PtcWorkspaceState> {
     if (!this.usable) throw new PtcHostError("unavailable", "the PTC sandbox is not usable on this host", "not_started");
     if (this.sessions.has(sessionId)) {
       throw new PtcHostError("busy", "session already exists", "not_started");

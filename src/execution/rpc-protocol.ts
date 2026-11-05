@@ -483,6 +483,19 @@ function isSafeReason(value: unknown): value is string {
   return typeof value === "string" && byteLength(value) <= RPC_MAX_REASON_BYTES;
 }
 
+/** A virtual workspace path: absolute, no traversal, no control characters, never the root itself. */
+function isSafeWorkspacePath(value: unknown): value is string {
+  return typeof value === "string"
+    && value.startsWith("/")
+    && value !== "/"
+    && byteLength(value) <= 4_096
+    && !value.includes("\0")
+    && !value.includes("\r")
+    && !value.includes("\n")
+    && !value.includes("\\")
+    && !value.split("/").includes("..");
+}
+
 function isSafeCorrelationId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && byteLength(value) <= 128;
 }
@@ -1191,12 +1204,18 @@ function validateRequestPayload(method: RpcMethod, payload: unknown): PayloadRes
       return unknown === undefined ? { ok: true, value: payload } : invalid(`unknown payload field: ${unknown}`);
     }
     case "session.open": {
-      const unknown = unexpectedKey(payload, ["sessionId", "jobId", "workspaceReady"]);
+      const unknown = unexpectedKey(payload, ["sessionId", "jobId", "workspaceReady", "cwd"]);
       if (unknown !== undefined) return invalid(`unknown session.open field: ${unknown}`);
       if (!isSafeId(payload.sessionId)) return invalid("sessionId is invalid");
       if (Object.hasOwn(payload, "jobId") && !isSafeJobId(payload.jobId)) return invalid("jobId is invalid");
       if (Object.hasOwn(payload, "workspaceReady") && typeof payload.workspaceReady !== "boolean") {
         return invalid("workspaceReady must be a boolean");
+      }
+      // Same-host sandboxes root each session in the bot workspace the host names. The value is a
+      // virtual POSIX path; the agent maps it below its own configured workspace root and refuses
+      // anything that is not already a direct child of it.
+      if (Object.hasOwn(payload, "cwd") && !isSafeWorkspacePath(payload.cwd)) {
+        return invalid("cwd is invalid");
       }
       return { ok: true, value: payload };
     }

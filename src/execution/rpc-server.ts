@@ -369,6 +369,7 @@ class AgentConnection {
       this.respondError(frame.id, "busy", "maximum sessions reached", "not_started");
       return;
     }
+    const cwd = typeof frame.payload.cwd === "string" ? frame.payload.cwd : undefined;
     const now = (this.options.now ?? nowMs)();
     const direct = jobId === undefined && this.options.direct?.enabled === true;
     const session: Session = {
@@ -380,16 +381,17 @@ class AgentConnection {
       requests: new Set(),
     };
     let workspaceReady: unknown;
-    let directState: { readonly sharedMode: "ro" | "rw"; readonly tmpPath: string } | undefined;
+    let directState: { readonly sharedMode: "ro" | "rw"; readonly tmpPath: string; readonly workspace?: string } | undefined;
     try {
       if (jobId !== undefined && this.options.ptc?.enabled === true) {
         workspaceReady = await this.options.ptc.openSession(
           sessionId,
           jobId,
           frame.payload.workspaceReady === true,
+          cwd,
         );
       } else if (direct && this.options.direct !== undefined) {
-        directState = await this.options.direct.openSession(sessionId);
+        directState = await this.options.direct.openSession(sessionId, cwd);
       }
     } catch (error) {
       const failure = this.hostFailure(error);
@@ -406,7 +408,14 @@ class AgentConnection {
       // Only virtual paths cross this boundary: the host tmp directory stays on the agent.
       ...(directState === undefined
         ? {}
-        : { direct: { sharedMode: directState.sharedMode, workspace: "/shared", tmp: "/tmp" } }),
+        : {
+            direct: {
+              sharedMode: directState.sharedMode,
+              // Virtual paths only; the host directory never crosses this boundary.
+              workspace: directState.workspace ?? "/shared",
+              tmp: "/tmp",
+            },
+          }),
       limits: {
         maxSessions: this.maxSessions,
         maxConcurrent: this.maxConcurrent,

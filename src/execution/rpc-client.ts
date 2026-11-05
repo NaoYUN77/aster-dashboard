@@ -128,7 +128,7 @@ export type RpcSessionResult = {
   readonly executionId: string;
   readonly jobId?: string;
   readonly workspaceReady?: PtcWorkspaceState;
-  /** Present when the session is a direct session over `/shared` and its private `/tmp`. */
+  /** Present when the session is a direct session over its workspace and a private `/tmp`. */
   readonly direct?: {
     readonly sharedMode: "ro" | "rw";
     readonly workspace: string;
@@ -206,6 +206,8 @@ export class RpcExecutionClient {
     options: {
       readonly jobId?: string;
       readonly workspaceReady?: boolean;
+      /** Virtual workspace the session is rooted in; omitting it keeps the agent's default. */
+      readonly cwd?: string;
       readonly deadlineMs?: number;
       readonly signal?: AbortSignal;
     } = {},
@@ -214,6 +216,7 @@ export class RpcExecutionClient {
       sessionId,
       ...(options.jobId === undefined ? {} : { jobId: options.jobId }),
       ...(options.workspaceReady === undefined ? {} : { workspaceReady: options.workspaceReady }),
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     }, {
       sessionId,
       ...(options.jobId === undefined ? {} : { jobId: options.jobId }),

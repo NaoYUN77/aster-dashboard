@@ -1,13 +1,14 @@
 // The `ExecutionEnv` for a direct RPC session: one command per `exec`, and file primitives over the
-// same session's `/shared` and `/tmp` namespaces.
+// same session's workspace and `/tmp` namespaces.
 //
 // Interface: pi-durable's built-in tools see a normal environment. `exec` becomes one `execute`
 // request with `executor: "bash"`; the file methods delegate to `RemoteFileSystem`, which uses the
 // `file.*` requests. Nothing in this environment contacts the host directly — the RPC client is
 // shared with the gateway and owns framing, deadlines and cancellation.
 //
-// Inputs: a host-created session id, the client, and the configured cwd (a virtual path inside
-// `/shared`). The model supplies only commands, environment variables and timeouts.
+// Inputs: a host-created session id, the client, and the configured cwd (a virtual path inside the
+// session workspace, `/shared` for the legacy execution agent). The model supplies only commands,
+// environment variables and timeouts.
 //
 // Errors: validation failures and transport failures become `ExecutionError`s; a write whose
 // outcome is unknown never becomes a success.
@@ -52,7 +53,7 @@ const DEFAULT_WINDOW: PtcOutputWindow = { maxBytes: 32 * 1024, maxLines: 1_000, 
 export type DirectEnvClient = {
   openSession(
     sessionId: string,
-    options?: { readonly deadlineMs?: number; readonly signal?: AbortSignal },
+    options?: { readonly cwd?: string; readonly deadlineMs?: number; readonly signal?: AbortSignal },
   ): Promise<RpcSessionResult>;
   closeSession(
     sessionId: string,
@@ -78,7 +79,13 @@ export type DirectEnvClient = {
 export type RemoteRpcEnvOptions = {
   readonly client: DirectEnvClient;
   readonly sessionId: string;
-  /** Virtual working directory; must be `/shared` or a path below it. */
+  /**
+   * Virtual workspace the agent roots this session in. A same-host sandbox exposes per-bot
+   * workspaces (`/workspaces/<bot>`); the legacy execution agent exposes `/shared`. The agent's
+   * answer is authoritative once the session opens.
+   */
+  readonly workspace?: string;
+  /** Virtual working directory; must be the workspace itself or a path below it. */
   readonly cwd: string;
   readonly defaultTimeoutSeconds: number;
   readonly maxTimeoutSeconds: number;
@@ -99,10 +106,12 @@ function clampWindow(window: PtcOutputWindow | undefined): PtcOutputWindow {
   };
 }
 
-function isSharedPath(value: string): boolean {
+/** True when `value` is `root` itself or a clean path below it. */
+export function isWorkspacePath(value: string, root: string): boolean {
   const normalized = value.length > 1 && value.endsWith("/") ? value.slice(0, -1) : value;
-  return normalized === "/shared"
-    || (normalized.startsWith("/shared/")
+  const base = root.length > 1 && root.endsWith("/") ? root.slice(0, -1) : root;
+  return normalized === base
+    || (normalized.startsWith(`${base}/`)
       && !normalized.includes("\0")
       && !normalized.includes("\\")
       && !normalized.split("/").includes(".."));
@@ -153,16 +162,19 @@ export class RemoteRpcExecutionEnv implements ExecutionEnv {
   readonly #defaultTimeoutSeconds: number;
   readonly #maxTimeoutMs: number;
   readonly #files: RemoteFileSystem;
+  #workspaceRoot: string;
   #opening: Promise<void> | undefined;
   #reopening: Promise<void> | undefined;
   #closed = false;
 
   constructor(options: RemoteRpcEnvOptions) {
-    if (!isSharedPath(options.cwd)) {
-      throw new Error("a direct session's cwd must be inside /shared");
+    const requestedRoot = options.workspace ?? "/shared";
+    if (!isWorkspacePath(options.cwd, requestedRoot)) {
+      throw new Error(`a direct session's cwd must be inside ${requestedRoot}`);
     }
     this.id = `direct:${options.sessionId}`;
     this.cwd = options.cwd;
+    this.#workspaceRoot = requestedRoot;
     this.#client = options.client;
     this.#sessionId = options.sessionId;
     this.#defaultTimeoutSeconds = options.defaultTimeoutSeconds;
@@ -182,12 +194,26 @@ export class RemoteRpcExecutionEnv implements ExecutionEnv {
   async #open(): Promise<void> {
     if (this.#closed) throw new RpcClientError("unavailable", "the direct session is closed");
     this.#opening ??= (async () => {
-      const result = await this.#client.openSession(this.#sessionId);
+      const result = await this.#client.openSession(this.#sessionId, { cwd: this.#workspaceRoot });
       if (result.direct === undefined) {
         await this.#client.closeSession(this.#sessionId).catch(() => undefined);
         throw new RpcClientError("not_implemented", "the execution agent did not open a direct session", {
           outcome: "not_started",
         });
+      }
+      // The agent is authoritative: a host that ignored the requested root (the legacy `/shared`
+      // sandbox) reports its own, and every later command is checked against that one.
+      const reported = result.direct.workspace;
+      if (typeof reported === "string" && reported.startsWith("/") && reported !== this.#workspaceRoot) {
+        this.#workspaceRoot = reported;
+        if (!isWorkspacePath(this.cwd, reported)) {
+          await this.#client.closeSession(this.#sessionId).catch(() => undefined);
+          throw new RpcClientError(
+            "invalid_request",
+            `the direct session workspace ${reported} does not contain the working directory`,
+            { outcome: "not_started" },
+          );
+        }
       }
     })();
     try {
@@ -256,8 +282,11 @@ export class RemoteRpcExecutionEnv implements ExecutionEnv {
     const cwd = requested.startsWith("/") ? posix.normalize(requested) : posix.resolve(this.cwd, requested);
     const cwdError = validateCwd(cwd);
     if (cwdError !== undefined) return err(new ExecutionError("unknown", `Invalid working directory: ${cwdError}`));
-    if (!isSharedPath(cwd)) {
-      return err(new ExecutionError("unknown", "The direct session runs commands only inside /shared"));
+    if (!isWorkspacePath(cwd, this.#workspaceRoot)) {
+      return err(new ExecutionError(
+        "unknown",
+        `The direct session runs commands only inside ${this.#workspaceRoot}`,
+      ));
     }
     // pi-durable passes seconds as any finite number; the wire contract uses whole milliseconds, so
     // a sub-second request rounds up rather than silently becoming zero.

@@ -42,7 +42,11 @@ export type PtcHost = {
   readonly enabled: boolean;
   readonly isolation: PtcIsolationState;
   preflight(): Promise<Record<string, boolean | null>>;
-  openSession(sessionId: string, jobId: string, workspaceReady: boolean): Promise<PtcWorkspaceState>;
+  /**
+   * `cwd` names the virtual workspace a same-host sandbox roots the session in. Hosts that derive
+   * the workspace from the job id ignore it.
+   */
+  openSession(sessionId: string, jobId: string, workspaceReady: boolean, cwd?: string): Promise<PtcWorkspaceState>;
   closeSession(sessionId: string): Promise<void>;
   startVm(input: {
     readonly sessionId: string;
@@ -68,12 +72,20 @@ export type PtcHost = {
   cancel(sessionId: string, requestId: string): void;
 };
 
-/** A direct session's host, which owns `/shared` and one private `/tmp` directory per session. */
+/**
+ * A direct session's host, which owns the session workspace and one private `/tmp` directory per
+ * session. The legacy bwrap host exposes `/shared`; a same-host container sandbox roots each
+ * session in the virtual `cwd` it was opened with.
+ */
 export type DirectHost = {
   readonly enabled: boolean;
   readonly sharedMode: "none" | "ro" | "rw";
   preflight(): Promise<Record<string, boolean | null>>;
-  openSession(sessionId: string): Promise<{ readonly sharedMode: "ro" | "rw"; readonly tmpPath: string }>;
+  openSession(sessionId: string, cwd?: string): Promise<{
+    readonly sharedMode: "ro" | "rw";
+    readonly tmpPath: string;
+    readonly workspace?: string;
+  }>;
   closeSession(sessionId: string): Promise<void>;
   execute(input: {
     readonly sessionId: string;

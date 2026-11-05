@@ -85,7 +85,7 @@ export class DirectExecutor implements DirectHost {
     };
   }
 
-  async openSession(sessionId: string): Promise<{ sharedMode: "ro" | "rw"; tmpPath: string }> {
+  async openSession(sessionId: string, _cwd?: string): Promise<{ sharedMode: "ro" | "rw"; tmpPath: string; workspace: string }> {
     if (!this.enabled) {
       throw new PtcHostError("unavailable", "direct execution is not available on this host", "not_started");
     }
@@ -109,7 +109,7 @@ export class DirectExecutor implements DirectHost {
       }),
     };
     this.#sessions.set(sessionId, session);
-    return { sharedMode: this.sharedMode === "rw" ? "rw" : "ro", tmpPath };
+    return { sharedMode: this.sharedMode === "rw" ? "rw" : "ro", tmpPath, workspace: "/shared" };
   }
 
   async closeSession(sessionId: string): Promise<void> {
