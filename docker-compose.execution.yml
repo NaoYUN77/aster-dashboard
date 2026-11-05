@@ -1,0 +1,86 @@
+# Phase 1 of the control/execution split: tool commands run on a second VPS through a broker that
+# lives on the Aster host. Layer it on top of the base deployment, and on top of the MITM overlay
+# when that is in use:
+#   docker compose -f docker-compose.yml -f docker-compose.mitm.yml \
+#     -f docker-compose.execution.yml --env-file .env up -d
+#
+# The application keeps only aster_mitm_clients (when MITM is enabled). It cannot route to the
+# execution host. The broker is the only component that talks to EXECUTION_HOST, and it does so from the
+# host network namespace, so its SSH source address is the Aster host (for example CONTROL_HOST).
+#
+# The broker never joins a Compose network. Control plane and broker share one Unix socket through a
+# host directory; no TCP port is published and no network route is added:
+#   EXECUTION_SOCKET_DIR (default ~/Aster/run/execution) must exist and be owned by uid/gid 1000
+#   (the `node` user in the image), with mode 0700. Example:
+#     install -d -m 0700 -o 1000 -g 1000 ~/Aster/run/execution
+#
+# SSH material is host-side and read-only; no key belongs in the repository or in .env:
+#   EXECUTION_SSH_HOST=EXECUTION_HOST
+#   EXECUTION_SSH_USER=<execution user>
+#   EXECUTION_SSH_KEY_FILE=~/Aster/secrets/execution/id_ed25519
+#   EXECUTION_SSH_KNOWN_HOSTS_FILE=~/Aster/secrets/execution/known_hosts
+# Optional: EXECUTION_SSH_PORT (default 22) and EXECUTION_REMOTE_CWD (default /home/aster/workspace).
+services:
+  personal-agent:
+    environment:
+      EXECUTION_MODE: remote
+      EXECUTION_BROKER_SOCKET: /run/aster/execution/broker.sock
+      EXECUTION_REMOTE_CWD: ${EXECUTION_REMOTE_CWD:-/home/aster/workspace}
+      EXECUTION_DEFAULT_TIMEOUT_SECONDS: ${EXECUTION_DEFAULT_TIMEOUT_SECONDS:-300}
+      EXECUTION_MAX_TIMEOUT_SECONDS: ${EXECUTION_MAX_TIMEOUT_SECONDS:-3600}
+    volumes:
+      - type: bind
+        source: ${EXECUTION_SOCKET_DIR:-${HOME:-/root}/Aster/run/execution}
+        target: /run/aster/execution
+        bind:
+          create_host_path: false
+
+  execution-broker:
+    image: ${ASTER_IMAGE:-aster:local}
+    # Same image, different entrypoint: the broker is a separate process and receives no app
+    # environment, Telegram token or model key.
+    entrypoint: ["node", "dist/src/execution/broker-main.js"]
+    restart: unless-stopped
+    # SSH originates from the host namespace (the Aster host's private address), never from the
+    # application's MITM-only network. The broker listens on the shared Unix socket, not on TCP.
+    network_mode: host
+    environment:
+      HOME: /tmp
+      EXECUTION_BROKER_SOCKET: /run/aster/execution/broker.sock
+      EXECUTION_SSH_HOST: ${EXECUTION_SSH_HOST:?set EXECUTION_SSH_HOST (for example EXECUTION_HOST)}
+      EXECUTION_SSH_USER: ${EXECUTION_SSH_USER:?set EXECUTION_SSH_USER for the execution host}
+      EXECUTION_SSH_PORT: ${EXECUTION_SSH_PORT:-22}
+      EXECUTION_SSH_KEY_PATH: /run/aster/ssh/id_execution
+      EXECUTION_SSH_KNOWN_HOSTS_PATH: /run/aster/ssh/known_hosts
+    volumes:
+      - type: bind
+        source: ${EXECUTION_SOCKET_DIR:-${HOME:-/root}/Aster/run/execution}
+        target: /run/aster/execution
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EXECUTION_SSH_KEY_FILE:?set EXECUTION_SSH_KEY_FILE to the host key path}
+        target: /run/aster/ssh/id_execution
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EXECUTION_SSH_KNOWN_HOSTS_FILE:?set EXECUTION_SSH_KNOWN_HOSTS_FILE to the host known_hosts path}
+        target: /run/aster/ssh/known_hosts
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    mem_limit: 128m
+    pids_limit: 64
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

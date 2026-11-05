@@ -1,0 +1,48 @@
+{
+  "name": "personal-agent-base-durable",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.19.0 <25"
+  },
+  "scripts": {
+    "dev": "tsx --env-file=.env src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "start": "node --env-file=.env dist/src/main.js",
+    "test": "tsx --test test/*.test.ts",
+    "test:topology": "node scripts/ci/compose-topology.mjs",
+    "release:preflight": "tsx src/release-preflight.ts",
+    "deployment:environment": "node dist/src/deployment-environment-check.js",
+    "deployment:volume-preflight": "node dist/src/deployment-volume-preflight.js",
+    "deliveries": "node --env-file-if-exists=.env dist/src/deliveries.js",
+    "reminders": "node --env-file-if-exists=.env dist/src/reminders-cli.js",
+    "mcp:auth": "node --env-file-if-exists=.env dist/src/mcp-auth.js",
+    "mcp:check": "node --env-file-if-exists=.env dist/src/mcp-check.js",
+    "execution:broker": "node --env-file-if-exists=.env dist/src/execution/broker-main.js",
+    "execution:rpc-agent": "node --env-file-if-exists=.env dist/src/execution/rpc-main.js",
+    "execution:rpc-gateway": "node --env-file-if-exists=.env dist/src/execution/rpc-gateway-main.js",
+    "execution:rpc-e2e": "node --env-file-if-exists=.env dist/src/execution/rpc-e2e.js"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.3.0",
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-codemode": "1.3.0",
+    "@earendil-works/pi-durable": "1.3.0",
+    "@earendil-works/pi-mcp": "1.3.0",
+    "@langfuse/otel": "6.1.1",
+    "@langfuse/tracing": "6.1.1",
+    "@opentelemetry/api": "1.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.223.0",
+    "@opentelemetry/sdk-trace-node": "2.12.0",
+    "abort-controller": "3.0.0",
+    "grammy": "1.46.0",
+    "typebox": "1.3.27"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}

@@ -1,0 +1,53 @@
+# Routes the app's outbound HTTPS through the Aster MITM proxy (deploy/openbao-mitm), which replaces
+# __vault_<NAME>__ placeholders with OpenBao values (KV path secret/aster/<NAME>).
+# Apply on top of docker-compose.yml after the OpenBao/MITM stack is running:
+#   docker compose -f docker-compose.yml -f docker-compose.mitm.yml --env-file .env up -d
+# Rollback: remove `-f docker-compose.mitm.yml` and restore plaintext secret values in .env.
+#
+# Network isolation: the app attaches only to aster_mitm_clients, an internal network shared with the
+# MITM proxy. It has no default network and no direct route to the internet, so it cannot bypass the
+# proxy. The fixed address below must match ASTER_PROXY_CLIENT_ALLOW in deploy/openbao-mitm/compose.yml.
+#
+# CA trust: mounts the public MITM CA certificate (default ~/Aster/secrets/openbao/mitmproxy-ca.pem,
+# override with ASTER_MITM_CA_CERT) read-only and sets NODE_EXTRA_CA_CERTS. That file must contain
+# only the public certificate (exported from mitmproxy-ca-cert.pem), never the CA private key.
+#
+# Proxy authentication: mounts the proxy token file (default
+# ~/Aster/secrets/openbao/mitm-proxy-token, override with ASTER_MITM_PROXY_TOKEN) and points
+# ASTER_MITM_TOKEN_FILE at it. The token is never in .env or in the environment; configureEnvProxy()
+# reads it and puts it into the proxy URL userinfo at startup.
+services:
+  personal-agent:
+    environment:
+      HTTPS_PROXY: http://aster-mitm:14322
+      HTTP_PROXY: http://aster-mitm:14322
+      # Only loopback and the proxy itself are direct; everything else must go through the proxy.
+      NO_PROXY: localhost,127.0.0.1,::1,aster-mitm
+      # Node 24 reads HTTP(S)_PROXY for fetch and https.request with this flag (and configureEnvProxy()).
+      NODE_USE_ENV_PROXY: "1"
+      # Trust the MITM CA certificate on top of Node's bundled root CAs.
+      NODE_EXTRA_CA_CERTS: /run/aster/mitmproxy-ca.pem
+      # The proxy rejects unauthenticated clients; configureEnvProxy() injects this token at startup.
+      ASTER_MITM_TOKEN_FILE: /run/aster/mitm-proxy-token
+    volumes:
+      - type: bind
+        source: ${ASTER_MITM_CA_CERT:-${HOME:-/root}/Aster/secrets/openbao/mitmproxy-ca.pem}
+        target: /run/aster/mitmproxy-ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ASTER_MITM_PROXY_TOKEN:-${HOME:-/root}/Aster/secrets/openbao/mitm-proxy-token}
+        target: /run/aster/mitm-proxy-token
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      mitm:
+        ipv4_address: 10.89.143.3
+networks:
+  mitm:
+    # Internal network created by deploy/openbao-mitm (compose project "aster"). No default
+    # network is attached, so this container cannot reach anything except the proxy.
+    name: aster_mitm_clients
+    external: true

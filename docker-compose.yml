@@ -1,0 +1,38 @@
+# Base single-service deployment. To route outbound HTTPS through the OpenBao + MITM proxy
+# (http://aster-mitm:14322 on aster_mitm_clients, authenticated with the proxy token file) with
+# __vault_<NAME>__ placeholders in .env, layer docker-compose.mitm.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.mitm.yml --env-file .env up -d
+# Rollback: drop `-f docker-compose.mitm.yml` and restore plaintext values in .env.
+services:
+  personal-agent:
+    image: ${ASTER_IMAGE:-aster:local}
+    restart: unless-stopped
+    # In MITM mode, secret variables in .env use __vault_<NAME>__ placeholders (for example
+    # TELEGRAM_BOT_TOKEN=__vault_TELEGRAM_BOT_TOKEN__, DEEPSEEK_API_KEY=__vault_DEEPSEEK_API_KEY__,
+    # DEEPSEEK_WEB_API_KEY=__vault_DEEPSEEK_WEB_API_KEY__); non-secret settings (TELEGRAM_OWNER_ID,
+    # MODEL_PROVIDER, MODEL_ID, DATA_DIR, MEMORY_*) keep their normal values.
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - personal-agent-data:/data
+    mem_limit: 1g
+    pids_limit: 128
+    init: true
+    stop_grace_period: 45s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  personal-agent-data:
+    # Keep the deployed volume name across the Aster image rename. The deployment environment
+    # check renders with ASTER_APP_VOLUME set from the environment description; the default
+    # keeps the name existing deployments already use.
+    name: ${ASTER_APP_VOLUME:-personal-agent-data}

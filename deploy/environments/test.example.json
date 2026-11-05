@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "kind": "aster.deployment-environment",
+  "environment": "test",
+  "composeProject": "aster-test",
+  "volumes": {
+    "app": "aster-test-app-data"
+  },
+  "identity": {
+    "botId": "1000000001"
+  }
+}

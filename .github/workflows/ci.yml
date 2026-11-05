@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  pull_request:
+    # Documentation and repository metadata cannot change a build input: the
+    # Dockerfiles exclude docs/ and never copy markdown. Path filters stay off
+    # for anything that can affect an image, test or workflow.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: Node.js
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  containers:
+    name: Final image and deployment checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ASTER_IMAGE: aster:ci
+      ASTER_DEPLOYMENT_TOOLS_IMAGE: aster-deployment-tools:ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Build application image
+        run: docker build --tag "$ASTER_IMAGE" .
+      - name: Verify offline volume preflight on Linux
+        run: |
+          bash -n scripts/deploy/*.sh scripts/ci/deployment-rehearsal.sh scripts/ci/topology-on-docker-host.sh
+          npm ci
+          npm run build
+          docker run --rm --pull never --network none --read-only --user 0:0 \
+            --cap-drop ALL --cap-add CHOWN --cap-add FOWNER --cap-add DAC_OVERRIDE \
+            --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777 \
+            --mount "type=bind,source=$PWD/dist,target=/verification,readonly" \
+            --entrypoint node "$ASTER_IMAGE" --test /verification/test/deployment-volume-preflight.test.js
+      - name: Verify stopped read-only WAL without modifying sources
+        env:
+          ASTER_TEST_DOCKER_VOLUME_PREFLIGHT: "1"
+          ASTER_VOLUME_TEST_IMAGE: aster:ci
+        run: node --test --test-name-pattern='Docker read-only residual WAL' dist/test/deployment-volume-preflight.test.js
+      - name: Build disposable host rehearsal operator
+        run: docker build --file scripts/ci/deployment-tools.Dockerfile --build-arg "APP_IMAGE=$ASTER_IMAGE" --tag "$ASTER_DEPLOYMENT_TOOLS_IMAGE" .
+      - name: Verify final Compose topology through Docker-only host entrypoint
+        run: bash scripts/ci/topology-on-docker-host.sh

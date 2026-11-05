@@ -1,0 +1,78 @@
+# Whole-line RPC: the app container keeps its MITM-only internal network and reaches the execution
+# VPS through a host-network gateway over a Unix socket (ADR-0021). Layer it on the base and MITM
+# overlays; do not layer docker-compose.execution.yml, which starts the legacy SSH broker:
+#   docker compose -f docker-compose.yml -f docker-compose.mitm.yml \
+#     -f docker-compose.rpc.yml --env-file .env up -d personal-agent rpc-gateway
+#
+# Ownership split:
+#   - the app container holds no execution certificate and can only open the Unix socket;
+#   - rpc-gateway runs in the host network namespace with the `aster-gateway` client certificate,
+#     dials the agent over private TCP with mutual TLS, and relays frames byte for byte;
+#   - the execution agent still enforces the client CN, its own bind address and the sandbox limits.
+#
+# Host paths (defaults mirror docker-compose.execution.yml):
+#   EXECUTION_SOCKET_DIR  shared with the app; must exist, uid/gid 1000, mode 0700
+#   EXECUTION_RPC_CERT_DIR  read-only directory holding ca.crt, client.crt and client.key
+services:
+  personal-agent:
+    environment:
+      EXECUTION_MODE: remote
+      EXECUTION_REMOTE_TRANSPORT: rpc
+      EXECUTION_REMOTE_CWD: ${EXECUTION_REMOTE_CWD:-/shared/aster}
+      EXECUTION_DEFAULT_TIMEOUT_SECONDS: ${EXECUTION_DEFAULT_TIMEOUT_SECONDS:-300}
+      EXECUTION_MAX_TIMEOUT_SECONDS: ${EXECUTION_MAX_TIMEOUT_SECONDS:-3600}
+      # The app only sees the host Unix socket; the gateway owns the mTLS identity.
+      EXECUTION_RPC_TRANSPORT: unix
+      EXECUTION_RPC_SOCKET: /run/aster/execution/rpc.sock
+      CODEMODE_ENABLED: ${CODEMODE_ENABLED:-1}
+    volumes:
+      - type: bind
+        source: ${EXECUTION_SOCKET_DIR:-${HOME:-/root}/Aster/run/execution}
+        target: /run/aster/execution
+        bind:
+          create_host_path: false
+
+  rpc-gateway:
+    image: ${ASTER_IMAGE:-aster:local}
+    entrypoint: ["node", "dist/src/execution/rpc-gateway-main.js"]
+    restart: unless-stopped
+    # The host namespace has the private route to the execution VPS; the app container does not.
+    network_mode: host
+    environment:
+      EXECUTION_RPC_GATEWAY_SOCKET: /run/aster/execution/rpc.sock
+      EXECUTION_RPC_GATEWAY_MAX_CONNECTIONS: ${EXECUTION_RPC_GATEWAY_MAX_CONNECTIONS:-4}
+      EXECUTION_RPC_TRANSPORT: tls
+      EXECUTION_RPC_ADDRESS: ${EXECUTION_RPC_ADDRESS:?set EXECUTION_RPC_ADDRESS to the agent's private address}
+      EXECUTION_RPC_SERVER_NAME: ${EXECUTION_RPC_SERVER_NAME:-execution.internal}
+      EXECUTION_RPC_CA_PATH: /run/aster/rpc/ca.crt
+      EXECUTION_RPC_CERT_PATH: /run/aster/rpc/client.crt
+      EXECUTION_RPC_KEY_PATH: /run/aster/rpc/client.key
+      EXECUTION_RPC_CONNECT_TIMEOUT_MS: ${EXECUTION_RPC_CONNECT_TIMEOUT_MS:-5000}
+    volumes:
+      - type: bind
+        source: ${EXECUTION_SOCKET_DIR:-${HOME:-/root}/Aster/run/execution}
+        target: /run/aster/execution
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${EXECUTION_RPC_CERT_DIR:?set EXECUTION_RPC_CERT_DIR to the host directory with ca.crt, client.crt and client.key}
+        target: /run/aster/rpc
+        read_only: true
+        bind:
+          create_host_path: false
+    # Only the socket is writable; the certificate directory is read-only and the image is read-only.
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=8m
+    mem_limit: 64m
+    pids_limit: 32
+    init: true
+    stop_grace_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

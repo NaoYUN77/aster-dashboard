@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "kind": "aster.deployment-environment",
+  "environment": "production",
+  "composeProject": "aster-production",
+  "volumes": {
+    "app": "personal-agent-data"
+  },
+  "identity": {
+    "botId": "1000000002"
+  }
+}

@@ -1,0 +1,4 @@
+# Explicit local build override; production Compose files only consume images.
+services:
+  personal-agent:
+    build: .
