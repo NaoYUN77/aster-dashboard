@@ -367,7 +367,11 @@ export type PtcWorkspaceState = {
 };
 
 export type PtcIsolationState = {
-  readonly mode: "bwrap" | "degraded-prlimit";
+  /**
+   * `bwrap`: per-command namespaces on the host; `degraded-prlimit`: explicitly allowed fallback;
+   * `container`: the process already runs inside the deployment's sandbox container.
+   */
+  readonly mode: "bwrap" | "degraded-prlimit" | "container";
   readonly bwrap: boolean;
   readonly userNamespace: boolean;
   readonly cgroup: "v2" | "none";

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { rm } from "node:fs/promises";
 import { buildBwrapArgv, buildDegradedArgv, runnerEnvironment } from "./ptc-bwrap.js";
 import { createPtcCgroup, spawnInCgroup, type PtcCgroup } from "./ptc-cgroup.js";
 import type { PtcConfig } from "./ptc-config.js";
@@ -82,15 +83,37 @@ type SessionState = {
   readonly sessionId: string;
   readonly jobId: string;
   readonly hostPath: string;
+  /** Container mode only: the session's private `/tmp` directory, removed with the session. */
+  readonly tmpPath?: string;
   readonly workspace: PtcWorkspaceState;
   runner?: Runner;
   exiting?: Promise<void>;
 };
 
+/**
+ * Container mode: the agent already runs inside the deployment's sandbox container, so the runner
+ * is started directly in the session's working directory instead of under bwrap and a cgroup.
+ * `open` creates (or accepts) that directory; `command` builds the runner's argv and environment.
+ */
+export type ContainerPtcRuntime = {
+  open(input: {
+    readonly sessionId: string;
+    readonly jobId: string;
+    readonly cwd?: string;
+    readonly workspaceReady: boolean;
+  }): Promise<{ readonly hostPath: string; readonly tmpPath: string; readonly workspace: PtcWorkspaceState }>;
+  command(input: {
+    readonly hostPath: string;
+    readonly tmpPath: string;
+  }): { readonly file: string; readonly args: readonly string[]; readonly env: NodeJS.ProcessEnv };
+};
+
 export type PtcExecutorOptions = {
   readonly config: PtcConfig;
   /** Result of `probePtcRuntime`; the executor never probes implicitly at request time. */
-  readonly probe: PtcRuntimeProbe;
+  readonly probe?: PtcRuntimeProbe;
+  /** Set on the same-host sandbox; it replaces both the bwrap probe and the cgroup. */
+  readonly container?: ContainerPtcRuntime;
   readonly now?: () => number;
 };
 
@@ -106,6 +129,16 @@ export class PtcExecutor implements PtcHost {
   private nextFileRequestId = 1;
 
   constructor(private readonly options: PtcExecutorOptions) {
+    const container = options.container;
+    if (container !== undefined) {
+      this.isolation = { mode: "container", bwrap: false, userNamespace: false, cgroup: "none", network: "none" };
+      this.usable = true;
+      this.enabled = true;
+      return;
+    }
+    if (options.probe === undefined) {
+      throw new Error("PtcExecutor needs either a runtime probe or a container runtime");
+    }
     this.isolation = options.probe.isolation;
     this.usable = options.probe.isolation.mode === "bwrap"
       ? options.probe.isolation.bwrap
@@ -116,13 +149,25 @@ export class PtcExecutor implements PtcHost {
   }
 
   async preflight(): Promise<Record<string, boolean | null>> {
-    return { ...this.options.probe.checks, usable: this.usable };
+    return { ...(this.options.probe?.checks ?? {}), usable: this.usable };
   }
 
-  async openSession(sessionId: string, jobId: string, workspaceReady: boolean, _cwd?: string): Promise<PtcWorkspaceState> {
+  async openSession(sessionId: string, jobId: string, workspaceReady: boolean, cwd?: string): Promise<PtcWorkspaceState> {
     if (!this.usable) throw new PtcHostError("unavailable", "the PTC sandbox is not usable on this host", "not_started");
     if (this.sessions.has(sessionId)) {
       throw new PtcHostError("busy", "session already exists", "not_started");
+    }
+    const container = this.options.container;
+    if (container !== undefined) {
+      const prepared = await container.open({ sessionId, jobId, ...(cwd === undefined ? {} : { cwd }), workspaceReady });
+      this.sessions.set(sessionId, {
+        sessionId,
+        jobId,
+        hostPath: prepared.hostPath,
+        tmpPath: prepared.tmpPath,
+        workspace: prepared.workspace,
+      });
+      return prepared.workspace;
     }
     const workspace = await preparePtcWorkspace(this.options.config, jobId, workspaceReady);
     this.sessions.set(sessionId, {
@@ -140,6 +185,9 @@ export class PtcExecutor implements PtcHost {
     this.sessions.delete(sessionId);
     await this.stopRunner(session, new PtcHostError("aborted", "the session was closed", "unknown"));
     await session.exiting;
+    if (session.tmpPath !== undefined) {
+      await rm(session.tmpPath, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   async startVm(input: {
@@ -293,34 +341,43 @@ export class PtcExecutor implements PtcHost {
 
   private async spawnRunner(session: SessionState): Promise<Runner> {
     const config = this.options.config;
-    const degraded = this.isolation.mode === "degraded-prlimit";
-    const argv = degraded
-      ? buildDegradedArgv(config, session.hostPath)
-      : buildBwrapArgv(config, session.hostPath);
-    const env = degraded
-      ? {
-          ...runnerEnvironment(config, session.hostPath),
-          HOME: session.hostPath,
-          TMPDIR: "/tmp",
-          PATH: config.nodePath,
-          LANG: "C.UTF-8",
-          PTC_INSIDE_SANDBOX: "1",
-        }
-      : {};
-
+    const container = this.options.container;
+    let argv: readonly string[];
+    let env: NodeJS.ProcessEnv;
     let cgroup: PtcCgroup | undefined;
-    if (!degraded) {
-      try {
-        cgroup = await createPtcCgroup(config, session.sessionId);
-      } catch (error) {
-        // A rejected session id is the caller's mistake; wrapping it as `internal` would hide the
-        // only actionable part of the failure.
-        if (error instanceof PtcHostError) throw error;
-        throw new PtcHostError(
-          "internal",
-          `the sandbox could not be constrained: ${error instanceof Error ? error.message : "cgroup setup failed"}`,
-          "not_started",
-        );
+
+    if (container !== undefined) {
+      const launched = container.command({ hostPath: session.hostPath, tmpPath: session.tmpPath ?? "" });
+      argv = [launched.file, ...launched.args];
+      env = launched.env;
+    } else {
+      const degraded = this.isolation.mode === "degraded-prlimit";
+      argv = degraded
+        ? buildDegradedArgv(config, session.hostPath)
+        : buildBwrapArgv(config, session.hostPath);
+      env = degraded
+        ? {
+            ...runnerEnvironment(config, session.hostPath),
+            HOME: session.hostPath,
+            TMPDIR: "/tmp",
+            PATH: config.nodePath,
+            LANG: "C.UTF-8",
+            PTC_INSIDE_SANDBOX: "1",
+          }
+        : {};
+      if (!degraded) {
+        try {
+          cgroup = await createPtcCgroup(config, session.sessionId);
+        } catch (error) {
+          // A rejected session id is the caller's mistake; wrapping it as `internal` would hide the
+          // only actionable part of the failure.
+          if (error instanceof PtcHostError) throw error;
+          throw new PtcHostError(
+            "internal",
+            `the sandbox could not be constrained: ${error instanceof Error ? error.message : "cgroup setup failed"}`,
+            "not_started",
+          );
+        }
       }
     }
 

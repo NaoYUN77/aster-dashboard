@@ -194,7 +194,9 @@ export class RemoteRpcExecutionEnv implements ExecutionEnv {
   async #open(): Promise<void> {
     if (this.#closed) throw new RpcClientError("unavailable", "the direct session is closed");
     this.#opening ??= (async () => {
-      const result = await this.#client.openSession(this.#sessionId, { cwd: this.#workspaceRoot });
+      // The working directory, not the configured root: a same-host sandbox roots the session in
+      // the bot's own directory, and must not grant it the whole `/workspaces` parent.
+      const result = await this.#client.openSession(this.#sessionId, { cwd: this.cwd });
       if (result.direct === undefined) {
         await this.#client.closeSession(this.#sessionId).catch(() => undefined);
         throw new RpcClientError("not_implemented", "the execution agent did not open a direct session", {

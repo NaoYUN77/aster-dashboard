@@ -16,32 +16,16 @@ import { chunkText, signalNumber } from "./output-chunks.js";
 import { buildDirectBwrapArgv } from "./ptc-bwrap.js";
 import { createPtcCgroup, spawnInCgroup, type PtcCgroup, type PtcRuntimeProbe } from "./ptc-cgroup.js";
 import type { PtcConfig } from "./ptc-config.js";
-import { FileServiceError, PtcFileService } from "./ptc-fs.js";
+import { handleFileRequest } from "./file-requests.js";
+import { PtcFileService } from "./ptc-fs.js";
 import { PtcHostError, type DirectHost } from "./ptc-host.js";
 import {
   PTC_MAX_WINDOW_LINES,
   RPC_MAX_OUTPUT_CHUNK_BYTES,
   type RpcBashExecutePayload,
-  type RpcErrorCode,
   type RpcFileMethod,
   type RpcSkippedOutput,
 } from "./rpc-protocol.js";
-
-const FILE_ERROR_CODES = new Set<RpcErrorCode>([
-  "invalid_request", "not_found", "permission_denied", "not_directory", "is_directory",
-  "too_large", "aborted", "busy", "not_implemented", "internal",
-]);
-
-/** File failures never carry a side effect whose outcome could be unknown. */
-function hostError(error: unknown): PtcHostError {
-  if (error instanceof FileServiceError) {
-    const code: RpcErrorCode = FILE_ERROR_CODES.has(error.code as RpcErrorCode)
-      ? error.code as RpcErrorCode
-      : "internal";
-    return new PtcHostError(code, error.message, "failed");
-  }
-  return new PtcHostError("internal", "the file operation failed", "failed");
-}
 
 type DirectSession = {
   readonly sessionId: string;
@@ -285,54 +269,7 @@ export class DirectExecutor implements DirectHost {
     if (input.signal.aborted) {
       throw new PtcHostError("aborted", "the file request was aborted before it started", "not_started");
     }
-    const files = session.files;
-    try {
-      switch (input.method) {
-        case "file.stat":
-          return await files.info(input.payload.path as string);
-        case "file.exists":
-          return { exists: await files.exists(input.payload.path as string) };
-        case "file.canonical":
-          return { path: await files.canonical(input.payload.path as string) };
-        case "file.open":
-          return await files.open(session.sessionId, input.payload.path as string, {
-            ...(input.payload.noFollow === true ? { noFollow: true } : {}),
-          });
-        case "file.read":
-          return await files.read(
-            session.sessionId,
-            input.payload.handle as string,
-            input.payload.offset as number,
-            input.payload.length as number,
-          );
-        case "file.scanLines":
-          return await files.scanLines(
-            session.sessionId,
-            input.payload.handle as string,
-            input.payload.startLine as number,
-            input.payload.endLine as number | undefined,
-            input.signal,
-          );
-        case "file.close":
-          await files.close(session.sessionId, input.payload.handle as string);
-          return {};
-        case "file.readText":
-          return await files.readText(input.payload.path as string, input.signal);
-        case "file.write":
-          return await files.write(input.payload.path as string, input.payload.content as string, input.signal);
-      }
-    } catch (error) {
-      if (input.method === "file.write" && error instanceof FileServiceError
-        && (error.code === "aborted" || error.code === "unknown")) {
-        // The write may or may not have reached its rename: never report a clean failure.
-        throw new PtcHostError(
-          FILE_ERROR_CODES.has(error.code as RpcErrorCode) ? error.code as RpcErrorCode : "internal",
-          error.message,
-          "unknown",
-        );
-      }
-      throw hostError(error);
-    }
+    return handleFileRequest(session.files, session.sessionId, input);
   }
 
   private requireSession(sessionId: string): DirectSession {
@@ -374,11 +311,15 @@ export function sharedCwd(value: string): string {
   return normalized;
 }
 
-function clampWindow(payload: RpcBashExecutePayload, config: PtcConfig): RpcBashExecutePayload["window"] {
+/** The caller's output window, clamped to what this host is willing to emit. */
+export function clampWindow(
+  payload: RpcBashExecutePayload,
+  bounds: Pick<PtcConfig, "outputChunkBytes" | "outputBytesPerSecond">,
+): RpcBashExecutePayload["window"] {
   return {
-    maxBytes: Math.max(1, Math.min(payload.window.maxBytes, config.outputChunkBytes, RPC_MAX_OUTPUT_CHUNK_BYTES)),
+    maxBytes: Math.max(1, Math.min(payload.window.maxBytes, bounds.outputChunkBytes, RPC_MAX_OUTPUT_CHUNK_BYTES)),
     maxLines: Math.max(1, Math.min(payload.window.maxLines, PTC_MAX_WINDOW_LINES)),
     minIntervalMs: Math.min(Math.max(0, payload.window.minIntervalMs), 1_000),
-    bytesPerSecond: Math.max(0, Math.min(payload.window.bytesPerSecond, Math.max(0, config.outputBytesPerSecond))),
+    bytesPerSecond: Math.max(0, Math.min(payload.window.bytesPerSecond, Math.max(0, bounds.outputBytesPerSecond))),
   };
 }
