@@ -78,9 +78,14 @@ done
 
 echo "== A10: loopback-only console and token gate"
 published=$(compose port personal-agent 8787 | head -1 | tr -d '\r')
-[[ "$published" == "127.0.0.1:8787" ]] \
-  && pass "A10 the console is published on 127.0.0.1:8787" \
-  || fail "A10 published address: ${published:-none}"
+if [[ "$published" == "127.0.0.1:8787" ]]; then
+  pass "A10 the console is published on 127.0.0.1:8787"
+elif command -v ss >/dev/null && ss -ltnH 'sport = :8787' | grep -q '127\.0\.0\.1:8787'; then
+  # With the MITM overlay the app has no publishable network and console-ingress owns the port.
+  pass "A10 the console answers on 127.0.0.1:8787 (console ingress)"
+else
+  fail "A10 published address: ${published:-none}"
+fi
 if command -v ss >/dev/null; then
   ss -ltnH 'sport = :8787' | grep -q '127\.0\.0\.1:8787' \
     && pass "A10 the host listens only on loopback" \

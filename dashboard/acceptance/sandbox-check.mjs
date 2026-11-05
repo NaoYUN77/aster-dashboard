@@ -61,13 +61,30 @@ try {
 
   const read = await client.fileRequest(sessionA, "file.readText", { path: `${cwdA}/a.txt` })
     .then((value) => ({ value }), (error) => ({ error }));
-  check("S4 the file primitives resolve only inside the session root",
-    read.value !== undefined && String(read.value?.data ?? "").includes("hello-from-A"),
+  // The protocol carries file content as base64 (write takes contentBase64); decode before asserting.
+  const readText = read.value?.data === undefined
+    ? ""
+    : Buffer.from(String(read.value.data), "base64").toString("utf8");
+  check("S4 the file primitive reads the session's own file",
+    readText === "hello-from-A",
     JSON.stringify(read).slice(0, 160));
 
-  const data = await run(sessionB, "ls /data", cwdB).promise;
-  check("S4 /data is not visible inside the sandbox",
-    data.exitCode !== 0, `exit ${data.exitCode}`);
+  const escape = await client.fileRequest(sessionA, "file.readText", { path: `${cwdA}/../bot-b-${stamp}/b.txt` })
+    .then(() => undefined, (error) => error);
+  check("S4 the file primitive rejects paths that leave the session root",
+    escape?.code === "permission_denied", escape?.code ?? "no error");
+
+  const appData = await client.fileRequest(sessionB, "file.readText", { path: "/data/inbox.sqlite" })
+    .then(() => undefined, (error) => error);
+  check("S4 the file primitive cannot reach /data",
+    appData?.code === "permission_denied", appData?.code ?? "no error");
+
+  // The base image declares VOLUME /data, so an empty /data exists in the sandbox; what matters is
+  // that no application data is mounted there.
+  const data = await run(sessionB, "ls -A /data", cwdB).promise;
+  check("S4 /data carries no app data inside the sandbox",
+    data.exitCode !== 0 || data.output.trim() === "",
+    `exit ${data.exitCode}${data.output.trim() === "" ? "" : ` entries: ${data.output.trim()}`}`);
 
   // Informational: raw bash can still list sibling bot directories; file primitives and each
   // session's working directory stay confined. Recorded for the report, not counted as a failure.

@@ -35,13 +35,13 @@ bash dashboard/acceptance/run.sh
 | 1 | overlay 一次 up 成功 | `run.sh` | `compose up -d --build` 退出 0；两个服务 running；sandbox healthy |
 | 2 | 研究员 + 编程 bot，两行 conversationId 不同 | `run.sh` + `console-check.mjs` | `bots` 表两行、conversationId 不同；控制台返回 201 |
 | 3 | prompt/工具隔离，非编程 bot 调不到 PTC | `console-check.mjs` | 两行 systemPrompt 不同；`tools` 列不同（programmer 含 `ptc`）；`loadedTools` 中 researcher 无 `codemode`；researcher 的 run 无 codemode 工具事件 |
-| 4 | sandbox 内 A 写 a.txt、B ls 看不到；`ls /data` 失败 | `console-check.mjs` + `sandbox-check.mjs` | A 的 bash 输出自己的 `/workspaces/<botId>`；B 的列目录没有 `acceptance-a.txt`；B 执行 `ls /data` 退出码非 0；A/B 的 `pwd` 各自独立 |
+| 4 | sandbox 内 A 写 a.txt、B ls 看不到；文件原语不能越出会话根或读到 `/data` | `console-check.mjs` + `sandbox-check.mjs` | A 的 bash 输出自己的 `/workspaces/<botId>`；B 的列目录没有 `acceptance-a.txt`；B 执行 `ls -A /data` 无条目（基础镜像自带空 `/data`）；`file.readText` 对 `../`、兄弟 bot 和 `/data` 返回 `permission_denied`；A/B 的 `pwd` 各自独立 |
 | 5 | 两个 `sleep 30` 并行约 30 秒 | `console-check.mjs` + `sandbox-check.mjs` | 两个 bot 同时发任务，总耗时 < 48s（串行约 60s） |
 | 6 | 事件流实时、running→terminal | `console-check.mjs` | SSE 依次收到 `run_start` → 工具事件 → `run_end`（同一次运行内） |
 | 7 | 取消 A 不影响 B | `console-check.mjs` + `sandbox-check.mjs` | `cancel` 返回 `cancelled: true`；A 的历史无迟到答案；B 的「OK」正常完成；RPC 层取消后另一会话命令照常退出 0 |
 | 8 | restart 后 bot 和历史还在 | `run.sh`（重启）+ `console-check.mjs --verify-restart` | 重启后两个 botId/conversationId 不变；A 的历史仍含 `WROTE-A` |
 | 9 | `npm test` 和 `test:topology` 全绿 | `run.sh --with-tests` 或 CI | `npm test`：0 fail；`test:topology`：`Topology acceptance passed` |
-| 10 | 无 token 401、端口只绑宿主 127.0.0.1 | `run.sh` | 无 token 请求 401；`docker compose port` 输出 `127.0.0.1:8787`；`ss` 显示仅 127.0.0.1 |
+| 10 | 无 token 401、端口只绑宿主 127.0.0.1 | `run.sh` | 无 token 请求 401；`docker compose port` 输出 `127.0.0.1:8787`，或 MITM overlay 下由 `console-ingress` 在宿主 `127.0.0.1:8787` 监听；`ss` 显示仅 127.0.0.1 |
 
 模型相关条目（2/3/4/5/6/7）由真实模型执行脚本内置的确定性 prompt；若模型未按指令调用
 bash，对应检查会失败并打印实际事件，重跑即可。第 4/5/7 条另有 RPC 层的确定性检查
