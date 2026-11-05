@@ -103,8 +103,6 @@ export function catalogFor(
   for (const { tool, record } of registrations) {
     const group = groupFor(tool.name, record);
     if (group === undefined || !groups.has(group)) continue;
-    // PTC is a programmer-only capability even if a future profile accidentally lists its group.
-    if (tool.name === "codemode" && profile !== "programmer") continue;
     defaults.add(tool.name);
     definitions.push(Object.freeze({ name: tool.name, description: tool.description, inputSchema: tool.parameters }));
   }
@@ -115,7 +113,6 @@ export function catalogFor(
 
 export function scopeAllows(scopeInput: ToolScope, profile: CatalogProfileId, name: string, record?: ToolRecord): boolean {
   const scope = parseToolScope(scopeInput);
-  if (name === "codemode" && profile !== "programmer") return false;
   const group = groupFor(name, record);
   if (group === undefined || !CATALOG_PROFILES[profile].defaultTools.includes(group)) return false;
   if (scope.allow.length > 0 && !scope.allow.includes(name)) return false;

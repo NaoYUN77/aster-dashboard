@@ -596,9 +596,6 @@ ${channel === "console"
         const wantsWeb = profile.tools.includes("web");
         const catalogProfile = profile.catalogProfile ?? profileForCapabilities(profile.tools);
         const requestedScope = parseToolScope(profile.toolScope ?? { allow: [], deny: [] });
-        if (wantsPtc && catalogProfile !== "programmer") {
-          throw new ConfigurationError(`Bot "${profile.botId}" can use PTC only with the programmer catalog profile`);
-        }
         if (wantsWeb && catalogProfile !== "research") {
           throw new ConfigurationError(`Bot "${profile.botId}" can use web tools only with the research catalog profile`);
         }
