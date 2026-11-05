@@ -10,6 +10,10 @@
 # the app reaches the sandbox over the Unix socket on the shared volume.
 services:
   personal-agent:
+    # The app image is the repository's root Dockerfile, so a clean host can start with one command.
+    build:
+      context: .
+      dockerfile: Dockerfile
     env_file: !override
       - ${ASTER_DASHBOARD_ENV_FILE:-./dashboard/.env}
     environment:

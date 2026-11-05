@@ -151,6 +151,9 @@ volumes:
     assert.deepEqual(Object.keys(config.services).sort(), ["aster-sandbox", "personal-agent"]);
     const app = config.services["personal-agent"];
     const sandbox = config.services["aster-sandbox"];
+    // The app image is the repository's root Dockerfile; the sandbox has its own.
+    assert.equal(app.build.dockerfile, "Dockerfile");
+    assert.equal(sandbox.build.dockerfile, "dashboard/sandbox.Dockerfile");
 
     // The console is reachable only from the host's loopback address.
     assert.deepEqual(app.ports, [{

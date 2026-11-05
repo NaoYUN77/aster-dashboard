@@ -23,10 +23,18 @@ docker compose -f docker-compose.yml -f dashboard/docker-compose.dashboard.yml \
 ```
 
 The app image is the repository's root `Dockerfile`; the sandbox image is built from
-`dashboard/sandbox.Dockerfile`. The console is published only on the host's loopback address:
-open `http://127.0.0.1:8787` and paste `WEB_TOKEN` when the page asks for it.
+`dashboard/sandbox.Dockerfile`, and the overlay builds both. The console is published only on the
+host's loopback address: open `http://127.0.0.1:8787` and paste `WEB_TOKEN` when the page asks for
+it.
 
 The compose overlay requires Compose with `!override` support (Docker Compose 2.24 or newer).
+
+## Acceptance
+
+`dashboard/acceptance/` holds the deployment acceptance kit: `run.sh` builds the overlay, checks the
+loopback/token boundary, drives the console and the sandbox, and verifies that a restart keeps the
+bots and their history. `acceptance/README.md` maps each criterion to the evidence it prints. The
+run uses its own compose project and volume names, so it never touches another deployment's data.
 
 ## Bots
 
