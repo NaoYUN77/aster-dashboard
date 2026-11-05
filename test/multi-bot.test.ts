@@ -38,6 +38,8 @@ function environment(dataDir: string): NodeJS.ProcessEnv {
     // stay visible so both roles share a comparable base surface.
     CODEMODE_ENABLED: "1",
     CODEMODE_SCRIPT_FIRST: "0",
+    // Web tools are on so the researcher role's extra capability is observable.
+    DEEPSEEK_WEB_API_KEY: "faux-web-key",
   };
 }
 
@@ -219,10 +221,15 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     const programmerId = programmer.body.bot.botId as string;
     assert.notEqual(researcher.body.bot.conversationId, programmer.body.bot.conversationId);
 
-    // Acceptance 3: the prompt and the tools differ per bot; only the programmer has code mode.
+    // Acceptance 3: the prompt and the tools differ per bot; only the programmer has code mode,
+    // and only the researcher keeps web_search (assistant/programmer lose the web-tools extension).
     assert.ok(researcher.body.bot.loadedTools.includes("bash"));
+    assert.ok(researcher.body.bot.loadedTools.includes("web_search"));
     assert.ok(!researcher.body.bot.loadedTools.includes("codemode"));
     assert.ok(programmer.body.bot.loadedTools.includes("codemode"));
+    assert.ok(!programmer.body.bot.loadedTools.includes("web_search"));
+    assert.ok(researcher.body.bot.tools.includes("web_search"));
+    assert.ok(!programmer.body.bot.tools.includes("web_search"));
 
     // Unknown bots are 404 and an invalid role is 400.
     assert.equal((await console.call("/api/bots/nobody/messages", { text: "hi" })).status, 404);

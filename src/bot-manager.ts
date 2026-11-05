@@ -31,8 +31,9 @@ import { failureCode } from "./telegram.js";
 export type OpenAgent = Awaited<ReturnType<typeof openAgent>>;
 
 /** The capabilities a role gets. The host decides this; the console never names tools directly. */
-export function toolsForRole(role: BotRole, deployment: { readonly ptc: boolean }): string {
+export function toolsForRole(role: BotRole, deployment: { readonly ptc: boolean; readonly web: boolean }): string {
   if (role === "programmer") return deployment.ptc ? "bash,files,ptc" : "bash,files";
+  if (role === "researcher") return deployment.web ? "bash,files,web_search" : "bash,files";
   return "bash,files";
 }
 
@@ -65,6 +66,8 @@ export type BotManagerOptions = {
   readonly bootstrapChannel?: "telegram" | "console";
   /** True when the deployment has code mode configured at all. */
   readonly ptc: boolean;
+  /** True when the deployment has web tools configured (`DEEPSEEK_WEB_API_KEY`). */
+  readonly web: boolean;
   readonly signal: AbortSignal;
   readonly log?: (line: string) => void;
 };
@@ -113,7 +116,7 @@ export class BotManager {
   /** Register the bootstrap bot, reconfigure every stored bot and start its worker. */
   async start(): Promise<void> {
     const { inbox } = this.#options;
-    const tools = toolsForRole("assistant", { ptc: this.#options.ptc });
+    const tools = toolsForRole("assistant", { ptc: this.#options.ptc, web: this.#options.web });
     inbox.ensureBot({
       botId: "default",
       name: "Default",
@@ -138,7 +141,7 @@ export class BotManager {
     const botId = input.botId === undefined ? this.#deriveId(name) : input.botId;
     if (!isBotId(botId)) throw new StateError("Bot id must be 1-32 lowercase letters, digits, '-' or '_'");
     if (this.#options.inbox.bot(botId) !== undefined) throw new StateError("Bot already exists");
-    const tools = parseBotTools(toolsForRole(role, { ptc: this.#options.ptc }));
+    const tools = parseBotTools(toolsForRole(role, { ptc: this.#options.ptc, web: this.#options.web }));
     // The conversation is created before the row: a bot never points at a transcript that does not exist.
     const configured = await this.#options.agent.configureBot({
       botId,
@@ -252,13 +255,16 @@ export class BotManager {
   /** Reconcile one row with the durable transcript and start its worker. */
   async #activate(bot: BotRecord): Promise<void> {
     if (bot.status !== "active") return;
+    // Role is the source of truth for capabilities; stored tools catch up when the host mapping changes.
+    const tools = parseBotTools(toolsForRole(bot.role, { ptc: this.#options.ptc, web: this.#options.web }));
+    if (tools !== bot.tools) this.#options.inbox.setBotTools(bot.botId, tools);
     const configured = await this.#options.agent.configureBot({
       botId: bot.botId,
       conversationId: bot.botId === "default" ? "root" : bot.conversationId,
       cwd: await this.#workspace(bot.botId),
       channel: bot.botId === "default" ? this.#options.bootstrapChannel ?? "telegram" : "console",
       prompt: bot.systemPrompt,
-      tools: parseBotTools(bot.tools).split(",").filter((name) => name !== ""),
+      tools: tools.split(",").filter((name) => name !== ""),
     });
     if (configured.conversationId !== bot.conversationId) {
       // The transcript was lost (for example with a wiped agent database); the row follows the

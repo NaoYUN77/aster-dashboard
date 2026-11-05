@@ -149,7 +149,7 @@ export type BotConversationProfile = {
   readonly channel?: "telegram" | "console";
   /** Operator-written system prompt for this bot; empty keeps only the base instructions. */
   readonly prompt: string;
-  /** Capability list; only `ptc` changes the extension selection. */
+  /** Capability list; `ptc` and `web_search` change the extension selection. */
   readonly tools: readonly string[];
 };
 
@@ -315,7 +315,10 @@ ${channel === "console"
   // its bound; the next user request starts a fresh run with cleared counters.
   const loopGuard = createLoopGuard(options.toolReviewLog ?? console.error);
   registry.install(loopGuard.extension);
-  if (config.webApiKey !== undefined) registry.install(scriptPolicy(createWebExtension({ apiKey: config.webApiKey })));
+  const webExtension = config.webApiKey === undefined
+    ? undefined
+    : scriptPolicy(createWebExtension({ apiKey: config.webApiKey }));
+  if (webExtension !== undefined) registry.install(webExtension);
   // Memory wiring (MEM-07) goes through the one composition entry; with MEMORY_ENABLED=0 the
   // application keeps exactly its previous registry, settings and request path. The memory
   // section is read from the same environment the rest of the config came from, unless the
@@ -586,11 +589,21 @@ ${channel === "console"
        */
       async configureBot(profile: BotConversationProfile): Promise<ConfiguredBot> {
         const wantsPtc = profile.tools.includes("ptc");
+        const wantsWeb = profile.tools.includes("web_search");
         if (wantsPtc && codemode === undefined) {
           throw new ConfigurationError(
             `Bot "${profile.botId}" requires code mode, but CODEMODE_ENABLED is not set on this deployment`,
           );
         }
+        if (wantsWeb && webExtension === undefined) {
+          throw new ConfigurationError(
+            `Bot "${profile.botId}" requires web_search, but DEEPSEEK_WEB_API_KEY is not set on this deployment`,
+          );
+        }
+        const remove = [
+          ...(codemode !== undefined && !wantsPtc ? [codemode.extension] : []),
+          ...(webExtension !== undefined && !wantsWeb ? [webExtension] : []),
+        ];
         const change: AgentChange = {
           model: { provider: config.provider, modelId: config.model },
           cwd: profile.cwd,
@@ -598,11 +611,11 @@ ${channel === "console"
             baseInstructions(profile.cwd, profile.channel ?? (profile.conversationId === "root" ? "telegram" : "console")),
             profile.prompt.trim(),
           ].filter((part) => part !== "").join("\n"),
-          // Only a bot that declares `ptc` keeps code mode; every other conversation removes it,
-          // so the tool is neither offered nor callable there.
-          ...(codemode === undefined
+          // Only declared capabilities keep their extensions; every other conversation removes them
+          // so the tools are neither offered nor callable there.
+          ...(codemode === undefined && webExtension === undefined
             ? {}
-            : { extensions: wantsPtc ? null : { remove: [codemode.extension] } }),
+            : { extensions: remove.length === 0 ? null : { remove } }),
         };
         let conversation: Conversation;
         if (profile.conversationId === "root") {
