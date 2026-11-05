@@ -1,0 +1,86 @@
+# Multi-bot dashboard on one machine: the app and its sandbox container.
+#
+# Usage (from the repository root):
+#   cp dashboard/.env.example dashboard/.env    # then fill in the model key and WEB_TOKEN
+#   docker compose -f docker-compose.yml -f dashboard/docker-compose.dashboard.yml \
+#     --env-file dashboard/.env up -d --build
+#
+# The overlay replaces the base service's env file with dashboard/.env, publishes the console on
+# the host's loopback address only, and adds the sandbox. There is no remote execution gateway:
+# the app reaches the sandbox over the Unix socket on the shared volume.
+services:
+  personal-agent:
+    env_file: !override
+      - ${ASTER_DASHBOARD_ENV_FILE:-./dashboard/.env}
+    environment:
+      DATA_DIR: /data
+      # The console is the only owner surface; Telegram is off in this deployment.
+      TELEGRAM_ENABLED: "0"
+      CONSOLE_ENABLED: "1"
+      CONSOLE_HOST: 0.0.0.0
+      CONSOLE_PORT: "8787"
+      CONSOLE_WEB_DIR: /app/dashboard/web
+      # Same-host sandbox over a Unix socket. Every bot's directory is `/workspaces/<botId>`.
+      EXECUTION_MODE: remote
+      EXECUTION_REMOTE_TRANSPORT: rpc
+      EXECUTION_REMOTE_CWD: /workspaces
+      EXECUTION_RPC_TRANSPORT: unix
+      EXECUTION_RPC_SOCKET: /run/aster/rpc.sock
+      # Code mode is available to the programmer role only; the role decides the tool list.
+      CODEMODE_ENABLED: "1"
+      CODEMODE_SCRIPT_FIRST: "0"
+    ports:
+      # Loopback only: the token is the second gate, never the only one.
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - personal-agent-data:/data
+      - sandbox-runtime:/run/aster:ro
+    mem_limit: 2g
+    pids_limit: 256
+    depends_on:
+      aster-sandbox:
+        condition: service_healthy
+
+  aster-sandbox:
+    image: ${ASTER_SANDBOX_IMAGE:-aster-sandbox:local}
+    build:
+      context: .
+      dockerfile: dashboard/sandbox.Dockerfile
+    restart: unless-stopped
+    init: true
+    # The sandbox sees only the bot workspaces and the socket volume; no app data, no network.
+    network_mode: "none"
+    read_only: true
+    user: "1000:1000"
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+    volumes:
+      - sandbox-workspaces:/workspaces
+      - sandbox-runtime:/home/aster/run
+    environment:
+      ASTER_SANDBOX_SOCKET: /home/aster/run/rpc.sock
+      ASTER_SANDBOX_WORKSPACES: /workspaces
+      ASTER_SANDBOX_TMP_ROOT: /tmp/aster-sessions
+      ASTER_SANDBOX_CONCURRENCY: "3"
+      ASTER_SANDBOX_MAX_SESSIONS: "32"
+      ASTER_SANDBOX_PTC: "1"
+      ASTER_SANDBOX_SHELL: /bin/bash
+      ASTER_SANDBOX_PATH: /usr/local/bin:/usr/bin:/bin
+    mem_limit: 2g
+    pids_limit: 512
+    stop_grace_period: 20s
+    healthcheck:
+      # The socket file is the only readiness signal: the agent creates it after listening.
+      test: ["CMD", "node", "-e", "require('node:fs').accessSync('/home/aster/run/rpc.sock')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  sandbox-runtime:
+    name: ${ASTER_SANDBOX_RUNTIME_VOLUME:-aster-sandbox-runtime}
+  sandbox-workspaces:
+    name: ${ASTER_SANDBOX_WORKSPACES_VOLUME:-aster-sandbox-workspaces}

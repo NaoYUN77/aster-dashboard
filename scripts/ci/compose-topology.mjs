@@ -17,6 +17,7 @@ const credentials = {
   telegramToken: `900001:${randomBytes(24).toString("hex")}`,
   modelKey: random("model"),
 };
+const dashboardToken = random("webtoken");
 const file = (name) => join(directory, name).replaceAll("\\", "/");
 let step = "prepare";
 let checks = 0;
@@ -32,11 +33,11 @@ const composeArgs = ["compose", "--project-name", project, "--project-directory"
   "--env-file", file("empty.env"), "-f", join(root, "docker-compose.yml"),
   "-f", join(root, "docker-compose.build.yml"), "-f", file("override.yml")];
 
-function command(program, args, { input, allowFailure = false, timeout = 120_000 } = {}) {
+function command(program, args, { input, allowFailure = false, timeout = 120_000, env = {} } = {}) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(program, args, { cwd: root, stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
       env: { ...process.env, COMPOSE_ENV_FILES: "", COMPOSE_DISABLE_ENV_FILE: "1",
-        ASTER_IMAGE: images.app } });
+        ASTER_IMAGE: images.app, ...env } });
     let output = "";
     let overflow = false;
     let timedOut = false;
@@ -99,6 +100,25 @@ volumes:
     name: ${project}-app
 `;
   await writeFile(file("override.yml"), override, { mode: 0o600 });
+  // The dashboard overlay reads its own env file; CI points it at a synthetic one instead of
+  // requiring a developer's `dashboard/.env`.
+  await writeFile(file("dashboard.env"), [
+    `WEB_TOKEN=${dashboardToken}`,
+    "MODEL_PROVIDER=deepseek",
+    "MODEL_ID=deepseek-flash",
+    `DEEPSEEK_API_KEY=${credentials.modelKey}`,
+    "",
+  ].join("\n"), { mode: 0o600 });
+  const dashboardArgs = ["compose", "--project-name", `${project}-dashboard`,
+    "--project-directory", root, "--env-file", file("dashboard.env"),
+    "-f", join(root, "docker-compose.yml"),
+    "-f", join(root, "dashboard/docker-compose.dashboard.yml")];
+  const dashboardEnv = {
+    ASTER_DASHBOARD_ENV_FILE: file("dashboard.env"),
+    ASTER_SANDBOX_IMAGE: `${project}-sandbox:ci`,
+    ASTER_SANDBOX_RUNTIME_VOLUME: `${project}-runtime`,
+    ASTER_SANDBOX_WORKSPACES_VOLUME: `${project}-workspaces`,
+  };
   await check("compose-single-service-and-production-boundaries", async () => {
     const result = await compose("config", "--format", "json");
     const config = JSON.parse(result.output);
@@ -124,6 +144,64 @@ volumes:
     assert.equal(mounts.length, 1);
     assert.equal(mounts[0].source, "personal-agent-data");
     for (const volume of Object.values(config.volumes)) assert.ok(!volume.external);
+  });
+  await check("dashboard-two-services-sandbox-boundaries-and-loopback-console", async () => {
+    const result = await command("docker", [...dashboardArgs, "config", "--format", "json"], { env: dashboardEnv });
+    const config = JSON.parse(result.output);
+    assert.deepEqual(Object.keys(config.services).sort(), ["aster-sandbox", "personal-agent"]);
+    const app = config.services["personal-agent"];
+    const sandbox = config.services["aster-sandbox"];
+
+    // The console is reachable only from the host's loopback address.
+    assert.deepEqual(app.ports, [{
+      mode: "ingress", target: 8787, published: "8787", protocol: "tcp", host_ip: "127.0.0.1",
+    }]);
+    assert.equal(String(app.mem_limit), String(2 * 1024 * 1024 * 1024));
+    assert.equal(app.pids_limit, 256);
+    // The overlay's env file replaced the base one; its synthetic values are the ones rendered.
+    assert.equal(app.environment.WEB_TOKEN, dashboardToken);
+    assert.equal(app.environment.TELEGRAM_ENABLED, "0");
+    assert.equal(app.environment.CONSOLE_ENABLED, "1");
+    assert.equal(app.environment.CONSOLE_HOST, "0.0.0.0");
+    assert.equal(app.environment.CONSOLE_PORT, "8787");
+    assert.equal(app.environment.EXECUTION_MODE, "remote");
+    assert.equal(app.environment.EXECUTION_REMOTE_TRANSPORT, "rpc");
+    assert.equal(app.environment.EXECUTION_REMOTE_CWD, "/workspaces");
+    assert.equal(app.environment.EXECUTION_RPC_TRANSPORT, "unix");
+    assert.equal(app.environment.EXECUTION_RPC_SOCKET, "/run/aster/rpc.sock");
+    assert.equal(app.environment.CODEMODE_ENABLED, "1");
+    assert.equal(app.depends_on["aster-sandbox"].condition, "service_healthy");
+
+    // The sandbox is non-root, has no network, no capabilities and a read-only filesystem.
+    assert.equal(sandbox.image, `${project}-sandbox:ci`);
+    assert.equal(sandbox.network_mode, "none");
+    assert.equal(sandbox.read_only, true);
+    assert.equal(sandbox.user, "1000:1000");
+    assert.deepEqual(sandbox.cap_drop, ["ALL"]);
+    assert.ok(sandbox.security_opt.includes("no-new-privileges:true"));
+    assert.ok(!sandbox.ports?.length, "the sandbox must not publish ports");
+    assert.equal(sandbox.environment.ASTER_SANDBOX_SOCKET, "/home/aster/run/rpc.sock");
+    assert.equal(sandbox.environment.ASTER_SANDBOX_WORKSPACES, "/workspaces");
+    assert.equal(sandbox.environment.ASTER_SANDBOX_CONCURRENCY, "3");
+    assert.equal(sandbox.environment.ASTER_SANDBOX_PTC, "1");
+
+    // Only the workspaces and socket volumes are mounted; the app's /data volume is never shared.
+    const sandboxTargets = sandbox.volumes.map((volume) => volume.target).sort();
+    assert.deepEqual(sandboxTargets, ["/home/aster/run", "/workspaces"]);
+    const appSocket = app.volumes.find((volume) => volume.target === "/run/aster");
+    const sandboxSocket = sandbox.volumes.find((volume) => volume.target === "/home/aster/run");
+    assert.ok(appSocket, "the app must mount the socket volume");
+    assert.ok(sandboxSocket, "the sandbox must mount the socket volume");
+    assert.equal(appSocket.source, sandboxSocket.source);
+    assert.equal(appSocket.read_only, true);
+    const workspaces = sandbox.volumes.find((volume) => volume.target === "/workspaces");
+    assert.equal(workspaces.source, "sandbox-workspaces");
+    // Rendered volume sources are the compose keys; the `name` override is what isolates the run.
+    assert.equal(config.volumes["sandbox-runtime"].name, `${project}-runtime`);
+    assert.equal(config.volumes["sandbox-workspaces"].name, `${project}-workspaces`);
+    assert.equal(appSocket.source, "sandbox-runtime");
+    // No remote execution gateway service is part of this overlay.
+    assert.ok(!Object.keys(config.services).some((name) => name.includes("gateway")));
   });
   if (!renderOnly) {
     await check("final-image-present", async () => {

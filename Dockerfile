@@ -23,6 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certifi
 COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
+# The local console page is served from the image; it is static and needs no build step.
+COPY --chown=node:node dashboard/web ./dashboard/web
 USER node
 VOLUME ["/data"]
 CMD ["flock", "--no-fork", "--nonblock", "/data/app.lock", "node", "dist/src/main.js"]
