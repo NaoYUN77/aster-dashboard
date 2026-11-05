@@ -226,6 +226,13 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
       systemPrompt: "You program.",
     });
     assert.equal(programmer.status, 201);
+    const scoped = await console.call("/api/bots", {
+      name: "Scoped Assistant",
+      role: "assistant",
+      systemPrompt: "Use only the command tool.",
+      toolScope: { allow: ["bash"], deny: [] },
+    });
+    assert.equal(scoped.status, 201);
     const researcherId = researcher.body.bot.botId as string;
     const programmerId = programmer.body.bot.botId as string;
     assert.notEqual(researcher.body.bot.conversationId, programmer.body.bot.conversationId);
@@ -240,6 +247,9 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     assert.ok(!programmer.body.bot.loadedTools.includes("web_fetch"));
     assert.ok(researcher.body.bot.tools.includes("web"));
     assert.ok(!programmer.body.bot.tools.includes("web"));
+    assert.equal(scoped.body.bot.profile, "chief");
+    assert.deepEqual(scoped.body.bot.toolScope, { allow: ["bash"], deny: [] });
+    assert.deepEqual(scoped.body.bot.loadedTools, ["bash"]);
 
     // Unknown bots are 404 and an invalid role is 400.
     assert.equal((await console.call("/api/bots/nobody/messages", { text: "hi" })).status, 404);
@@ -295,7 +305,7 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     assert.equal(assistantTexts(await history(console, programmerId)).at(-1), "OK");
 
     // The default bot keeps the legacy working directory, not a per-bot one.
-    assert.equal(service.bots.views().length, 3);
+    assert.equal(service.bots.views().length, 4);
 
     // Acceptance 8 (local): bots, conversations and history survive a restart.
     const beforeRestart = await console.call("/api/bots");
@@ -307,6 +317,9 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
       afterRestart.body.bots.map((bot: { botId: string; conversationId: string }) => [bot.botId, bot.conversationId]),
       beforeRestart.body.bots.map((bot: { botId: string; conversationId: string }) => [bot.botId, bot.conversationId]),
     );
+    const restoredScope = afterRestart.body.bots.find((bot: { botId: string }) => bot.botId === scoped.body.bot.botId);
+    assert.equal(restoredScope.profile, "chief");
+    assert.deepEqual(restoredScope.toolScope, { allow: ["bash"], deny: [] });
     const restored = assistantTexts(await history(restarted, researcherId));
     assert.ok(restored.includes("WROTE"), `history lost after restart: ${restored.join("|")}`);
   } finally {

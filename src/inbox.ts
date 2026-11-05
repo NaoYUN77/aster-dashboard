@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { StateError } from "./errors.js";
 import { splitReply, type TextRequest } from "./messages.js";
+import { profileForRole, parseToolScope, serializeToolScope, type CatalogProfileId, type ToolScope } from "./tool-catalog.js";
 
 export interface Job extends TextRequest {
   status: "pending" | "ready" | "sent" | "failed" | "uncertain";
@@ -25,7 +26,10 @@ export interface BotRecord {
   role: BotRole;
   conversationId: string;
   systemPrompt: string;
+  /** Legacy capability projection retained for configureBot and older clients. */
   tools: string;
+  profile: CatalogProfileId;
+  toolScope: string;
   status: BotStatus;
   createdAt: string;
 }
@@ -37,6 +41,9 @@ export interface BotRegistration {
   conversationId: string;
   systemPrompt: string;
   tools: string;
+  /** Optional to keep direct legacy Inbox callers source-compatible. */
+  profile?: CatalogProfileId;
+  toolScope?: ToolScope;
 }
 
 const BOT_ROLES: ReadonlySet<string> = new Set(["assistant", "researcher", "programmer"]);
@@ -102,6 +109,8 @@ export class Inbox {
         conversationId TEXT NOT NULL UNIQUE,
         systemPrompt TEXT NOT NULL,
         tools TEXT NOT NULL,
+        profile TEXT,
+        toolScope TEXT,
         status TEXT NOT NULL DEFAULT 'active',
         createdAt TEXT NOT NULL
       );
@@ -112,6 +121,13 @@ export class Inbox {
     addColumn(this.db, "inbox", "repliedAt", "TEXT");
     addColumn(this.db, "deliveries", "createdAt", "TEXT");
     addColumn(this.db, "deliveries", "updatedAt", "TEXT");
+    addColumn(this.db, "bots", "profile", "TEXT");
+    addColumn(this.db, "bots", "toolScope", "TEXT");
+    // Upgrade existing role/capability rows once into the profile contract; keep `tools` intact.
+    this.db.prepare(`UPDATE bots SET profile = CASE role
+      WHEN 'researcher' THEN 'research' WHEN 'programmer' THEN 'programmer' ELSE 'chief' END
+      WHERE profile IS NULL OR profile = ''`).run();
+    this.db.prepare("UPDATE bots SET toolScope = '{\"allow\":[],\"deny\":[]}' WHERE toolScope IS NULL OR toolScope = ''").run();
   }
 
   bindIdentity(botId: string, ownerId: string): void {
@@ -228,14 +244,18 @@ export class Inbox {
   /** Register the bootstrap bot without overwriting an operator's later edits. */
   ensureBot(registration: BotRegistration): BotRecord {
     validateBot(registration);
-    this.db.prepare(`INSERT OR IGNORE INTO bots (botId, name, role, conversationId, systemPrompt, tools, createdAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+    const profile = registration.profile ?? profileForRole(registration.role);
+    const toolScope = serializeToolScope(registration.toolScope ?? { allow: [], deny: [] });
+    this.db.prepare(`INSERT OR IGNORE INTO bots (botId, name, role, conversationId, systemPrompt, tools, profile, toolScope, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       registration.botId,
       registration.name,
       registration.role,
       registration.conversationId,
       registration.systemPrompt,
       registration.tools,
+      profile,
+      toolScope,
       timestamp(),
     );
     return this.bot(registration.botId) as BotRecord;
@@ -244,14 +264,18 @@ export class Inbox {
   createBot(registration: BotRegistration): BotRecord {
     validateBot(registration);
     if (this.bot(registration.botId) !== undefined) throw new StateError("Bot already exists");
-    this.db.prepare(`INSERT INTO bots (botId, name, role, conversationId, systemPrompt, tools, createdAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+    const profile = registration.profile ?? profileForRole(registration.role);
+    const toolScope = serializeToolScope(registration.toolScope ?? { allow: [], deny: [] });
+    this.db.prepare(`INSERT INTO bots (botId, name, role, conversationId, systemPrompt, tools, profile, toolScope, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       registration.botId,
       registration.name,
       registration.role,
       registration.conversationId,
       registration.systemPrompt,
       registration.tools,
+      profile,
+      toolScope,
       timestamp(),
     );
     return this.bot(registration.botId) as BotRecord;
@@ -281,6 +305,12 @@ export class Inbox {
   setBotTools(botId: string, tools: string): void {
     const normalized = parseBotTools(tools);
     this.db.prepare(`UPDATE bots SET tools = ? WHERE botId = ?`).run(normalized, botId);
+  }
+
+  setBotCatalog(botId: string, profile: CatalogProfileId, toolScope: ToolScope): void {
+    const scope = serializeToolScope(toolScope);
+    const changed = this.db.prepare("UPDATE bots SET profile = ?, toolScope = ? WHERE botId = ?").run(profile, scope, botId);
+    if (changed.changes !== 1) throw new StateError("Bot not found");
   }
 
 
@@ -411,6 +441,10 @@ function validateBot(registration: BotRegistration): void {
   if (registration.systemPrompt.length > 8_000) throw new StateError("Bot prompt must be at most 8000 characters");
   const tools = parseBotTools(registration.tools);
   if (tools !== registration.tools) throw new StateError("Bot tools must be normalized before storage");
+  const profile = registration.profile ?? profileForRole(registration.role);
+  if (profile !== "research" && profile !== "chief" && profile !== "programmer") throw new StateError("Bot catalog profile is invalid");
+  try { parseToolScope(registration.toolScope ?? { allow: [], deny: [] }); }
+  catch (error) { throw new StateError(error instanceof Error ? error.message : "Bot tool scope is invalid"); }
 }
 
 /** SQLite has no `ADD COLUMN IF NOT EXISTS`; re-running the migration must stay a no-op. */

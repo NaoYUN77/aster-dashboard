@@ -25,6 +25,29 @@ const update: Update = {
 };
 const request = toRequest(update, "42", "99")!;
 
+test("legacy bot rows migrate to role profiles with an empty persisted tool scope", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-bot-profile-migration-"));
+  const path = join(directory, "inbox.sqlite");
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE bots (
+    botId TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, conversationId TEXT NOT NULL UNIQUE,
+    systemPrompt TEXT NOT NULL, tools TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', createdAt TEXT NOT NULL
+  );`);
+  legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, 'active', ?)").run("researcher", "Researcher", "researcher", "11", "", "bash,files,web", new Date().toISOString());
+  legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, 'active', ?)").run("coder", "Coder", "programmer", "12", "", "bash,files,ptc", new Date().toISOString());
+  legacy.close();
+  let inbox: Inbox | undefined;
+  try {
+    inbox = new Inbox(path);
+    assert.equal(inbox.bot("researcher")?.profile, "research");
+    assert.equal(inbox.bot("coder")?.profile, "programmer");
+    assert.equal(inbox.bot("researcher")?.toolScope, "{\"allow\":[],\"deny\":[]}");
+  } finally {
+    inbox?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Telegram boundary admits only owner private text and namespaces identifiers", () => {
   assert.deepEqual(request, {
     requestId: "telegram:99:12", conversationId: "42", senderId: "42", text: "hello",

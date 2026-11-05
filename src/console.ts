@@ -203,6 +203,7 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
         role: body.role,
         systemPrompt: body.systemPrompt,
         botId: body.botId,
+        toolScope: body.toolScope,
       });
       send(response, 201, { bot });
       return;

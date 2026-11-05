@@ -42,6 +42,7 @@ import { hasUnfinishedModelToolCalls, hideFromModel, SCRIPT_ONLY_TOOLS } from ".
 import { createCcrWebExtension } from "./ccr-web-tools.js";
 import { inspectGithubToolRecovery, readResidentTools, withToolLedger } from "./tool-ledger.js";
 import { installMcpTools, orderedMcpExtensions } from "./tool-pins.js";
+import { catalogFor, parseToolScope, profileForCapabilities, type CatalogProfileId, type ToolScope } from "./tool-catalog.js";
 
 const context = BACKGROUND_CONTEXT;
 // Failures the request can recover from in-process; anything else thrown by the durable calls means the Session is unusable.
@@ -149,8 +150,11 @@ export type BotConversationProfile = {
   readonly channel?: "telegram" | "console";
   /** Operator-written system prompt for this bot; empty keeps only the base instructions. */
   readonly prompt: string;
-  /** Capability list; `ptc` and `web` change the extension selection. */
+  /** Legacy capability list; retained for existing BotManager/configureBot callers. */
   readonly tools: readonly string[];
+  /** The catalog profile and scope narrow the runtime tool registry for this conversation. */
+  readonly catalogProfile?: CatalogProfileId;
+  readonly toolScope?: ToolScope;
 };
 
 export type ConfiguredBot = {
@@ -590,6 +594,14 @@ ${channel === "console"
       async configureBot(profile: BotConversationProfile): Promise<ConfiguredBot> {
         const wantsPtc = profile.tools.includes("ptc");
         const wantsWeb = profile.tools.includes("web");
+        const catalogProfile = profile.catalogProfile ?? profileForCapabilities(profile.tools);
+        const requestedScope = parseToolScope(profile.toolScope ?? { allow: [], deny: [] });
+        if (wantsPtc && catalogProfile !== "programmer") {
+          throw new ConfigurationError(`Bot "${profile.botId}" can use PTC only with the programmer catalog profile`);
+        }
+        if (wantsWeb && catalogProfile !== "research") {
+          throw new ConfigurationError(`Bot "${profile.botId}" can use web tools only with the research catalog profile`);
+        }
         if (wantsPtc && codemode === undefined) {
           throw new ConfigurationError(
             `Bot "${profile.botId}" requires code mode, but CODEMODE_ENABLED is not set on this deployment`,
@@ -600,6 +612,15 @@ ${channel === "console"
             `Bot "${profile.botId}" requires web tools, but CCR_PROFILE is not set on this deployment`,
           );
         }
+        const denied = new Set(requestedScope.deny);
+        if (!wantsPtc) denied.add("codemode");
+        if (!wantsWeb) { denied.add("web_search"); denied.add("web_fetch"); }
+        const effectiveScope: ToolScope = { allow: requestedScope.allow, deny: [...denied] };
+        const snapshot = registry.snapshot();
+        const catalog = catalogFor(snapshot.tools().map(({ tool }) => ({ tool, record: registry.lookup(tool.name) })), catalogProfile, effectiveScope);
+        const catalogNames = new Set(catalog.definitions.map(({ name }) => name));
+        const selectedTools = snapshot.tools().filter(({ tool }) => catalog.names.has(tool.name) && catalogNames.has(tool.name));
+        const modelTools = selectedTools.filter(({ tool }) => tool.deferred !== true).map(({ tool }) => tool);
         const remove = [
           ...(codemode !== undefined && !wantsPtc ? [codemode.extension] : []),
           ...(webExtension !== undefined && !wantsWeb ? [webExtension] : []),
@@ -611,11 +632,13 @@ ${channel === "console"
             baseInstructions(profile.cwd, profile.channel ?? (profile.conversationId === "root" ? "telegram" : "console")),
             profile.prompt.trim(),
           ].filter((part) => part !== "").join("\n"),
-          // Only declared capabilities keep their extensions; every other conversation removes them
-          // so the tools are neither offered nor callable there.
+          // Capabilities select the PTC/Web extensions; the catalog filters every host and MCP tool
+          // through the same profile plus scope for declarations and nested execution.
           ...(codemode === undefined && webExtension === undefined
             ? {}
             : { extensions: remove.length === 0 ? null : { remove } }),
+          tools: selectedTools.map(({ tool }) => tool),
+          modelTools,
         };
         let conversation: Conversation;
         if (profile.conversationId === "root") {
@@ -636,6 +659,7 @@ ${channel === "console"
             }, context);
           }
         }
+        registry.setConversationCatalog(conversation.id, catalogProfile, effectiveScope, catalog.names);
         botCwds.set(conversation.id, profile.cwd);
         const agent = await conversation.agent(context);
         return {

@@ -27,20 +27,21 @@ import {
   type Inbox,
 } from "./inbox.js";
 import { failureCode } from "./telegram.js";
+import { legacyCapabilitiesForRole, parseToolScope, profileForRole, type CatalogProfileId, type ToolScope } from "./tool-catalog.js";
 
 export type OpenAgent = Awaited<ReturnType<typeof openAgent>>;
 
-/** The capabilities a role gets. The host decides this; the console never names tools directly. */
+/** Compatibility projection; catalog profile defaults are defined in tool-catalog.ts. */
 export function toolsForRole(role: BotRole, deployment: { readonly ptc: boolean; readonly web: boolean }): string {
-  if (role === "programmer") return deployment.ptc ? "bash,files,ptc" : "bash,files";
-  if (role === "researcher") return deployment.web ? "bash,files,web" : "bash,files";
-  return "bash,files";
+  return legacyCapabilitiesForRole(role, deployment);
 }
 
 export type BotView = {
   readonly botId: string;
   readonly name: string;
   readonly role: BotRole;
+  readonly profile: CatalogProfileId;
+  readonly toolScope: ToolScope;
   readonly conversationId: string;
   readonly tools: readonly string[];
   readonly status: BotRecord["status"];
@@ -129,7 +130,7 @@ export class BotManager {
     for (const bot of inbox.bots()) await this.#activate(bot);
   }
 
-  async create(input: { readonly name: unknown; readonly role: unknown; readonly systemPrompt: unknown; readonly botId?: unknown }): Promise<BotView> {
+  async create(input: { readonly name: unknown; readonly role: unknown; readonly systemPrompt: unknown; readonly botId?: unknown; readonly toolScope?: unknown }): Promise<BotView> {
     const name = typeof input.name === "string" ? input.name.trim() : "";
     if (name === "" || name.length > 80) throw new StateError("Bot name must be 1-80 characters");
     const role = input.role;
@@ -142,6 +143,10 @@ export class BotManager {
     if (!isBotId(botId)) throw new StateError("Bot id must be 1-32 lowercase letters, digits, '-' or '_'");
     if (this.#options.inbox.bot(botId) !== undefined) throw new StateError("Bot already exists");
     const tools = parseBotTools(toolsForRole(role, { ptc: this.#options.ptc, web: this.#options.web }));
+    const profile = profileForRole(role);
+    let toolScope: ToolScope;
+    try { toolScope = parseToolScope(input.toolScope ?? { allow: [], deny: [] }); }
+    catch (error) { throw new StateError(error instanceof Error ? error.message : "Bot tool scope is invalid"); }
     // The conversation is created before the row: a bot never points at a transcript that does not exist.
     const configured = await this.#options.agent.configureBot({
       botId,
@@ -149,6 +154,8 @@ export class BotManager {
       channel: "console",
       prompt: systemPrompt,
       tools: tools.split(","),
+      catalogProfile: profile,
+      toolScope,
     });
     const bot = this.#options.inbox.createBot({
       botId,
@@ -157,6 +164,8 @@ export class BotManager {
       conversationId: configured.conversationId,
       systemPrompt,
       tools,
+      profile,
+      toolScope,
     });
     this.#loadedTools.set(botId, configured.tools);
     await this.#activate(bot);
@@ -206,6 +215,8 @@ export class BotManager {
       botId: bot.botId,
       name: bot.name,
       role: bot.role,
+      profile: bot.profile,
+      toolScope: parseToolScope(bot.toolScope),
       conversationId: bot.conversationId,
       tools: parseBotTools(bot.tools).split(",").filter((name) => name !== ""),
       status: bot.status,
@@ -255,9 +266,12 @@ export class BotManager {
   /** Reconcile one row with the durable transcript and start its worker. */
   async #activate(bot: BotRecord): Promise<void> {
     if (bot.status !== "active") return;
-    // Role is the source of truth for capabilities; stored tools catch up when the host mapping changes.
+    // Role maps to the durable catalog profile; capability strings remain a compatibility projection.
+    const profile = profileForRole(bot.role);
+    const toolScope = parseToolScope(bot.toolScope);
     const tools = parseBotTools(toolsForRole(bot.role, { ptc: this.#options.ptc, web: this.#options.web }));
     if (tools !== bot.tools) this.#options.inbox.setBotTools(bot.botId, tools);
+    if (profile !== bot.profile) this.#options.inbox.setBotCatalog(bot.botId, profile, toolScope);
     const configured = await this.#options.agent.configureBot({
       botId: bot.botId,
       conversationId: bot.botId === "default" ? "root" : bot.conversationId,
@@ -265,6 +279,8 @@ export class BotManager {
       channel: bot.botId === "default" ? this.#options.bootstrapChannel ?? "telegram" : "console",
       prompt: bot.systemPrompt,
       tools: tools.split(",").filter((name) => name !== ""),
+      catalogProfile: profile,
+      toolScope,
     });
     if (configured.conversationId !== bot.conversationId) {
       // The transcript was lost (for example with a wiped agent database); the row follows the

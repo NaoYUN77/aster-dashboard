@@ -89,6 +89,21 @@ test("a stale executor cannot borrow a replacement registration's authority", as
   assert.equal(writes, 0);
 });
 
+test("conversation catalog denies host and nested tool execution outside its profile scope", async () => {
+  let runs = 0;
+  const outside = defineTool({ name: "outside", description: "outside", parameters: Type.Object({}),
+    execute: async () => { runs++; return { output: [] }; } });
+  const registry = createToolRegistry([personalTools, defineExtension({ name: "extra", tools: [outside] })], { log: () => {} });
+  registry.setConversationCatalog(41, "chief", { allow: [], deny: [] }, new Set(["current_time"]));
+  const registered = registry.snapshot().tools().find(({ tool }) => tool.name === "outside")!.tool;
+  const result = await registered.execute({}, {
+    conversationId: 41, taskId: 2, callId: "scoped",
+  } as ToolExecutionApi, BACKGROUND_CONTEXT);
+  assert.equal(result.isError, true);
+  assert.equal((result.details as { code?: string }).code, "TOOL_SCOPE_DENIED");
+  assert.equal(runs, 0);
+});
+
 test("tool wrappers are rejected because they can replace the reviewed executor", () => {
   const registry = createToolRegistry([personalTools]);
   assert.throws(() => registry.install({
