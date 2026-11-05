@@ -150,7 +150,7 @@ test("a crash while a segment is sending quarantines it and later sends only sto
       const shutdown = new AbortController();
       let executions = 0;
       await serveTelegram(
-        { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } } satisfies ReturnType<typeof readConfig>,
+        { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } } satisfies ReturnType<typeof readConfig>,
         "99",
         inbox,
         async () => { executions++; throw new Error("must not rerun the agent"); },

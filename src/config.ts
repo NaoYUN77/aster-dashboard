@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { setGlobalProxyFromEnv } from "node:http";
+import { isIP } from "node:net";
 import { join, resolve } from "node:path";
 import { ConfigurationError } from "./errors.js";
 import { isAbsoluteRemotePath } from "./execution/protocol.js";
@@ -134,7 +135,8 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     if (!value) throw new ConfigurationError(`Missing configuration: ${key}`);
     return value;
   };
-  const ownerId = readOwnerId(env);
+  const telegramEnabled = readTelegramEnabled(env);
+  const ownerId = telegramEnabled ? readOwnerId(env) : "console";
   const provider = required("MODEL_PROVIDER");
   if (!isProviderId(provider)) {
     throw new ConfigurationError(`MODEL_PROVIDER must be one of: ${PROVIDER_IDS.join(", ")}`);
@@ -142,8 +144,10 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   const providerKeyEnv = PROVIDERS[provider].apiKeyEnv;
   const providerKey = required(providerKeyEnv);
   assertValidCredentialShape(providerKeyEnv, providerKey);
-  const token = required("TELEGRAM_BOT_TOKEN");
-  assertValidCredentialShape("TELEGRAM_BOT_TOKEN", token);
+  // A console-only deployment has no Telegram identity at all; requiring a token there would be a
+  // configuration error the operator cannot satisfy without creating a bot they do not use.
+  const token = telegramEnabled ? required("TELEGRAM_BOT_TOKEN") : "";
+  if (telegramEnabled) assertValidCredentialShape("TELEGRAM_BOT_TOKEN", token);
   const webApiKey = env.DEEPSEEK_WEB_API_KEY?.trim();
   if (webApiKey) assertValidCredentialShape("DEEPSEEK_WEB_API_KEY", webApiKey);
   const execution = readExecutionConfig(env);
@@ -163,9 +167,12 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
       }
     : undefined;
   const reminders = readReminderConfig(env);
+  const consoleConfig = readConsoleConfig(env);
   return {
     token,
     ownerId,
+    telegramEnabled,
+    console: consoleConfig,
     provider,
     model: required("MODEL_ID"),
     telegramApiRoot,
@@ -173,7 +180,8 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     ...(execution === undefined ? {} : { execution }),
     ...(codemodeConfig === undefined ? {} : { codemode: codemodeConfig }),
     ...paths,
-    ...(reminders.enabled ? { reminders } : {}),
+    // Proactive sends need a Telegram identity; a console-only instance stores none.
+    ...(reminders.enabled && telegramEnabled ? { reminders } : {}),
     trace: readTraceConfig(env),
   };
 }
@@ -271,13 +279,16 @@ export type ExecutionConfig = {
     }
 );
 
-/** `/shared` itself or a path below it; the direct sandbox exposes nothing else to commands. */
-function isSharedRemotePath(value: string): boolean {
-  return value === "/shared"
-    || (value.startsWith("/shared/")
-      && !value.includes("\\")
-      && !value.split("/").includes(".."));
+/**
+ * The roots a sandbox exposes to commands: the legacy `/shared` workspace and the per-bot
+ * `/workspaces` tree. A per-bot directory is derived inside one of them, never elsewhere.
+ */
+function isSandboxRootPath(value: string): boolean {
+  if (value.includes("\\") || value.split("/").includes("..")) return false;
+  return SANDBOX_ROOTS.some((root) => value === root || value.startsWith(`${root}/`));
 }
+
+export const SANDBOX_ROOTS = ["/shared", "/workspaces"] as const;
 
 function boundedInteger(env: NodeJS.ProcessEnv, key: string, fallback: number, min: number, max: number): number {
   const raw = env[key]?.trim();
@@ -317,8 +328,10 @@ export function readExecutionConfig(env: NodeJS.ProcessEnv = process.env): Execu
   if (Buffer.byteLength(remoteCwd, "utf8") > 4096) {
     throw new ConfigurationError("EXECUTION_REMOTE_CWD must be at most 4096 bytes");
   }
-  if (transport === "rpc" && !isSharedRemotePath(remoteCwd)) {
-    throw new ConfigurationError("EXECUTION_REMOTE_CWD must be /shared or a path below it for the rpc transport");
+  if (transport === "rpc" && !isSandboxRootPath(remoteCwd)) {
+    throw new ConfigurationError(
+      "EXECUTION_REMOTE_CWD must be under /shared or /workspaces for the rpc transport",
+    );
   }
   const defaultTimeoutSeconds = boundedInteger(env, "EXECUTION_DEFAULT_TIMEOUT_SECONDS", 300, 1, 86_400);
   const maxTimeoutSeconds = boundedInteger(env, "EXECUTION_MAX_TIMEOUT_SECONDS", 3600, 1, 86_400);
@@ -493,6 +506,52 @@ export function readMemoryConfig(env: NodeJS.ProcessEnv = process.env): MemoryCo
     reserveTokens: memoryInteger(env, "MEMORY_RESERVE_TOKENS", 16_384, 1, 1_048_576),
     timezone,
     archiveTimeoutMs: memoryInteger(env, "MEMORY_ARCHIVE_TIMEOUT_MS", 60_000, 1, 300_000),
+  };
+}
+
+/** Telegram long polling is the historical default; a local console replaces it entirely. */
+function readTelegramEnabled(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.TELEGRAM_ENABLED?.trim();
+  if (raw !== undefined && raw !== "" && raw !== "0" && raw !== "1") {
+    throw new ConfigurationError("TELEGRAM_ENABLED must be 0 or 1");
+  }
+  return raw !== "0";
+}
+
+/**
+ * The local console: an in-process HTTP surface for the owner's browser. It is off unless enabled,
+ * and it refuses to start without a token: the browser is the only client, but the port is still a
+ * listener, so an unauthenticated mode would be an open door rather than a convenience.
+ */
+export type ConsoleConfig = {
+  readonly host: string;
+  readonly port: number;
+  readonly token: string;
+  /** Directory holding the static page; the image copies `dashboard/web` there. */
+  readonly webDir: string;
+  readonly maxBots: number;
+};
+
+export function readConsoleConfig(env: NodeJS.ProcessEnv = process.env): ConsoleConfig | undefined {
+  const enabledRaw = env.CONSOLE_ENABLED?.trim();
+  if (enabledRaw !== undefined && enabledRaw !== "" && enabledRaw !== "0" && enabledRaw !== "1") {
+    throw new ConfigurationError("CONSOLE_ENABLED must be 0 or 1");
+  }
+  if (enabledRaw !== "1") return undefined;
+  const token = env.WEB_TOKEN?.trim() ?? "";
+  if (!/^[\x21-\x7e]{16,256}$/.test(token)) {
+    throw new ConfigurationError("WEB_TOKEN must be 16-256 printable characters without spaces");
+  }
+  const host = env.CONSOLE_HOST?.trim() || "0.0.0.0";
+  if (!isIP(host)) throw new ConfigurationError("CONSOLE_HOST must be an IP literal");
+  const webDir = resolve(env.CONSOLE_WEB_DIR?.trim() || "dashboard/web");
+  return {
+    host,
+    // 0 asks the OS for an ephemeral port, which the acceptance tests use; a deployment pins one.
+    port: boundedInteger(env, "CONSOLE_PORT", 8787, 0, 65_535),
+    token,
+    webDir,
+    maxBots: boundedInteger(env, "CONSOLE_MAX_BOTS", 8, 1, 64),
   };
 }
 

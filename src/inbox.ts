@@ -10,6 +10,40 @@ export interface Job extends TextRequest {
   repliedAt: string | null;
 }
 
+/** A bot's declared role decides its workspace and the tools it is offered. */
+export type BotRole = "assistant" | "researcher" | "programmer";
+
+export type BotStatus = "active" | "disabled";
+
+/**
+ * One bot and the conversation it owns. `tools` is a comma-separated capability list (`bash`,
+ * `files`, `ptc`) rather than free text, so the host can validate it instead of trusting a prompt.
+ */
+export interface BotRecord {
+  botId: string;
+  name: string;
+  role: BotRole;
+  conversationId: string;
+  systemPrompt: string;
+  tools: string;
+  status: BotStatus;
+  createdAt: string;
+}
+
+export interface BotRegistration {
+  botId: string;
+  name: string;
+  role: BotRole;
+  conversationId: string;
+  systemPrompt: string;
+  tools: string;
+}
+
+const BOT_ROLES: ReadonlySet<string> = new Set(["assistant", "researcher", "programmer"]);
+const BOT_TOOLS: ReadonlySet<string> = new Set(["bash", "files", "ptc"]);
+/** Bot ids are directory names under the workspace root, so the shape is fixed and short. */
+export const BOT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
 export interface Delivery {
   requestId: string;
   part: number;
@@ -61,6 +95,16 @@ export class Inbox {
         requestId TEXT PRIMARY KEY REFERENCES inbox(requestId) ON DELETE CASCADE,
         code TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS bots (
+        botId TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL,
+        conversationId TEXT NOT NULL UNIQUE,
+        systemPrompt TEXT NOT NULL,
+        tools TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        createdAt TEXT NOT NULL
+      );
     `);
     // Existing databases predate the timestamps. Adding a nullable column leaves those rows unknown
     // instead of backfilling them with a time the process never observed.
@@ -109,8 +153,130 @@ export class Inbox {
     });
   }
 
+  /** Telegram's queue: console requests are answered by their bot worker, never sent to a chat. */
   next(): Job | undefined {
-    return this.db.prepare("SELECT * FROM inbox WHERE status IN ('pending', 'ready') ORDER BY rowid LIMIT 1").get() as Job | undefined;
+    return this.db.prepare(`SELECT * FROM inbox WHERE status IN ('pending', 'ready')
+      AND requestId NOT LIKE 'console:%' ORDER BY rowid LIMIT 1`).get() as Job | undefined;
+  }
+
+  /**
+   * The next request a bot's own worker should answer. Ordering by rowid keeps one bot's requests
+   * in arrival order; each bot has its own queue, so two bots run at the same time.
+   */
+  nextForBot(botId: string): Job | undefined {
+    return this.db.prepare(`SELECT * FROM inbox WHERE status = 'pending' AND requestId LIKE ?
+      ORDER BY rowid LIMIT 1`).get(`${consoleRequestPrefix(botId)}%`) as Job | undefined;
+  }
+
+  /** Durably accept a console request before the console answers its caller. */
+  acceptConsole(request: TextRequest): void {
+    const botId = consoleRequestBot(request.requestId);
+    if (botId === undefined || request.senderId !== "console") {
+      throw new StateError("A console request must be addressed to one bot");
+    }
+    this.transaction(() => {
+      const existing = this.db.prepare("SELECT * FROM inbox WHERE requestId = ?").get(request.requestId);
+      if (existing && (existing.text !== request.text || existing.conversationId !== request.conversationId)) {
+        throw new StateError("Request ID reused with different content");
+      }
+      this.db.prepare(`INSERT OR IGNORE INTO inbox (requestId, conversationId, senderId, text, receivedAt)
+        VALUES (?, ?, ?, ?, ?)`).run(request.requestId, request.conversationId, request.senderId, request.text, timestamp());
+    });
+  }
+
+  /**
+   * A console reply is terminal at once: it is read back from the conversation and streamed to the
+   * browser, so no delivery row is created and no part is ever sent to Telegram.
+   */
+  saveConsoleReply(requestId: string, reply: string, errorCode?: string): void {
+    const text = reply.trim() ? reply : "(no reply)";
+    this.transaction(() => {
+      const changed = this.db.prepare(`UPDATE inbox SET reply = ?, status = 'sent', repliedAt = ?
+        WHERE requestId = ? AND status = 'pending'`).run(text, timestamp(), requestId);
+      if (changed.changes !== 1) throw new StateError("Reply already saved or request missing");
+      if (errorCode) this.db.prepare("INSERT INTO failures VALUES (?, ?)").run(requestId, errorCode);
+    });
+  }
+
+  /** A withdrawn console request is terminal; it is never executed later. */
+  cancelConsole(requestId: string): boolean {
+    const changed = this.db.prepare(`UPDATE inbox SET status = 'failed' WHERE requestId = ? AND status = 'pending'`)
+      .run(requestId);
+    return changed.changes === 1;
+  }
+
+  /** Requests this bot still has to answer, including the one its worker is running. */
+  pendingForBot(botId: string): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS count FROM inbox WHERE status = 'pending' AND requestId LIKE ?`)
+      .get(`${consoleRequestPrefix(botId)}%`) as { count: number };
+    return Number(row.count);
+  }
+
+  consoleRequests(botId: string, limit = 20): Job[] {
+    return this.db.prepare(`SELECT * FROM inbox WHERE requestId LIKE ? ORDER BY rowid DESC LIMIT ?`)
+      .all(`${consoleRequestPrefix(botId)}%`, limit) as unknown as Job[];
+  }
+
+  /** The bot this request belongs to, from its own request id; never from a caller-supplied field. */
+  botOfRequest(requestId: string): BotRecord | undefined {
+    const botId = consoleRequestBot(requestId);
+    if (botId !== undefined) return this.bot(botId);
+    const job = this.db.prepare("SELECT conversationId FROM inbox WHERE requestId = ?").get(requestId);
+    return job === undefined ? undefined : this.botByConversation(String(job.conversationId));
+  }
+
+  /** Register the bootstrap bot without overwriting an operator's later edits. */
+  ensureBot(registration: BotRegistration): BotRecord {
+    validateBot(registration);
+    this.db.prepare(`INSERT OR IGNORE INTO bots (botId, name, role, conversationId, systemPrompt, tools, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+      registration.botId,
+      registration.name,
+      registration.role,
+      registration.conversationId,
+      registration.systemPrompt,
+      registration.tools,
+      timestamp(),
+    );
+    return this.bot(registration.botId) as BotRecord;
+  }
+
+  createBot(registration: BotRegistration): BotRecord {
+    validateBot(registration);
+    if (this.bot(registration.botId) !== undefined) throw new StateError("Bot already exists");
+    this.db.prepare(`INSERT INTO bots (botId, name, role, conversationId, systemPrompt, tools, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+      registration.botId,
+      registration.name,
+      registration.role,
+      registration.conversationId,
+      registration.systemPrompt,
+      registration.tools,
+      timestamp(),
+    );
+    return this.bot(registration.botId) as BotRecord;
+  }
+
+  bot(botId: string): BotRecord | undefined {
+    return this.db.prepare("SELECT * FROM bots WHERE botId = ?").get(botId) as BotRecord | undefined;
+  }
+
+  botByConversation(conversationId: string): BotRecord | undefined {
+    return this.db.prepare("SELECT * FROM bots WHERE conversationId = ?").get(conversationId) as BotRecord | undefined;
+  }
+
+  bots(): BotRecord[] {
+    return this.db.prepare("SELECT * FROM bots ORDER BY rowid").all() as unknown as BotRecord[];
+  }
+
+  /** Point a bot at the conversation its durable transcript actually lives in. */
+  setBotConversation(botId: string, conversationId: string): void {
+    this.db.prepare("UPDATE bots SET conversationId = ? WHERE botId = ?").run(conversationId, botId);
+  }
+
+  setBotStatus(botId: string, status: BotStatus): void {
+    const changed = this.db.prepare("UPDATE bots SET status = ? WHERE botId = ?").run(status, botId);
+    if (changed.changes !== 1) throw new StateError("Bot not found");
   }
 
   saveReply(requestId: string, reply: string, errorCode?: string): void {
@@ -199,6 +365,47 @@ export class Inbox {
       throw error;
     }
   }
+}
+
+/** Request ids name their channel and their bot, so a queue is never shared by accident. */
+export function consoleRequestPrefix(botId: string): string {
+  if (!BOT_ID_PATTERN.test(botId)) throw new StateError("Bot id is invalid");
+  return `console:${botId}:`;
+}
+
+/** The bot id inside a console request id, or undefined when this is not a console request. */
+export function consoleRequestBot(requestId: string): string | undefined {
+  const match = /^console:([a-z0-9][a-z0-9_-]{0,31}):[A-Za-z0-9-]{8,64}$/.exec(requestId);
+  return match?.[1];
+}
+
+/** Normalize and validate a bot's capability list: `bash`, `files`, `ptc`, comma separated. */
+export function parseBotTools(value: unknown): string {
+  if (typeof value !== "string") throw new StateError("Bot tools must be a comma-separated string");
+  const names = [...new Set(value.split(",").map((name) => name.trim()).filter((name) => name !== ""))];
+  for (const name of names) {
+    if (!BOT_TOOLS.has(name)) throw new StateError(`Unknown bot tool: ${name.slice(0, 32)}`);
+  }
+  // Order is fixed by the host, so the same capability set is always stored the same way.
+  return ["bash", "files", "ptc"].filter((name) => names.includes(name)).join(",");
+}
+
+export function isBotId(value: unknown): value is string {
+  return typeof value === "string" && BOT_ID_PATTERN.test(value);
+}
+
+function validateBot(registration: BotRegistration): void {
+  if (!isBotId(registration.botId)) {
+    throw new StateError("Bot id must be 1-32 lowercase letters, digits, '-' or '_'");
+  }
+  if (registration.name.trim() === "" || registration.name.length > 80) {
+    throw new StateError("Bot name must be 1-80 characters");
+  }
+  if (!BOT_ROLES.has(registration.role)) throw new StateError("Bot role must be assistant, researcher or programmer");
+  if (registration.conversationId.trim() === "") throw new StateError("Bot conversation is required");
+  if (registration.systemPrompt.length > 8_000) throw new StateError("Bot prompt must be at most 8000 characters");
+  const tools = parseBotTools(registration.tools);
+  if (tools !== registration.tools) throw new StateError("Bot tools must be normalized before storage");
 }
 
 /** SQLite has no `ADD COLUMN IF NOT EXISTS`; re-running the migration must stay a no-op. */

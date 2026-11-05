@@ -9,3 +9,9 @@ export class ConfigurationError extends Error {
 export class StateError extends Error {
   override name = "StateError";
 }
+
+// A requested object does not exist. Host surfaces answer it with a 404 instead of treating it as
+// an invalid request, which keeps "you sent something wrong" and "it is not there" distinguishable.
+export class NotFoundError extends StateError {
+  override name = "NotFoundError";
+}

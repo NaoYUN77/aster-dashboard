@@ -96,7 +96,7 @@ test("restart preserves confirmed segments and quarantines only the interrupted 
 test("reconciling partial delivery sends stored remainder without rerunning agent", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-delivery-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   let executions = 0;
   const firstShutdown = new AbortController();
   const sent: string[] = [];
@@ -192,7 +192,7 @@ test("an unknown model id is rejected with provider examples", () => {
 test("oversized input is refused explicitly instead of being silently dropped", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-input-limit-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     inbox.accept(1, { ...request, text: "x".repeat(16_001) });
     const shutdown = new AbortController();
@@ -363,7 +363,7 @@ test("prune retains the newest 100 sent requests and every unfinished request", 
 test("Telegram rejection is failed while a transport failure is uncertain, and neither resends", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-send-errors-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     inbox.accept(1, { ...request, requestId: "telegram:99:1" });
     inbox.accept(2, { ...request, requestId: "telegram:99:2" });
@@ -399,7 +399,7 @@ test("Telegram rejection is failed while a transport failure is uncertain, and n
 test("a truncated agent answer is delivered with an explicit incompleteness notice", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-truncated-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     inbox.accept(1, { ...request, requestId: "telegram:99:1" });
     const sent: string[] = [];
@@ -443,7 +443,7 @@ test("malformed Telegram updates are rejected at the boundary", () => {
 test("invalid updates are skipped without writing an unusable checkpoint", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-invalid-update-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     const sent: string[] = [];
     const shutdown = new AbortController();
@@ -496,7 +496,7 @@ test("invalid updates are skipped without writing an unusable checkpoint", async
 test("a failed agent session stops polling and leaves the request pending", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-session-failure-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     inbox.accept(1, { ...request, requestId: "telegram:99:1" });
     const fatal = Object.assign(
@@ -532,7 +532,7 @@ test("a local storage failure while saving a reply is fatal", async () => {
     next: () => ({ ...request, requestId: "telegram:99:1", status: "pending", reply: null }),
     saveReply: () => { throw new Error("database is locked"); },
   } as unknown as Inbox;
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: "unused", mcpConfigPath: "unused/mcp.json", mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: "unused", mcpConfigPath: "unused/mcp.json", mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   await assert.rejects(
     serveTelegram(config, "99", inbox, async () => "reply", new AbortController().signal, {
       updates: async () => [],
@@ -545,7 +545,7 @@ test("a local storage failure while saving a reply is fatal", async () => {
 test("a model failure is delivered as a notice and later requests still run", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-model-failure-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     inbox.accept(1, { ...request, requestId: "telegram:99:1" });
     inbox.accept(2, { ...request, requestId: "telegram:99:2" });

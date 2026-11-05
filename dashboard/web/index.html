@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Aster Console</title>
+<style nonce="{{NONCE}}">
+  :root {
+    --bg: #0f1216;
+    --panel: #171c22;
+    --panel-2: #1e252d;
+    --line: #2a323c;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #4c9aff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --user: #23405e;
+    --assistant: #1b2229;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #f0f2f5;
+      --line: #dcdfe4;
+      --text: #1b1f24;
+      --muted: #5c6773;
+      --accent: #1868d6;
+      --user: #dbe8fb;
+      --assistant: #f0f2f5;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .status { color: var(--muted); font-size: 12px; margin-left: auto; }
+  main { display: grid; grid-template-columns: 260px 1fr; min-height: 0; }
+  aside {
+    border-right: 1px solid var(--line);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .aside-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
+  #bots { list-style: none; margin: 0; padding: 6px; overflow: auto; flex: 1; }
+  #bots li { margin-bottom: 4px; }
+  .bot {
+    width: 100%;
+    text-align: left;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: transparent;
+    color: inherit;
+    padding: 8px 10px;
+    cursor: pointer;
+    display: grid;
+    gap: 2px;
+  }
+  .bot:hover { background: var(--panel-2); }
+  .bot[aria-current="true"] { background: var(--panel-2); border-color: var(--line); }
+  .bot strong { font-weight: 600; font-size: 13px; }
+  .bot small { color: var(--muted); font-size: 11px; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+  .dot.running { background: var(--ok); }
+  .dot.pending { background: var(--warn); }
+  section.chat { display: grid; grid-template-rows: auto 1fr auto; min-height: 0; }
+  .chat-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  .chat-head .meta { color: var(--muted); font-size: 12px; }
+  .chat-head .spacer { flex: 1; }
+  #messages { overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 780px; padding: 9px 12px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.user { background: var(--user); align-self: flex-end; }
+  .msg.assistant { background: var(--assistant); align-self: flex-start; }
+  .msg.note { color: var(--muted); font-size: 12px; background: transparent; border: 1px dashed var(--line); }
+  .msg.tool { color: var(--muted); font-size: 12px; background: transparent; padding: 0 12px; }
+  .empty { color: var(--muted); margin: auto; text-align: center; }
+  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 16px; }
+  footer .row { display: flex; gap: 8px; align-items: flex-end; }
+  textarea, input, select {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+  }
+  textarea { width: 100%; resize: vertical; min-height: 44px; max-height: 200px; }
+  button {
+    font: inherit; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text); padding: 8px 12px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--err); }
+  button:disabled { opacity: .5; cursor: default; }
+  dialog {
+    border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text);
+    width: min(520px, calc(100vw - 32px)); padding: 0;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.5); }
+  dialog form { display: grid; gap: 10px; padding: 16px; }
+  dialog h2 { font-size: 15px; margin: 0; }
+  dialog label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  dialog .actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .banner { padding: 6px 16px; font-size: 12px; border-bottom: 1px solid var(--line); display: none; }
+  .banner.show { display: block; }
+  .banner.error { background: rgba(248,81,73,.12); color: var(--err); }
+  @media (max-width: 720px) {
+    main { grid-template-columns: 1fr; }
+    aside { display: none; }
+    aside.open { display: flex; position: absolute; inset: 48px 0 0; z-index: 5; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Aster Console</h1>
+  <span class="status" id="status">未连接</span>
+  <button id="menu">Bots</button>
+  <button id="signOut" title="清除本地令牌">登出</button>
+</header>
+<div class="banner" id="banner"></div>
+<main>
+  <aside id="sidebar">
+    <div class="aside-head">
+      <span>Bots</span>
+      <button id="newBot" class="primary">新建</button>
+    </div>
+    <ul id="bots"></ul>
+  </aside>
+  <section class="chat">
+    <div class="chat-head">
+      <strong id="chatTitle">选择一个 bot</strong>
+      <span class="meta" id="chatMeta"></span>
+      <span class="spacer"></span>
+      <button id="cancel" class="danger" disabled>停止</button>
+    </div>
+    <div id="messages"><p class="empty">先在上方输入访问令牌，再选择一个 bot。</p></div>
+    <footer>
+      <div class="row">
+        <textarea id="text" rows="2" placeholder="给这个 bot 发消息（Ctrl+Enter 发送）" disabled></textarea>
+        <button id="send" class="primary" disabled>发送</button>
+      </div>
+    </footer>
+  </section>
+</main>
+
+<dialog id="createDialog">
+  <form method="dialog" id="createForm">
+    <h2>新建 bot</h2>
+    <label>名称<input id="botName" required maxlength="80" autocomplete="off"></label>
+    <label>角色
+      <select id="botRole">
+        <option value="assistant">assistant（通用）</option>
+        <option value="researcher">researcher（调研，无 PTC）</option>
+        <option value="programmer">programmer（可写脚本，PTC）</option>
+      </select>
+    </label>
+    <label>系统提示词（可选）<textarea id="botPrompt" rows="4" maxlength="8000"></textarea></label>
+    <div class="actions">
+      <button value="cancel" type="submit">取消</button>
+      <button value="create" type="submit" class="primary">创建</button>
+    </div>
+  </form>
+</dialog>
+
+<script nonce="{{NONCE}}">
+"use strict";
+const state = { token: "", bots: [], selected: null, source: null, live: null };
+
+const $ = (id) => document.getElementById(id);
+const statusLine = $("status");
+const banner = $("banner");
+
+function showError(message) {
+  banner.textContent = message;
+  banner.className = "banner show error";
+}
+function clearError() { banner.className = "banner"; banner.textContent = ""; }
+
+function readToken() {
+  try { return sessionStorage.getItem("aster.web.token") || ""; } catch { return ""; }
+}
+function writeToken(value) {
+  try { value ? sessionStorage.setItem("aster.web.token", value) : sessionStorage.removeItem("aster.web.token"); } catch {}
+}
+
+function setConnected(ok) {
+  statusLine.textContent = ok ? "已连接" : "未连接";
+  statusLine.style.color = ok ? "var(--ok)" : "var(--muted)";
+}
+
+async function api(path, options = {}) {
+  const headers = Object.assign({ "content-type": "application/json" }, options.headers || {});
+  if (state.token) headers.authorization = "Bearer " + state.token;
+  const response = await fetch(path, Object.assign({}, options, { headers }));
+  if (response.status === 401) {
+    state.token = "";
+    writeToken("");
+    setConnected(false);
+    throw new Error("访问令牌无效，请重新输入");
+  }
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || ("请求失败：" + response.status));
+  return body;
+}
+
+function askToken() {
+  const value = window.prompt("输入 WEB_TOKEN", readToken());
+  if (value === null) return false;
+  const token = value.trim();
+  if (!token) return false;
+  state.token = token;
+  writeToken(token);
+  return true;
+}
+
+function botLabel(bot) {
+  return bot.name + " · " + bot.role;
+}
+
+function renderBots() {
+  const list = $("bots");
+  list.replaceChildren();
+  for (const bot of state.bots) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.className = "bot";
+    button.type = "button";
+    button.setAttribute("aria-current", String(bot.botId === state.selected));
+    const dot = document.createElement("span");
+    dot.className = "dot" + (bot.running ? " running" : bot.pending > 0 ? " pending" : "");
+    const title = document.createElement("strong");
+    title.append(dot, document.createTextNode(botLabel(bot)));
+    const meta = document.createElement("small");
+    meta.textContent = bot.botId + " · 工具 " + (bot.loadedTools.join(", ") || "无")
+      + (bot.running ? " · 运行中" : bot.pending > 0 ? " · 排队 " + bot.pending : "");
+    button.append(title, meta);
+    button.addEventListener("click", () => selectBot(bot.botId));
+    item.append(button);
+    list.append(item);
+  }
+}
+
+function currentBot() {
+  return state.bots.find((bot) => bot.botId === state.selected) || null;
+}
+
+function renderChatMeta() {
+  const bot = currentBot();
+  $("chatTitle").textContent = bot ? bot.name : "选择一个 bot";
+  $("chatMeta").textContent = bot
+    ? bot.role + " · conversation " + bot.conversationId + (bot.status === "disabled" ? " · 已停用" : "")
+    : "";
+  const usable = Boolean(bot) && bot.status === "active";
+  $("text").disabled = !usable;
+  $("send").disabled = !usable;
+  $("cancel").disabled = !usable;
+}
+
+function appendMessage(role, text) {
+  const node = document.createElement("div");
+  node.className = "msg " + role;
+  node.textContent = text;
+  $("messages").append(node);
+  return node;
+}
+
+function note(text) {
+  const node = appendMessage("note", text);
+  $("messages").scrollTop = $("messages").scrollHeight;
+  return node;
+}
+
+function clearLive() {
+  if (state.live && state.live.isConnected) state.live.remove();
+  state.live = null;
+}
+
+async function loadHistory() {
+  const bot = currentBot();
+  const box = $("messages");
+  box.replaceChildren();
+  if (!bot) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "选择一个 bot 查看对话。";
+    box.append(empty);
+    return;
+  }
+  let body;
+  try {
+    body = await api("/api/bots/" + encodeURIComponent(bot.botId) + "/history?limit=200");
+  } catch (error) {
+    showError(error.message);
+    return;
+  }
+  if (body.messages.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "还没有对话。";
+    box.append(empty);
+  }
+  for (const message of body.messages) appendMessage(message.role, message.text);
+  box.scrollTop = box.scrollHeight;
+}
+
+async function refreshBots() {
+  const body = await api("/api/bots");
+  state.bots = body.bots;
+  if (state.selected && !state.bots.some((bot) => bot.botId === state.selected)) state.selected = null;
+  renderBots();
+  renderChatMeta();
+  setConnected(true);
+}
+
+function handleEvent(event) {
+  if (event.type === "delta") {
+    if (!state.live) {
+      state.live = appendMessage("assistant", "");
+      const box = $("messages");
+      const empty = box.querySelector(".empty");
+      if (empty) empty.remove();
+    }
+    state.live.textContent += event.text;
+    const box = $("messages");
+    box.scrollTop = box.scrollHeight;
+    return;
+  }
+  if (event.type === "tool") { note("调用工具 " + event.name); return; }
+  if (event.type === "error") { note("出错：" + event.message); return; }
+  if (event.type === "run_start") { clearLive(); return; }
+  if (event.type === "run_end" || event.type === "message_end") {
+    clearLive();
+    void loadHistory().catch(() => undefined);
+    void refreshBots().catch(() => undefined);
+  }
+}
+
+function openStream() {
+  if (state.source) { state.source.close(); state.source = null; }
+  if (!state.selected) return;
+  const source = new EventSource("/api/bots/" + encodeURIComponent(state.selected) + "/events?token=" + encodeURIComponent(state.token));
+  state.source = source;
+  source.onmessage = (message) => {
+    let payload;
+    try { payload = JSON.parse(message.data); } catch { return; }
+    if (payload.type === "snapshot") { setConnected(true); return; }
+    if (payload.type === "error") { showError(payload.message); return; }
+    if (payload.type === "events") for (const event of payload.events) handleEvent(event);
+  };
+  source.onerror = () => {
+    setConnected(false);
+    if (source.readyState === EventSource.CLOSED) return;
+    statusLine.textContent = "重连中…";
+  };
+}
+
+async function selectBot(botId) {
+  state.selected = botId;
+  clearLive();
+  renderBots();
+  renderChatMeta();
+  $("sidebar").classList.remove("open");
+  await loadHistory();
+  openStream();
+}
+
+async function send() {
+  const bot = currentBot();
+  const field = $("text");
+  const text = field.value.trim();
+  if (!bot || text === "") return;
+  $("send").disabled = true;
+  try {
+    await api("/api/bots/" + encodeURIComponent(bot.botId) + "/messages", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    field.value = "";
+    appendMessage("user", text);
+    $("messages").scrollTop = $("messages").scrollHeight;
+    await refreshBots();
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    $("send").disabled = false;
+  }
+}
+
+async function cancel() {
+  const bot = currentBot();
+  if (!bot) return;
+  try {
+    const result = await api("/api/bots/" + encodeURIComponent(bot.botId) + "/cancel", { method: "POST" });
+    note(result.cancelled ? "已撤回并停止本次请求。" : "已请求停止。");
+    await refreshBots();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+async function createBot() {
+  const dialog = $("createDialog");
+  const choice = await new Promise((resolve) => {
+    const form = $("createForm");
+    const onClose = () => {
+      form.removeEventListener("submit", onSubmit);
+      resolve({ choice: dialog.returnValue, name: $("botName").value, role: $("botRole").value, prompt: $("botPrompt").value });
+    };
+    const onSubmit = (event) => {
+      dialog.returnValue = event.submitter ? event.submitter.value : "cancel";
+      if (dialog.returnValue === "create" && !$("botName").value.trim()) {
+        event.preventDefault();
+        $("botName").focus();
+        return;
+      }
+      dialog.removeEventListener("close", onClose);
+      resolve({ choice: dialog.returnValue, name: $("botName").value, role: $("botRole").value, prompt: $("botPrompt").value });
+    };
+    dialog.addEventListener("close", onClose, { once: true });
+    form.addEventListener("submit", onSubmit);
+    dialog.showModal();
+    $("botName").focus();
+  });
+  if (choice.choice !== "create") return;
+  try {
+    const body = await api("/api/bots", {
+      method: "POST",
+      body: JSON.stringify({ name: choice.name.trim(), role: choice.role, systemPrompt: choice.prompt }),
+    });
+    $("botName").value = ""; $("botPrompt").value = "";
+    await refreshBots();
+    await selectBot(body.bot.botId);
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+async function boot() {
+  $("send").addEventListener("click", () => void send());
+  $("cancel").addEventListener("click", () => void cancel());
+  $("newBot").addEventListener("click", () => void createBot());
+  $("menu").addEventListener("click", () => $("sidebar").classList.toggle("open"));
+  $("signOut").addEventListener("click", () => {
+    state.token = ""; writeToken(""); setConnected(false);
+    state.bots = []; state.selected = null; clearLive();
+    if (state.source) { state.source.close(); state.source = null; }
+    renderBots(); renderChatMeta();
+    void boot();
+  });
+  $("text").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); void send(); }
+  });
+
+  if (!state.token) state.token = readToken();
+  if (!state.token) {
+    if (!askToken()) { showError("需要 WEB_TOKEN 才能连接。"); return; }
+  }
+  clearError();
+  try {
+    await refreshBots();
+  } catch (error) {
+    if (error.message.indexOf("访问令牌无效") >= 0) {
+      if (askToken()) { try { await refreshBots(); } catch (again) { showError(again.message); return; } }
+      else { showError(error.message); return; }
+    } else {
+      showError(error.message);
+      return;
+    }
+  }
+  const first = state.bots.find((bot) => bot.botId === "default") || state.bots[0];
+  if (first) await selectBot(first.botId);
+}
+
+void boot();
+</script>
+</body>
+</html>
