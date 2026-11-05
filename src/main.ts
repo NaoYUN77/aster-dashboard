@@ -130,7 +130,7 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       defaultWorkspace: config.execution?.remoteCwd ?? join(config.dataDir, "workspace"),
       bootstrapChannel: config.telegramEnabled ? "telegram" : "console",
       ptc: config.codemode !== undefined,
-      web: config.webApiKey !== undefined,
+      web: config.ccrProfile !== undefined,
       signal,
       log: console.error,
     });

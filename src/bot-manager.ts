@@ -33,7 +33,7 @@ export type OpenAgent = Awaited<ReturnType<typeof openAgent>>;
 /** The capabilities a role gets. The host decides this; the console never names tools directly. */
 export function toolsForRole(role: BotRole, deployment: { readonly ptc: boolean; readonly web: boolean }): string {
   if (role === "programmer") return deployment.ptc ? "bash,files,ptc" : "bash,files";
-  if (role === "researcher") return deployment.web ? "bash,files,web_search" : "bash,files";
+  if (role === "researcher") return deployment.web ? "bash,files,web" : "bash,files";
   return "bash,files";
 }
 
@@ -66,7 +66,7 @@ export type BotManagerOptions = {
   readonly bootstrapChannel?: "telegram" | "console";
   /** True when the deployment has code mode configured at all. */
   readonly ptc: boolean;
-  /** True when the deployment has web tools configured (`DEEPSEEK_WEB_API_KEY`). */
+  /** True when the deployment has a configured Claude Code Router profile. */
   readonly web: boolean;
   readonly signal: AbortSignal;
   readonly log?: (line: string) => void;

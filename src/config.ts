@@ -148,8 +148,14 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   // configuration error the operator cannot satisfy without creating a bot they do not use.
   const token = telegramEnabled ? required("TELEGRAM_BOT_TOKEN") : "";
   if (telegramEnabled) assertValidCredentialShape("TELEGRAM_BOT_TOKEN", token);
-  const webApiKey = env.DEEPSEEK_WEB_API_KEY?.trim();
-  if (webApiKey) assertValidCredentialShape("DEEPSEEK_WEB_API_KEY", webApiKey);
+  const ccrProfile = env.CCR_PROFILE?.trim();
+  if (ccrProfile && (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,127}$/.test(ccrProfile))) {
+    throw new ConfigurationError("CCR_PROFILE must be a configured profile name or id");
+  }
+  const ccrCommand = env.CCR_COMMAND?.trim() || "ccr";
+  if (ccrCommand.length > 512 || !/^[A-Za-z0-9_./:\\ -]+$/.test(ccrCommand)) {
+    throw new ConfigurationError("CCR_COMMAND must be an executable path without shell metacharacters");
+  }
   const execution = readExecutionConfig(env);
   const codemode = readCodemodeConfig(env);
   // Remote code mode runs its VM on the execution agent, so the gateway must be configured and
@@ -176,7 +182,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     provider,
     model: required("MODEL_ID"),
     telegramApiRoot,
-    ...(webApiKey ? { webApiKey } : {}),
+    ...(ccrProfile === undefined || ccrProfile === "" ? {} : { ccrProfile, ccrCommand }),
     ...(execution === undefined ? {} : { execution }),
     ...(codemodeConfig === undefined ? {} : { codemode: codemodeConfig }),
     ...paths,

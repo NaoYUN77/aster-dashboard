@@ -172,11 +172,11 @@ test("a registered provider requires only its own API key", () => {
     DEEPSEEK_API_KEY: "secret",
   });
   assert.equal(config.provider, "deepseek");
-  assert.equal(config.webApiKey, undefined);
+  assert.equal(config.ccrProfile, undefined);
   assert.equal(readConfig({
     TELEGRAM_BOT_TOKEN: "token", TELEGRAM_OWNER_ID: "42", MODEL_PROVIDER: "deepseek",
     MODEL_ID: "deepseek-flash", DEEPSEEK_API_KEY: "secret", DEEPSEEK_WEB_API_KEY: " web-secret ",
-  }).webApiKey, "web-secret");
+  }).ccrProfile, undefined);
   assert.throws(() => readConfig({
     TELEGRAM_BOT_TOKEN: "token", TELEGRAM_OWNER_ID: "42", MODEL_PROVIDER: "deepseek", MODEL_ID: "deepseek-flash",
   }), /Missing configuration: DEEPSEEK_API_KEY/);

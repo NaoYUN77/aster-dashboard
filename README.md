@@ -127,7 +127,7 @@ npm start
 - `MEMORY_ENABLED`：记忆系统总开关，默认开；设 `0` 整体关闭。其余 `MEMORY_*` 为预算、时区与归档超时。
 - `CODEMODE_ENABLED`：PTC／code mode 总开关，默认关；设 `1` 启用 `codemode` 工具。`CODEMODE_TIMEOUT_MS` 与 `CODEMODE_MEMORY_LIMIT_BYTES` 约束脚本期限和 QuickJS 内存。
 - `MCP_CONFIG`：MCP 配置文件路径，默认 `DATA_DIR/mcp.json`。
-- `DEEPSEEK_WEB_API_KEY`：可选；设置后启用内置 `web_search` 与 `web_fetch`，与模型 key 分开配置。
+- `CCR_PROFILE`：可选；配置已启用的 Claude Code Router profile 后，researcher bot 可调用 CCR 提供的 WebSearch 与 WebFetch。`CCR_COMMAND` 可覆盖可执行文件名，默认 `ccr`。CCR 与 Claude Code CLI 必须在应用运行环境内可用。
 - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`：可选；两个都设置时启用 Langfuse Cloud Trace，可用 `LANGFUSE_TRACING_ENABLED=0` 临时关闭。默认只上报 id、长度、计数、工具名和错误码，不上传消息、脚本、参数或文件内容。MITM 模式下 secret key 使用 `__vault_LANGFUSE_SECRET_KEY__`。配置、隐私边界与验收步骤见 [Langfuse Tracing](docs/langfuse-tracing.md)。
 
 私聊 bot 后直接发送文字即可。bot 若已配置 webhook，应用会拒绝启动，需先在原部署中停用 webhook。
@@ -148,7 +148,7 @@ npm start
 
 ## 工具
 
-常驻工具包括底座的 `bash`、`read`、`write`、`edit`，以及 `current_time`、上表中的记忆工具和配置 Web key 后启用的 `web_search`、`web_fetch`。内置工具使用底座 `defineTool` 注册；名称冲突在注册时直接拒绝。工具不是文件系统沙箱，生产环境应使用独立低权限用户运行。MCP 的配置字段、pin、授权、OAuth 和检查命令见 [工具与 MCP](docs/mcp.md)，通用工具契约见 [契约与生命周期](docs/contracts-and-lifecycle.md)。
+常驻工具包括底座的 `bash`、`read`、`write`、`edit`，以及 `current_time` 和上表中的记忆工具。Researcher bot 另有 `web_search`、`web_fetch`；assistant 与 programmer 不会获得 Web 工具。MCP 的配置字段、pin、授权、OAuth 和检查命令见 [工具与 MCP](docs/mcp.md)，通用工具契约见 [契约与生命周期](docs/contracts-and-lifecycle.md)。
 
 ### 代码调用工具（PTC，可选）
 
@@ -168,11 +168,11 @@ npm start
 
 阶段 1 只支持 shell；`read`／`write`／`edit` 等文件工具在远程模式下返回 `not_supported`，文件工作请用 `bash`。broker 不可达时应用启动失败，不回退本地执行。socket 目录权限、SSH 密钥与 known-hosts 路径（示例均为占位）、检查命令与失败语义见 [远程工具执行](docs/execution-remote.md)，设计取舍见 [ADR-0021](docs/adr/0021-control-execution-split.md)。
 
-### 内置 Web 工具
+### Researcher Web 工具
 
-`web_search` 与 `web_fetch` 直接通过 Aster 的工具注册表执行，不需要 `mcp.json` 或额外进程。设置独立的 `DEEPSEEK_WEB_API_KEY` 并重启后，两项工具同时注册；未设置时均不向模型声明。Search 返回来源与摘要，Fetch 返回规范化标题和 Markdown 正文。
+设置 `CCR_PROFILE` 为 CCR Agent Profiles 中已启用的 Claude Code profile 后，researcher bot 获得 `web_search` 与 `web_fetch`。每次调用都会通过 `ccr <profile> cli -- <Claude Code args>` 启动非交互 Claude Code CLI；Search 和 Fetch 分别只允许对应的原生 `WebSearch` 或 `WebFetch` 工具，并禁用额外 MCP 配置。未配置 profile 时 researcher 与 assistant 一样没有 Web 工具。旧 bot 的 capability 字符串会在激活时按 role 自动更新。
 
-两项工具按只读权限治理，但远端调用可能计费，因此不可自动重放。它们共享最多 2 个正在执行的请求，单次等待上限 20 秒；Search／Fetch 上游响应分别限 256／512 KiB，模型可见结果限 24 KiB。Fetch 会拒绝凭据 URL、IP literal、localhost／常见内部域名和自定义端口；这些本地检查不构成对供应商远端 DNS、重定向或 SSRF 行为的保证。供应商契约、价格、详细边界及待完成的真实 key 验证见 [Web 提供商调研](docs/web-search-provider-research.md)。
+CCR、Claude Code CLI 与 profile 必须在应用运行环境内已配置。子进程等待上限 60 秒，stdout/stderr 有大小限制；超时、启动失败和非零退出都会作为工具错误返回。Web Fetch 只接受无凭据的公网 HTTP(S) URL，并拒绝本地地址。Web 工具是只读授权，但因外部调用结果可能变化，工具不可自动重放。
 
 ## 开发
 

@@ -17,7 +17,7 @@ export type BotStatus = "active" | "disabled";
 
 /**
  * One bot and the conversation it owns. `tools` is a comma-separated capability list (`bash`,
- * `files`, `ptc`, `web_search`) rather than free text, so the host can validate it instead of trusting a prompt.
+ * `files`, `ptc`, `web`) rather than free text, so the host can validate it instead of trusting a prompt.
  */
 export interface BotRecord {
   botId: string;
@@ -40,7 +40,7 @@ export interface BotRegistration {
 }
 
 const BOT_ROLES: ReadonlySet<string> = new Set(["assistant", "researcher", "programmer"]);
-const BOT_TOOLS: ReadonlySet<string> = new Set(["bash", "files", "ptc", "web_search"]);
+const BOT_TOOLS: ReadonlySet<string> = new Set(["bash", "files", "ptc", "web"]);
 /** Bot ids are directory names under the workspace root, so the shape is fixed and short. */
 export const BOT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
@@ -384,7 +384,7 @@ export function consoleRequestBot(requestId: string): string | undefined {
   return match?.[1];
 }
 
-/** Normalize and validate a bot's capability list: `bash`, `files`, `ptc`, `web_search`, comma separated. */
+/** Normalize and validate a bot's capability list: `bash`, `files`, `ptc`, `web`, comma separated. */
 export function parseBotTools(value: unknown): string {
   if (typeof value !== "string") throw new StateError("Bot tools must be a comma-separated string");
   const names = [...new Set(value.split(",").map((name) => name.trim()).filter((name) => name !== ""))];
@@ -392,7 +392,7 @@ export function parseBotTools(value: unknown): string {
     if (!BOT_TOOLS.has(name)) throw new StateError(`Unknown bot tool: ${name.slice(0, 32)}`);
   }
   // Order is fixed by the host, so the same capability set is always stored the same way.
-  return ["bash", "files", "ptc", "web_search"].filter((name) => names.includes(name)).join(",");
+  return ["bash", "files", "ptc", "web"].filter((name) => names.includes(name)).join(",");
 }
 
 export function isBotId(value: unknown): value is string {

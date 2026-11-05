@@ -64,13 +64,12 @@ test("readConfig accepts __vault_<NAME>__ placeholders and rejects malformed pla
     MODEL_PROVIDER: "deepseek",
     MODEL_ID: "deepseek-chat",
     DEEPSEEK_API_KEY: "__vault_DEEPSEEK_API_KEY__",
-    DEEPSEEK_WEB_API_KEY: "__vault_DEEPSEEK_WEB_API_KEY__",
     HTTPS_PROXY: "http://aster-mitm:14322",
     HTTP_PROXY: "http://aster-mitm:14322",
   };
   const cfg = readConfig(base);
   assert.equal(cfg.token, "__vault_TELEGRAM_BOT_TOKEN__");
-  assert.equal(cfg.webApiKey, "__vault_DEEPSEEK_WEB_API_KEY__");
+  assert.equal(cfg.ccrProfile, undefined);
   assert.equal(isVaultPlaceholder("__vault_DEEPSEEK_API_KEY__"), true);
   assert.equal(isVaultPlaceholder("__vault_bad-name__"), false);
 
@@ -83,7 +82,7 @@ test("readConfig accepts __vault_<NAME>__ placeholders and rejects malformed pla
     ConfigurationError,
   );
   assert.throws(
-    () => readConfig({ ...base, DEEPSEEK_WEB_API_KEY: "__vault_bad__" }),
+    () => readConfig({ ...base, CCR_PROFILE: "invalid;profile" }),
     ConfigurationError,
   );
   assert.throws(
@@ -335,7 +334,7 @@ test("deployment example, MITM overlay, and allowlist stay aligned without real 
   }
   assert.equal(seenSecrets.get("TELEGRAM_BOT_TOKEN"), "__vault_TELEGRAM_BOT_TOKEN__");
   assert.equal(seenSecrets.get("DEEPSEEK_API_KEY"), "__vault_DEEPSEEK_API_KEY__");
-  assert.equal(seenSecrets.get("DEEPSEEK_WEB_API_KEY"), "__vault_DEEPSEEK_WEB_API_KEY__");
+  assert.equal(seenSecrets.has("DEEPSEEK_WEB_API_KEY"), false, "the retired web credential must not be configured");
 
   const allowlist = JSON.parse(
     await readFile(join(root, "deploy", "openbao-mitm", "addon", "allowlist.json"), "utf8"),

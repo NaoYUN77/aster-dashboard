@@ -39,7 +39,7 @@ import { createReminderExtension, type ReminderStore } from "./reminders.js";
 import { createToolRegistry, personalTools, type ToolAuthority } from "./tools.js";
 import { beginRequest, traceExtension, type TraceOutcome } from "./trace.js";
 import { hasUnfinishedModelToolCalls, hideFromModel, SCRIPT_ONLY_TOOLS } from "./tool-exposure.js";
-import { createWebExtension } from "./web-tools.js";
+import { createCcrWebExtension } from "./ccr-web-tools.js";
 import { inspectGithubToolRecovery, readResidentTools, withToolLedger } from "./tool-ledger.js";
 import { installMcpTools, orderedMcpExtensions } from "./tool-pins.js";
 
@@ -149,7 +149,7 @@ export type BotConversationProfile = {
   readonly channel?: "telegram" | "console";
   /** Operator-written system prompt for this bot; empty keeps only the base instructions. */
   readonly prompt: string;
-  /** Capability list; `ptc` and `web_search` change the extension selection. */
+  /** Capability list; `ptc` and `web` change the extension selection. */
   readonly tools: readonly string[];
 };
 
@@ -315,9 +315,9 @@ ${channel === "console"
   // its bound; the next user request starts a fresh run with cleared counters.
   const loopGuard = createLoopGuard(options.toolReviewLog ?? console.error);
   registry.install(loopGuard.extension);
-  const webExtension = config.webApiKey === undefined
+  const webExtension = config.ccrProfile === undefined
     ? undefined
-    : scriptPolicy(createWebExtension({ apiKey: config.webApiKey }));
+    : scriptPolicy(createCcrWebExtension({ command: config.ccrCommand ?? "ccr", profile: config.ccrProfile }));
   if (webExtension !== undefined) registry.install(webExtension);
   // Memory wiring (MEM-07) goes through the one composition entry; with MEMORY_ENABLED=0 the
   // application keeps exactly its previous registry, settings and request path. The memory
@@ -589,7 +589,7 @@ ${channel === "console"
        */
       async configureBot(profile: BotConversationProfile): Promise<ConfiguredBot> {
         const wantsPtc = profile.tools.includes("ptc");
-        const wantsWeb = profile.tools.includes("web_search");
+        const wantsWeb = profile.tools.includes("web");
         if (wantsPtc && codemode === undefined) {
           throw new ConfigurationError(
             `Bot "${profile.botId}" requires code mode, but CODEMODE_ENABLED is not set on this deployment`,
@@ -597,7 +597,7 @@ ${channel === "console"
         }
         if (wantsWeb && webExtension === undefined) {
           throw new ConfigurationError(
-            `Bot "${profile.botId}" requires web_search, but DEEPSEEK_WEB_API_KEY is not set on this deployment`,
+            `Bot "${profile.botId}" requires web tools, but CCR_PROFILE is not set on this deployment`,
           );
         }
         const remove = [

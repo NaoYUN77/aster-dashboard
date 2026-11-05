@@ -17,10 +17,19 @@ import {
   fauxToolCall,
   type FauxResponseFactory,
 } from "@earendil-works/pi-ai/providers/faux";
+import { toolsForRole } from "../src/bot-manager.js";
 import { startService, type ServiceHandle } from "../src/main.js";
 
 const TOKEN = "{{SECRET_5xpdbsvp}}";
 const MODEL = "faux-1";
+
+test("role capability strings keep web tools exclusive to configured researchers", () => {
+  const deployment = { ptc: true, web: true };
+  assert.equal(toolsForRole("assistant", deployment), "bash,files");
+  assert.equal(toolsForRole("researcher", deployment), "bash,files,web");
+  assert.equal(toolsForRole("programmer", deployment), "bash,files,ptc");
+  assert.equal(toolsForRole("researcher", { ptc: true, web: false }), "bash,files");
+});
 
 function environment(dataDir: string): NodeJS.ProcessEnv {
   return {
@@ -38,8 +47,8 @@ function environment(dataDir: string): NodeJS.ProcessEnv {
     // stay visible so both roles share a comparable base surface.
     CODEMODE_ENABLED: "1",
     CODEMODE_SCRIPT_FIRST: "0",
-    // Web tools are on so the researcher role's extra capability is observable.
-    DEEPSEEK_WEB_API_KEY: "faux-web-key",
+    // A configured CCR profile enables the researcher's native Claude Code web tools.
+    CCR_PROFILE: "test-researcher-profile",
   };
 }
 
@@ -221,15 +230,16 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     const programmerId = programmer.body.bot.botId as string;
     assert.notEqual(researcher.body.bot.conversationId, programmer.body.bot.conversationId);
 
-    // Acceptance 3: the prompt and the tools differ per bot; only the programmer has code mode,
-    // and only the researcher keeps web_search (assistant/programmer lose the web-tools extension).
+    // Acceptance 3: only the programmer has code mode and only the researcher has web access.
     assert.ok(researcher.body.bot.loadedTools.includes("bash"));
     assert.ok(researcher.body.bot.loadedTools.includes("web_search"));
+    assert.ok(researcher.body.bot.loadedTools.includes("web_fetch"));
     assert.ok(!researcher.body.bot.loadedTools.includes("codemode"));
     assert.ok(programmer.body.bot.loadedTools.includes("codemode"));
     assert.ok(!programmer.body.bot.loadedTools.includes("web_search"));
-    assert.ok(researcher.body.bot.tools.includes("web_search"));
-    assert.ok(!programmer.body.bot.tools.includes("web_search"));
+    assert.ok(!programmer.body.bot.loadedTools.includes("web_fetch"));
+    assert.ok(researcher.body.bot.tools.includes("web"));
+    assert.ok(!programmer.body.bot.tools.includes("web"));
 
     // Unknown bots are 404 and an invalid role is 400.
     assert.equal((await console.call("/api/bots/nobody/messages", { text: "hi" })).status, 404);
