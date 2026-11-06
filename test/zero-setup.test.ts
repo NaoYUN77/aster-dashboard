@@ -30,7 +30,7 @@ function makeManifest(overrides: Partial<PlatformDependencies> = {}): PlatformMa
     webViaPlatformCredential: true,
     taskDeliverable: true,
     ptcConfigured: true,
-    sandboxVerified: true,
+    computerHost: true,
     mcpConnected: true,
     ...overrides,
   }, () => new Date("2026-11-06T00:00:00.000Z"));
@@ -146,7 +146,7 @@ function restarted(store: MemoryProvisioningStore, runtime: FakeRuntime, manifes
 test("platform manifest marks unconfigured services unavailable and gates internal defaults", () => {
   const manifest = makeManifest({
     memoryEnabled: false, webConfigured: false, taskDeliverable: false,
-    ptcConfigured: false, sandboxVerified: false, mcpConnected: false,
+    ptcConfigured: false, computerHost: false, mcpConnected: false,
   });
   const states = new Map(manifest.capabilities.map((entry) => [entry.id, entry.state]));
   assert.equal(states.get("core"), "available");
@@ -156,7 +156,7 @@ test("platform manifest marks unconfigured services unavailable and gates intern
   assert.equal(states.get("web"), "unavailable");
   assert.equal(states.get("computer"), "unavailable");
   assert.equal(states.get("task"), "unavailable");
-  // The host's unsandboxed bash is never a zero-setup default.
+  // Bash is only a zero-setup default when the shared execution host is configured.
   assert.equal(manifest.defaults.shell, false);
   assert.equal(manifest.defaults.web, false);
   assert.equal(manifest.defaults.ptc, false);
@@ -166,7 +166,7 @@ test("platform manifest marks unconfigured services unavailable and gates intern
   assert.equal(manifest.defaults.core, true);
   assert.equal(manifest.defaults.files, true);
   assert.match(manifest.fingerprint, /^[a-f0-9]{64}$/);
-  assert.match(manifest.capabilities.find((entry) => entry.id === "computer")!.reason, /沙箱/);
+  assert.match(manifest.capabilities.find((entry) => entry.id === "computer")!.reason, /未配置共享执行主机/);
   assert.ok(manifest.capabilities.every((entry) => !/Bearer|sk-|api[_-]?key/i.test(entry.reason)),
     "operator reasons never carry a credential");
 });
@@ -175,9 +175,17 @@ test("a changed deployment changes the manifest fingerprint", () => {
   assert.notEqual(makeManifest().fingerprint, makeManifest({ webConfigured: false }).fingerprint);
 });
 
+test("a configured shared execution host grants Bash but not codemode", () => {
+  const manifest = makeManifest({ ptcConfigured: true, computerHost: true });
+  assert.equal(manifest.capabilities.find((entry) => entry.id === "computer")!.state, "available");
+  assert.equal(manifest.defaults.shell, true);
+  // Phase 1 migrates Bash / Read / Write / Edit only; a configured codemode is not a grant.
+  assert.equal(manifest.defaults.ptc, false);
+});
+
 test("capability resolver closes unavailable groups with exact-name reasons", () => {
   const { manifest, integrations } = harness({
-    manifest: makeManifest({ webConfigured: false, sandboxVerified: false, taskDeliverable: false }),
+    manifest: makeManifest({ webConfigured: false, computerHost: false, taskDeliverable: false }),
   });
   const resolved = resolveCatalog({ manifest, integrations });
   assert.equal(resolved.profile.core, true);
@@ -369,7 +377,7 @@ test("deferred discovery only sees tools whose capability is actually available"
   const entries = registry.snapshot().tools().map(({ tool }) => ({ tool, record: registry.lookup(tool.name) }));
   const { integrations } = harness();
   const off = resolveCatalog({
-    manifest: makeManifest({ webConfigured: false, sandboxVerified: false }), integrations,
+    manifest: makeManifest({ webConfigured: false, computerHost: false }), integrations,
   });
   const on = resolveCatalog({ manifest: makeManifest(), integrations });
   const offNames = catalogFor(entries, off.profile, off.scope).names;

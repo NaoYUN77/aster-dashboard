@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Acceptance run for the one-machine dashboard overlay (app + aster-sandbox).
+# Acceptance run for the one-machine dashboard overlay (app + local shared Execution Host).
 #
 # Run from a clean deployment host, from the repository root:
 #   bash dashboard/acceptance/run.sh                 # build, start, drive criteria 1,2,3,4,5,6,7,8,10
@@ -23,14 +23,14 @@ for argument in "$@"; do
 done
 
 export ASTER_DASHBOARD_ENV_FILE=$ENV_FILE
+# The local execution-host stand-in reuses the app image; there is no separate sandbox image.
 export ASTER_IMAGE=${ASTER_IMAGE:-aster:local}
-export ASTER_SANDBOX_IMAGE=${ASTER_SANDBOX_IMAGE:-aster-sandbox:local}
 # Dedicated volumes keep acceptance bots and files away from a real deployment on the same host.
 export ASTER_APP_VOLUME=${ASTER_APP_VOLUME:-aster-acceptance-app}
-export ASTER_SANDBOX_RUNTIME_VOLUME=${ASTER_SANDBOX_RUNTIME_VOLUME:-aster-acceptance-runtime}
-export ASTER_SANDBOX_WORKSPACES_VOLUME=${ASTER_SANDBOX_WORKSPACES_VOLUME:-aster-acceptance-workspaces}
-# This harness exercises the pre-zero-setup explicit profile/PTC surface. Production deployments
-# keep ALLOW_LEGACY_CATALOG unset (zero-setup); only this acceptance run opts into the old surface.
+export ASTER_EXECUTION_RUNTIME_VOLUME=${ASTER_EXECUTION_RUNTIME_VOLUME:-aster-acceptance-runtime}
+export ASTER_EXECUTION_WORKSPACES_VOLUME=${ASTER_EXECUTION_WORKSPACES_VOLUME:-aster-acceptance-workspaces}
+# This harness exercises the pre-zero-setup explicit-profile surface (no PTC in Phase 1). Production
+# deployments keep ALLOW_LEGACY_CATALOG unset (zero-setup); only this acceptance run opts into it.
 export ALLOW_LEGACY_CATALOG=1
 
 compose() {
@@ -65,19 +65,19 @@ compose up -d --build || die "compose up failed"
 echo "PASS A1 overlay started in $(( $(date +%s) - started ))s"
 
 running=$(compose ps --status running --format '{{.Service}}' | sort | tr '\n' ' ')
-[[ "$running" == "aster-sandbox personal-agent " ]] \
+[[ "$running" == "execution-host personal-agent " ]] \
   && pass "A1 both services are running" \
   || fail "A1 running services: $running"
 
-sandbox_status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
-  "$(compose ps -q aster-sandbox)" 2>/dev/null || echo unknown)
+host_status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+  "$(compose ps -q execution-host)" 2>/dev/null || echo unknown)
 for _ in $(seq 1 60); do
-  [[ "$sandbox_status" == "healthy" ]] && break
+  [[ "$host_status" == "healthy" ]] && break
   sleep 2
-  sandbox_status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
-    "$(compose ps -q aster-sandbox)" 2>/dev/null || echo unknown)
+  host_status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+    "$(compose ps -q execution-host)" 2>/dev/null || echo unknown)
 done
-[[ "$sandbox_status" == "healthy" ]] && pass "A1 the sandbox is healthy" || fail "A1 sandbox health: $sandbox_status"
+[[ "$host_status" == "healthy" ]] && pass "A1 the execution host is healthy" || fail "A1 host health: $host_status"
 
 echo "== A10: loopback-only console and token gate"
 published=$(compose port personal-agent 8787 | head -1 | tr -d '\r')
@@ -107,7 +107,7 @@ done
 app_id=$(compose ps -q personal-agent)
 [[ -n "$app_id" ]] || die "the app container is not running"
 
-echo "== A2/A3/A4/A5/A6/A7: console, bots, isolation, concurrency, events, cancel"
+echo "== A2/A3/A4/A5/A6/A7: console, bots, workspaces, concurrency, events, cancel"
 docker cp dashboard/acceptance/console-check.mjs "$app_id:/tmp/console-check.mjs" >/dev/null
 if ! docker exec "$app_id" node /tmp/console-check.mjs; then
   fail "A2-A7 console acceptance reported failures"
@@ -125,14 +125,14 @@ if ! docker exec "$app_id" node /tmp/console-check.mjs --verify-restart; then
   fail "A8 restart acceptance reported failures"
 fi
 
-echo "== A4/A5/A7: sandbox boundaries over the RPC socket"
+echo "== A4/A5/A7: shared-host boundaries over the RPC socket"
 app_image=$(docker inspect --format '{{.Config.Image}}' "$app_id")
 if ! docker run --rm --network none --read-only --tmpfs /tmp:mode=1777 --user 1000:1000 \
   --env EXECUTION_RPC_TRANSPORT=unix --env EXECUTION_RPC_SOCKET=/run/aster/rpc.sock \
-  --mount "type=volume,source=${ASTER_SANDBOX_RUNTIME_VOLUME},target=/run/aster,readonly" \
-  --mount "type=bind,source=${ROOT}/dashboard/acceptance/sandbox-check.mjs,target=/check.mjs,readonly" \
+  --mount "type=volume,source=${ASTER_EXECUTION_RUNTIME_VOLUME},target=/run/aster,readonly" \
+  --mount "type=bind,source=${ROOT}/dashboard/acceptance/execution-host-check.mjs,target=/check.mjs,readonly" \
   --entrypoint node "$app_image" /check.mjs; then
-  fail "A4/A5/A7 sandbox acceptance reported failures"
+  fail "A4/A5/A7 shared-host acceptance reported failures"
 fi
 
 if (( WITH_TESTS )); then

@@ -68,8 +68,10 @@ flowchart LR
   对同一工作区与会话重新体检并重建内存中的会话目录。失败可经 `POST /api/bots/:id/retry`
   重试，重试不分配第二个工作区或会话。
 - **能力来源**：`PLATFORM_WEB_SEARCH_API_KEY` 是宿主自有凭据（与 `CCR_PROFILE` 互斥），不进模型
-  上下文、工具声明、Bot 行或日志；`PLATFORM_SANDBOX_VERIFIED=1` 要求已配置并验收的远程执行面，
-  否则 Computer 能力（`bash` / `codemode`）默认关闭，宿主 bash 不作为安全默认值。
+  上下文、工具声明、Bot 行或日志；Computer 能力（`bash` 与 Read / Write / Edit）来自已配置的
+  RPC 执行面，即单台共享 CVM Execution Host。本阶段明确是单用户 MVP，不提供 OS 级隔离、每 Bot
+  容器或每 Bot UID；启动时的 RPC `health.check` 与各 Bot 工作区探针保持 fail-closed，宿主本地
+  bash 仍不作为零配置默认值。见 [共享执行主机 Runbook](docs/runbook-shared-execution-host.md)。
 - **外部集成**：本阶段只实现 `disconnected | authorization_pending | connected` 状态抽象与授权
   请求接口（`integration_status` / `integration_request`、`POST /api/integrations/:service/
   authorization-requests`）。授权请求只登记 pending，返回 `connected: false`，不会伪造连接；
@@ -79,7 +81,7 @@ flowchart LR
 
 设计取舍与已知边界见 [ADR-0023](docs/adr/zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md)。
 零配置流程由 `test/zero-setup.test.ts` 与 `test/zero-setup-wiring.test.ts` 覆盖；真实模型供应商、
-远程 sandbox 与控制台的部署验收仍需运维在目标机器上执行，仓库不把未执行的部署验证记为通过。
+远程共享执行主机与控制台的部署验收仍需运维在目标机器上执行，仓库不把未执行的部署验证记为通过。
 
 ## 已验证与尚未验证
 
@@ -103,8 +105,8 @@ flowchart LR
 
 - 回复已持久化但请求收尾未执行时进程被杀，该轮的轮数计数会永久滞后一轮（回复与状态一致，压缩评估点后移）。见 issue #26。
 - 单会话串行。长期繁忙时消息留在 Telegram 侧。
-- `bash` 等工具不是沙箱。零配置模式下未验收 OS 隔离时 Computer 能力默认关闭；QuickJS 只约束脚本，其嵌套 `bash` 调用仍具有执行面权限。
-- 本阶段没有真实 OAuth 集成连接、供应商实时连通性探测、已验收的 OS 级沙箱，也没有进程内多用户账号体系（跨用户隔离仍按独立 `DATA_DIR` 部署）。Memory 仍是全局而非每 Bot 独立；容器 dashboard overlay 的原始 bash 仍可列出兄弟工作区目录。见 [ADR-0023](docs/adr/zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md)。
+- `bash` 等工具不是沙箱。Phase 1 的 Computer 能力经 mTLS RPC 连到单台共享 CVM Execution Host，所有 Bot 共用软件与文件，只保留各自默认工作目录；QuickJS 只约束脚本，其嵌套 `bash` 调用仍具有执行面权限。
+- 本阶段没有真实 OAuth 集成连接、供应商实时连通性探测、OS 级隔离（按 2026-11-06 架构决策明确不需要），也没有进程内多用户账号体系（单用户 MVP，跨用户隔离仍按独立 `DATA_DIR` 部署）。Memory 仍是全局而非每 Bot 独立；共享执行主机的原始 bash 可列出兄弟工作区目录，这是被接受的取舍而非待修复缺陷。见 [ADR-0023](docs/adr/zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md)。
 
 ## 对话示例
 
@@ -161,7 +163,7 @@ npm start
 - `CODEMODE_ENABLED`：PTC／code mode 总开关，默认关；设 `1` 启用 `codemode` 工具。`CODEMODE_TIMEOUT_MS` 与 `CODEMODE_MEMORY_LIMIT_BYTES` 约束脚本期限和 QuickJS 内存。
 - `MCP_CONFIG`：MCP 配置文件路径，默认 `DATA_DIR/mcp.json`。
 - `PLATFORM_WEB_SEARCH_API_KEY`：宿主自有 Web 凭据，零配置模式下自动为所有 Bot 提供 `web_search` / `web_fetch`；与 `CCR_PROFILE` 互斥，不进模型上下文、Bot 配置或日志。未设置时 Web 能力明确标为 `unavailable`。
-- `PLATFORM_SANDBOX_VERIFIED` / `ALLOW_LEGACY_CATALOG`：见「开箱即用」一节；前者默认 0（Computer 关闭），后者默认 0（零配置）。
+- `ALLOW_LEGACY_CATALOG`：见「开箱即用」一节；默认 0（零配置）。Computer 能力不由开关声明，而由 `EXECUTION_MODE=remote` 加 rpc 传输决定，见 [共享执行主机 Runbook](docs/runbook-shared-execution-host.md)。
 - `CCR_PROFILE`：**旧版兼容路径**，仅在 `ALLOW_LEGACY_CATALOG=1` 且 `profile.web=true` 且 `toolScope` 允许时提供 CCR 的 WebSearch 与 WebFetch。`CCR_COMMAND` 可覆盖可执行文件名，默认 `ccr`。CCR 与 Claude Code CLI 必须在应用运行环境内可用。
 - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`：可选；两个都设置时启用 Langfuse Cloud Trace，可用 `LANGFUSE_TRACING_ENABLED=0` 临时关闭。默认只上报 id、长度、计数、工具名和错误码，不上传消息、脚本、参数或文件内容。MITM 模式下 secret key 使用 `__vault_LANGFUSE_SECRET_KEY__`。配置、隐私边界与验收步骤见 [Langfuse Tracing](docs/langfuse-tracing.md)。
 

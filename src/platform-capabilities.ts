@@ -45,8 +45,11 @@ export type PlatformDependencies = {
   /** One-time reminders need a delivery identity; without it the task capability is unavailable. */
   readonly taskDeliverable: boolean;
   readonly ptcConfigured: boolean;
-  /** Set only after the OS-isolation acceptance runbook has passed for this deployment. */
-  readonly sandboxVerified: boolean;
+  /**
+   * A shared Computer / Execution Host is reachable over the RPC transport. Phase 1 does not
+   * require OS-level isolation; the startup health probe is the real, fail-closed verification.
+   */
+  readonly computerHost: boolean;
   /** True only when an external integration actually reached a connected state. */
   readonly mcpConnected: boolean;
 };
@@ -82,11 +85,11 @@ export function buildPlatformManifest(
             : "CCR profile 已配置；依赖应用运行环境内的 CCR 与 Claude Code CLI。")
         : "未配置平台 Web 凭据或 CCR profile；Web Search/Fetch 不可用。"),
     capability("workspace", "available", "host-verified", "每个 bot 的持久化工作目录由宿主创建并校验。"),
-    capability("computer", deps.sandboxVerified ? "available" : "unavailable",
-      deps.sandboxVerified ? "configured-only" : "not-configured",
-      deps.sandboxVerified
-        ? "已声明通过 OS 级隔离验收；命令执行走隔离执行面。"
-        : "未验收 OS 级沙箱；不把宿主 bash 当作默认执行环境。"),
+    capability("computer", deps.computerHost ? "available" : "unavailable",
+      deps.computerHost ? "configured-only" : "not-configured",
+      deps.computerHost
+        ? "共享 CVM 执行主机已配置；启动时由 RPC health.check 验证 Bash 与文件原语，工作区由执行面按需创建。"
+        : "未配置共享执行主机；Bash / Read / Write / Edit 不可用。"),
     capability("task", deps.taskDeliverable ? "available" : "unavailable",
       deps.taskDeliverable ? "host-verified" : "not-configured",
       deps.taskDeliverable ? "提醒存储与投递身份可用。" : "一次性提醒需要 Telegram 投递身份；当前部署未启用。"),
@@ -95,12 +98,12 @@ export function buildPlatformManifest(
   ];
   const defaults = parseCatalogProfile({
     core: true,
-    shell: deps.sandboxVerified,
+    shell: deps.computerHost,
     files: true,
     web: deps.webConfigured,
-    // QuickJS bounds the script, but its nested bash/file calls still reach the host execution
-    // environment. Without a verified OS sandbox, codemode is not a safe zero-setup default.
-    ptc: deps.ptcConfigured && deps.sandboxVerified,
+    // Phase 1 migrates Bash / Read / Write / Edit to the shared execution host. Codemode and the
+    // other tool families follow later; they are not granted just because CODEMODE_ENABLED is set.
+    ptc: false,
     memory: deps.memoryEnabled,
     reminders: deps.taskDeliverable,
     // External integrations are never open just because a bot was created.

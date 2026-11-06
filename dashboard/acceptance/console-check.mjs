@@ -16,6 +16,10 @@ const verifyRestart = process.argv.includes("--verify-restart");
 const runTimeoutMs = Number(process.env.ACCEPTANCE_RUN_TIMEOUT_MS ?? 180_000);
 const results = [];
 
+// Phase 1 migrates Bash / Read / Write / Edit to the shared Execution Host only. The legacy
+// explicit-profile surface is still exercised here (ALLOW_LEGACY_CATALOG=1), but an explicit
+// ptc: true must NOT resurrect codemode: the app sets CODEMODE_ENABLED=0 and the shared host
+// deliberately advertises no PTC. The two variable names below are historical identifiers.
 const ptcDisabledProfile = {
   core: true,
   shell: true,
@@ -193,18 +197,19 @@ async function phaseA() {
     && profileMatches(ptcEnabled.profile, ptcEnabledProfile)
     && profileMatches(JSON.parse(rowOf(ptcDisabledId).profile), ptcDisabledProfile)
     && profileMatches(JSON.parse(rowOf(ptcEnabledId).profile), ptcEnabledProfile));
-  check("A3 compatibility tools reflect explicit PTC switches",
+  check("A3 the Phase 1 tools projection grants bash but no codemode",
     rowOf(ptcDisabledId).tools.split(",").includes("bash")
+    && rowOf(ptcEnabledId).tools.split(",").includes("bash")
     && !rowOf(ptcDisabledId).tools.split(",").includes("ptc")
-    && rowOf(ptcEnabledId).tools.split(",").includes("ptc"),
+    && !rowOf(ptcEnabledId).tools.split(",").includes("ptc"),
     `PTC disabled=${rowOf(ptcDisabledId).tools}; PTC enabled=${rowOf(ptcEnabledId).tools}`);
-  check("A3 only the bot with PTC enabled has code mode loaded",
-    !ptcDisabled.loadedTools.includes("codemode") && ptcEnabled.loadedTools.includes("codemode"),
+  check("A3 Phase 1 loads no code mode, even with an explicit legacy ptc switch",
+    !ptcDisabled.loadedTools.includes("codemode") && !ptcEnabled.loadedTools.includes("codemode"),
     `PTC disabled=${ptcDisabled.loadedTools.join(",")}; PTC enabled=${ptcEnabled.loadedTools.join(",")}`);
 
   // Acceptance 4 + 6: A writes its marker through bash; the run is observed live.
   const aRun = await prompt(ptcDisabledId,
-    "You are in a sandboxed working directory. Use the bash tool exactly once with the command "
+    "You are in your own default working directory. Use the bash tool exactly once with the command "
     + "`printf 'hello-from-A' > acceptance-a.txt && pwd`. Then reply with exactly the command output "
     + "followed by the word WROTE-A on the next line, nothing else.");
   const aKinds = aRun.events.map((event) => event.type);
@@ -230,11 +235,11 @@ async function phaseA() {
     !bTexts.some((text) => text.includes("acceptance-a.txt")),
     bTexts.at(-1)?.slice(0, 160) ?? "");
 
-  // Acceptance 3, behavioural half: profile.ptc=false leaves code mode unavailable.
+  // Acceptance 3, behavioural half: no bot has a code-mode tool to call in Phase 1.
   const ptcAttempt = await prompt(ptcDisabledId,
     "Call the codemode tool to evaluate the script `1 + 1`. If code mode is not available, reply exactly NO-CODE.");
   const ptcToolNames = toolNames(ptcAttempt.events);
-  check("A3 the bot with PTC disabled has no code-mode tool to call",
+  check("A3 no bot has a code-mode tool to call in Phase 1",
     !ptcToolNames.some((name) => name.includes("codemode")),
     ptcToolNames.join(",") || "no tool events");
 

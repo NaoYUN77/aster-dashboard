@@ -1,10 +1,14 @@
+import { mkdir, stat } from "node:fs/promises";
 import { createSecureContext } from "node:tls";
 import { ConfigurationError } from "../errors.js";
 import { describeRpcAgentConfig, readRpcAgentConfig, readTlsMaterial } from "./rpc-config.js";
 import { probePtcRuntime, type PtcRuntimeProbe } from "./ptc-cgroup.js";
-import { readPtcConfig } from "./ptc-config.js";
+import { readPtcConfig, type PtcConfig } from "./ptc-config.js";
 import { DirectExecutor } from "./direct-executor.js";
 import { PtcExecutor } from "./ptc-executor.js";
+import {
+  assertNotRoot, describeSharedHostConfig, readSharedHostConfig, SharedHostDirectHost,
+} from "./shared-host.js";
 import { startRpcAgent } from "./rpc-server.js";
 import { listenTlsRpc, listenUnixRpc, type RpcServer } from "./rpc-transport.js";
 
@@ -13,6 +17,11 @@ const USAGE = `Usage: node dist/src/execution/rpc-main.js [--check]
 Reads EXECUTION_AGENT_* from the environment. --check validates the bind address, limits, and
 TLS material without listening or executing anything. TCP mode requires a private or loopback IP
 and mutual TLS; Unix mode is intended for local tests or same-host deployments.
+
+Phase 1 shared host (single-user MVP): EXECUTION_AGENT_SHARED_HOST=1 serves Bash / Read / Write /
+Edit on one shared Computer / Execution Host with no OS-level isolation. It must run as a dedicated
+non-root user and does not start bwrap, cgroups or PTC. EXECUTION_AGENT_WORKSPACES (default: none,
+required), EXECUTION_AGENT_TMP_ROOT, EXECUTION_AGENT_SHELL and EXECUTION_AGENT_PATH configure it.
 `;
 
 async function main(): Promise<void> {
@@ -21,9 +30,21 @@ async function main(): Promise<void> {
     return;
   }
   const config = readRpcAgentConfig();
-  const ptcConfig = readPtcConfig();
+  const shared = readSharedHostConfig();
+  if (shared !== undefined) assertNotRoot();
+  let ptcConfig: PtcConfig | undefined;
+  if (shared !== undefined) {
+    const ptcRaw = process.env.PTC_ENABLED?.trim();
+    if (ptcRaw !== undefined && ptcRaw !== "" && ptcRaw !== "0") {
+      throw new ConfigurationError(
+        "shared host mode is Phase 1 (Bash / Read / Write / Edit only); set PTC_ENABLED=0",
+      );
+    }
+  } else {
+    ptcConfig = readPtcConfig();
+  }
   let ptc: PtcExecutor | undefined;
-  let direct: DirectExecutor | undefined;
+  let direct: DirectExecutor | SharedHostDirectHost | undefined;
   let ptcChecks: Record<string, boolean | null> | undefined;
   let directChecks: Record<string, boolean | null> | undefined;
   let probe: PtcRuntimeProbe | undefined;
@@ -35,6 +56,14 @@ async function main(): Promise<void> {
     // `/shared` and the per-session tmp root are all usable.
     direct = new DirectExecutor({ config: ptcConfig, probe });
     directChecks = await direct.preflight();
+  } else if (shared !== undefined) {
+    const info = await stat(shared.workspacesRoot).catch(() => undefined);
+    if (info === undefined || !info.isDirectory()) {
+      throw new ConfigurationError(`${shared.workspacesRoot} must be an existing directory owned by the execution user`);
+    }
+    await mkdir(shared.tmpRoot, { recursive: true, mode: 0o700 });
+    direct = new SharedHostDirectHost(shared);
+    directChecks = await direct.preflight();
   }
   const checkReport = (): string => `${JSON.stringify({
     ...describeRpcAgentConfig(config),
@@ -43,6 +72,7 @@ async function main(): Promise<void> {
     ...(ptcChecks === undefined ? {} : {
       ptc: probe?.cgroupReason === undefined ? ptcChecks : { ...ptcChecks, cgroupReason: probe.cgroupReason },
     }),
+    ...(shared === undefined ? {} : { sharedHost: describeSharedHostConfig(shared) }),
     ...(directChecks === undefined ? {} : { direct: directChecks }),
   }, null, 2)}\n`;
   let server: RpcServer;
@@ -110,7 +140,8 @@ async function main(): Promise<void> {
     maxConcurrent: config.maxConcurrent,
     sessionTtlMs: config.sessionTtlMs,
     heartbeatMs: config.heartbeatMs,
-    testExecutorEnabled: config.testExecutorEnabled,
+    // The shared host is a Phase 1 production surface: no Phase 0 test executor is advertised.
+    testExecutorEnabled: shared === undefined ? config.testExecutorEnabled : false,
     ...(ptc === undefined ? {} : { ptc }),
     ...(direct === undefined ? {} : { direct }),
   });

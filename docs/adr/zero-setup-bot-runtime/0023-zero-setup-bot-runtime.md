@@ -88,6 +88,9 @@ ADR-0020 / 0021 记录远程 PTC sandbox 与控制面 / 执行面分离尚未通
 
 ## 后果
 
+> 2026-11-06 修订：本节记录的是本功能首次决策时的状态。下文「无已验收的 OS 沙箱，Computer
+> 默认不可用」等表述已被同日的共享 CVM Execution Host 决策取代，见本 ADR 末尾的分阶段历史。
+
 - 用户首次打开控制台即有一个已初始化的 Bot，可直接交代任务；创建第二个 Bot 只需名称。
 - 未部署的服务在 UI 与 `/api/platform` 中显示 `unavailable`，Bot 为 `degraded` 而不是假 Ready；
   基础运行环境不可用时为 `failed` 且禁止对话，可显式重试。
@@ -117,3 +120,37 @@ ADR-0020 / 0021 记录远程 PTC sandbox 与控制面 / 执行面分离尚未通
 - 相关缺陷：尚未发现。已通过 `npm run check`、`npm test`（含 `test/zero-setup.test.ts` 与
   `test/zero-setup-wiring.test.ts` 的单元与端到端验收）；本地控制台与真实模型供应商、远程 RPC
   sandbox 的部署验收由运维在单机部署上执行，本 ADR 不把未执行的部署验证记为已通过。
+
+### 2026-11-06：共享 CVM Execution Host（Phase 1 架构决策修订）
+
+- **决策**：Aster Dashboard 明确为单用户 MVP，停止实施「每 Bot Docker 容器」「Bot Container
+  Provisioning」「每 Bot 独立 UID」「多租户资源隔离」。Lighthouse（10.1.4.9）继续运行 Agent
+  Runtime、Session、Memory、Task 与 Tool Registry；CVM（172.16.0.7）提供一台共享 Computer /
+  Execution Host。所有 Bot 经现有 mTLS RPC 共用同一套软件环境（Bash、Git、Python、Node.js、
+  Claude Code、Herdr 等 CLI）；CC、Herdr 不抽象为独立 Agent Tool，统一通过 Bash 使用。每个 Bot
+  保有独立对话、记忆与任务状态及各自默认工作目录，但**不要求 OS 级隔离**。
+- **对上文决策的修订**：决策驱动因素第 4 条「Computer 必须有经过验证的 OS 级隔离与资源限制」、
+  决策 1 的 `PLATFORM_SANDBOX_VERIFIED=1`、决策 6「未验收 OS 隔离时 shell 与 ptc 均为 false」
+  在本阶段被本节取代。Computer 能力改由「已配置 rpc 传输」这一宿主事实提供；启动时的 RPC
+  `health.check`（`directBash` / `fileTools` / `sharedMode: "rw"` / `ptc: false`）与各 Bot 工作区
+  探针保持 fail-closed，`PLATFORM_SANDBOX_VERIFIED` 从配置中移除。`defaults.ptc` 仍恒为 false：
+  Phase 1 只迁移 Bash / Read / Write / Edit，codemode 与其它工具族留待后续阶段。
+- **执行面约束**：Execution Service 以专用非 root Linux 用户运行，不允许 root、sudo、Docker
+  Socket 或 Lighthouse 凭据；保留执行超时、并发控制、进程组终止、输出限制、审计与「RPC 断线
+  不自动重放」；宿主运行时环境（`PATH` / `LANG` / `HOME` / `TMPDIR` / `PTC_INSIDE_SANDBOX`）
+  由执行面固定，wire 上的 `env` 只能携带任务变量，试图覆盖宿主变量按 `invalid_request` 拒绝且
+  不执行；`inheritEnv` 被忽略，执行服务的进程环境不进入命令；保留原有 RPC Gateway 与 mTLS
+  设计，不重新开发传输协议。
+- **交付边界**：本次只提交代码、测试与可审查的部署步骤
+  （`docs/runbook-shared-execution-host.md`），**未自动修改 CVM 生产服务、系统权限或防火墙**。
+  `dashboard/docker-compose.dashboard.yml` 中的 `execution-host` 只是单机验收用的同机替代，
+  生产仍走 `docker-compose.rpc.yml`。删除 `dashboard/sandbox.Dockerfile`、
+  `src/execution/sandbox-main.ts`、`src/execution/container-executor.ts` 与
+  `test/container-workspace.test.ts`；新增 `src/execution/shared-host.ts`。
+- **取舍与代价**：不再提供 OS 级隔离或多租户边界；共享主机上一个 Bot 的 bash 能看到兄弟工作区
+  目录，这是被接受的架构取舍，不得在文档中描述为待修复缺陷。收益是复用既有 mTLS RPC、沿用
+  控制面／执行面分离，并让所有 Bot 共享一套软件环境。
+- **相关缺陷**：尚未发现。`test/shared-host.test.ts`（含真实 Unix socket 上 Bash / Read / Write /
+  Edit、工作区隔离与超时的 Linux 回环）、`test/shared-host-workspace.test.ts`、
+  `test/zero-setup.test.ts` 通过；CVM 部署验收由运维按 runbook 执行，本 ADR 不把未执行的部署
+  验证记为已通过。

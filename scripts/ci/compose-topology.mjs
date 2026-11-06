@@ -115,9 +115,8 @@ volumes:
     "-f", join(root, "dashboard/docker-compose.dashboard.yml")];
   const dashboardEnv = {
     ASTER_DASHBOARD_ENV_FILE: file("dashboard.env"),
-    ASTER_SANDBOX_IMAGE: `${project}-sandbox:ci`,
-    ASTER_SANDBOX_RUNTIME_VOLUME: `${project}-runtime`,
-    ASTER_SANDBOX_WORKSPACES_VOLUME: `${project}-workspaces`,
+    ASTER_EXECUTION_RUNTIME_VOLUME: `${project}-runtime`,
+    ASTER_EXECUTION_WORKSPACES_VOLUME: `${project}-workspaces`,
   };
   await check("compose-single-service-and-production-boundaries", async () => {
     const result = await compose("config", "--format", "json");
@@ -145,15 +144,16 @@ volumes:
     assert.equal(mounts[0].source, "personal-agent-data");
     for (const volume of Object.values(config.volumes)) assert.ok(!volume.external);
   });
-  await check("dashboard-two-services-sandbox-boundaries-and-loopback-console", async () => {
+  await check("dashboard-two-services-shared-host-and-loopback-console", async () => {
     const result = await command("docker", [...dashboardArgs, "config", "--format", "json"], { env: dashboardEnv });
     const config = JSON.parse(result.output);
-    assert.deepEqual(Object.keys(config.services).sort(), ["aster-sandbox", "personal-agent"]);
+    assert.deepEqual(Object.keys(config.services).sort(), ["execution-host", "personal-agent"]);
     const app = config.services["personal-agent"];
-    const sandbox = config.services["aster-sandbox"];
-    // The app image is the repository's root Dockerfile; the sandbox has its own.
+    const host = config.services["execution-host"];
+    // Both services use the repository's one image: there is no separate sandbox image to build.
     assert.equal(app.build.dockerfile, "Dockerfile");
-    assert.equal(sandbox.build.dockerfile, "dashboard/sandbox.Dockerfile");
+    assert.equal(host.build.dockerfile, "Dockerfile");
+    assert.equal(host.image, images.app);
 
     // The console is reachable only from the host's loopback address.
     assert.deepEqual(app.ports, [{
@@ -172,37 +172,43 @@ volumes:
     assert.equal(app.environment.EXECUTION_REMOTE_CWD, "/workspaces");
     assert.equal(app.environment.EXECUTION_RPC_TRANSPORT, "unix");
     assert.equal(app.environment.EXECUTION_RPC_SOCKET, "/run/aster/rpc.sock");
-    assert.equal(app.environment.CODEMODE_ENABLED, "1");
-    assert.equal(app.depends_on["aster-sandbox"].condition, "service_healthy");
+    // Phase 1 migrates Bash / Read / Write / Edit only; a shared host never advertises remote PTC.
+    assert.equal(app.environment.CODEMODE_ENABLED, "0");
+    assert.equal(app.depends_on["execution-host"].condition, "service_healthy");
 
-    // The sandbox is non-root, has no network, no capabilities and a read-only filesystem.
-    assert.equal(sandbox.image, `${project}-sandbox:ci`);
-    assert.equal(sandbox.network_mode, "none");
-    assert.equal(sandbox.read_only, true);
-    assert.equal(sandbox.user, "1000:1000");
-    assert.deepEqual(sandbox.cap_drop, ["ALL"]);
-    assert.ok(sandbox.security_opt.includes("no-new-privileges:true"));
-    assert.ok(!sandbox.ports?.length, "the sandbox must not publish ports");
-    assert.equal(sandbox.environment.ASTER_SANDBOX_SOCKET, "/home/aster/run/rpc.sock");
-    assert.equal(sandbox.environment.ASTER_SANDBOX_WORKSPACES, "/workspaces");
-    assert.equal(sandbox.environment.ASTER_SANDBOX_CONCURRENCY, "3");
-    assert.equal(sandbox.environment.ASTER_SANDBOX_PTC, "1");
+    // The local stand-in runs as a dedicated non-root uid and claims no OS isolation boundary:
+    // it is one shared host for every bot, not a per-bot container.
+    assert.equal(host.user, "1000:1000");
+    assert.ok(!host.network_mode, "a shared host must not claim a network-none isolation boundary");
+    assert.ok(!host.read_only, "the shared host needs a writable workspace and socket directory");
+    assert.ok(!host.cap_drop, "the shared host does not rely on capability dropping for isolation");
+    assert.ok(!host.ports?.length, "the shared host must not publish ports");
+    assert.deepEqual(host.entrypoint, ["node", "dist/src/execution/rpc-main.js"]);
+    assert.equal(host.environment.EXECUTION_AGENT_SHARED_HOST, "1");
+    assert.equal(host.environment.EXECUTION_AGENT_UNIX_SOCKET, "/run/aster/rpc.sock");
+    assert.equal(host.environment.EXECUTION_AGENT_WORKSPACES, "/workspaces");
+    assert.equal(host.environment.EXECUTION_AGENT_TMP_ROOT, "/tmp/aster-sessions");
+    assert.equal(host.environment.EXECUTION_AGENT_SHELL, "/bin/bash");
+    assert.equal(host.environment.EXECUTION_AGENT_MAX_CONCURRENT, "3");
+    assert.equal(host.environment.EXECUTION_AGENT_TEST_EXECUTOR, "0");
+    assert.equal(host.environment.EXECUTION_AGENT_OUTPUT_CHUNK_BYTES, "32768");
+    assert.equal(host.environment.EXECUTION_AGENT_OUTPUT_BYTES_PER_SECOND, "4194304");
+    assert.equal(host.environment.PTC_ENABLED, "0");
 
     // Only the workspaces and socket volumes are mounted; the app's /data volume is never shared.
-    const sandboxTargets = sandbox.volumes.map((volume) => volume.target).sort();
-    assert.deepEqual(sandboxTargets, ["/home/aster/run", "/workspaces"]);
+    assert.deepEqual(host.volumes.map((volume) => volume.target).sort(), ["/run/aster", "/workspaces"]);
     const appSocket = app.volumes.find((volume) => volume.target === "/run/aster");
-    const sandboxSocket = sandbox.volumes.find((volume) => volume.target === "/home/aster/run");
+    const hostSocket = host.volumes.find((volume) => volume.target === "/run/aster");
     assert.ok(appSocket, "the app must mount the socket volume");
-    assert.ok(sandboxSocket, "the sandbox must mount the socket volume");
-    assert.equal(appSocket.source, sandboxSocket.source);
+    assert.ok(hostSocket, "the execution host must mount the socket volume");
+    assert.equal(appSocket.source, hostSocket.source);
     assert.equal(appSocket.read_only, true);
-    const workspaces = sandbox.volumes.find((volume) => volume.target === "/workspaces");
-    assert.equal(workspaces.source, "sandbox-workspaces");
+    const workspaces = host.volumes.find((volume) => volume.target === "/workspaces");
+    assert.equal(workspaces.source, "execution-workspaces");
     // Rendered volume sources are the compose keys; the `name` override is what isolates the run.
-    assert.equal(config.volumes["sandbox-runtime"].name, `${project}-runtime`);
-    assert.equal(config.volumes["sandbox-workspaces"].name, `${project}-workspaces`);
-    assert.equal(appSocket.source, "sandbox-runtime");
+    assert.equal(config.volumes["execution-runtime"].name, `${project}-runtime`);
+    assert.equal(config.volumes["execution-workspaces"].name, `${project}-workspaces`);
+    assert.equal(appSocket.source, "execution-runtime");
     // No remote execution gateway service is part of this overlay.
     assert.ok(!Object.keys(config.services).some((name) => name.includes("gateway")));
   });

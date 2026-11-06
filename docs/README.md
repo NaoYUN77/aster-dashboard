@@ -37,6 +37,7 @@ ADR 持续记录该功能所有部分的取舍与缺陷，跨越各份 spec 的�
 - [Phase 0 RPC 部署与验收](runbook-execution-rpc-phase0.md)：常驻 Execution Agent、私网 mTLS、证书、systemd、正向／负向验收与断线检查。
 - [Phase 0 RPC 验收记录](acceptance/20261102-execution-rpc-phase0.md)：2026-11-02 真实双 VPS 的 PASS 证据、负向结果与网络变更边界。
 - [Remote PTC Phase 1／2 Runbook](runbook-remote-ptc-phase1-2.md)：bwrap／cgroup 前提、direct／PTC 配置、实机正向与负向验收、证据与回滚。
+- [共享 CVM Execution Host Runbook](runbook-shared-execution-host.md)：单用户 MVP 的专用非 root 用户、`/workspaces`、Phase 1 shared-host 模式、systemd 模板、正向／负向验收与回滚（不自动修改生产服务、权限或防火墙）。
 - [代码调用工具](codemode.md)：可选的 PTC／codemode 配置、脚本工具白名单、输出边界与恢复语义。
 - [一次性提醒](reminders.md)：`reminder_*` 工具、独立 SQLite 状态机、进程内调度、失败恢复与人工核查。
 - [Langfuse Tracing](langfuse-tracing.md)：可选 Trace 的环境变量、隐私边界、部署与第一条真实 Trace 验收。

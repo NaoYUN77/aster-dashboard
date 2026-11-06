@@ -1,16 +1,23 @@
 # Aster dashboard: multiple bots on one machine
 
-One app container plus one sandbox container. The app owns the model loop, the durable
-conversations and the web console; the sandbox owns every command and file operation. They share a
-Unix socket on a small volume and the workspace volume — nothing else.
+One app container plus one local stand-in for the shared Execution Host. The app owns the model
+loop, the durable conversations and the web console; the Execution Host owns every command and file
+operation. They share a Unix socket on a small volume and the workspace volume — nothing else.
 
 ```
-browser ── HTTP 127.0.0.1:8787 ──> personal-agent ── unix /run/aster/rpc.sock ──> aster-sandbox
+browser ── HTTP 127.0.0.1:8787 ──> personal-agent ── unix /run/aster/rpc.sock ──> execution-host
                                     │                                              │
                                     └── personal-agent-data:/data                  └── /workspaces/<botId>
-                                        (agent.sqlite, inbox.sqlite)                   (only volume the
-                                                                                         sandbox sees)
+                                        (agent.sqlite, inbox.sqlite)                   (one shared volume
+                                                                                         for every bot)
 ```
+
+This is a **single-user MVP**. There is no per-bot container, no per-bot UID and no OS-level
+isolation: all bots use the same host, the same installed software and the same workspace volume,
+each with its own default working directory. The production topology is `docker-compose.rpc.yml`,
+where the app on Lighthouse reaches the shared CVM Execution Host through the existing mTLS RPC
+gateway. See [the shared-host runbook](../docs/runbook-shared-execution-host.md); nothing in this
+overlay changes the CVM, its permissions or its firewall.
 
 ## Start
 
@@ -22,20 +29,20 @@ docker compose -f docker-compose.yml -f dashboard/docker-compose.dashboard.yml \
   --env-file dashboard/.env up -d --build
 ```
 
-The app image is the repository's root `Dockerfile`; the sandbox image is built from
-`dashboard/sandbox.Dockerfile`, and the overlay builds both. The console is published only on the
-host's loopback address: open `http://127.0.0.1:8787` and paste `WEB_TOKEN` when the page asks for
-it.
+The app image is the repository's root `Dockerfile`; the local `execution-host` service starts the
+same image on `dist/src/execution/rpc-main.js` in shared-host mode as uid 1000. The overlay builds
+one image, not two. The console is published only on the host's loopback address: open
+`http://127.0.0.1:8787` and paste `WEB_TOKEN` when the page asks for it.
 
 The compose overlay requires Compose with `!override` support (Docker Compose 2.24 or newer).
 
 ## Acceptance
 
 `dashboard/acceptance/` holds the deployment acceptance kit: `run.sh` builds the overlay, checks the
-loopback/token boundary, drives the console and the sandbox, and verifies that a restart keeps the
+loopback/token boundary, drives the console and the shared host, and verifies that a restart keeps the
 bots and their history. `acceptance/README.md` maps each criterion to the evidence it prints. The
 run uses its own compose project and volume names, so it never touches another deployment's data.
-That kit targets the legacy explicit profile/PTC surface and sets `ALLOW_LEGACY_CATALOG=1` itself;
+That kit targets the legacy explicit-profile surface and sets `ALLOW_LEGACY_CATALOG=1` itself;
 the zero-setup flow is covered by `test/zero-setup.test.ts` and `test/zero-setup-wiring.test.ts`.
 
 ## Bots
@@ -58,44 +65,39 @@ OAuth services or claim a successful connection.
 
 The explicit eight-switch `profile` / `toolScope` surface and `PATCH /api/bots/:id` remain only
 behind the host-only `ALLOW_LEGACY_CATALOG=1` switch, which `dashboard/acceptance/run.sh` sets for
-its legacy explicit-profile/PTC checks. See [the tool catalog](../docs/tool-catalog.md) for switch
+its legacy explicit-profile checks. See [the tool catalog](../docs/tool-catalog.md) for switch
 groups, scope rules and the historical database upgrade, and
 [ADR-0023](../docs/adr/zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md) for the design.
 
-## Sandbox
+## Execution host
 
-`/workspaces/<botId>` is both the session's working directory and the root of its file primitives
-(`read`, `write`, `edit`). The sandbox container:
+`/workspaces/<botId>` is both the session's default working directory and the root of its file
+primitives (`read`, `write`, `edit`). The local service:
 
 - mounts only the workspace volume, the socket volume and a private `/tmp` tmpfs;
-- runs as uid 1000 with `cap_drop: ALL`, `no-new-privileges` and `network none`;
-- has a read-only root filesystem;
-- bounds bash and PTC together at `ASTER_SANDBOX_CONCURRENCY` (3) concurrent executions.
+- runs as a dedicated non-root uid (1000); `rpc-main.js` refuses to start as root in shared-host
+  mode and has no root, sudo, Docker socket or control-plane credentials;
+- starts no bwrap, cgroups, PTC or per-bot container;
+- bounds commands at `EXECUTION_AGENT_MAX_CONCURRENT` (3) concurrent executions and clamps each
+  command's output to the host's chunk/byte limits.
 
-The sandbox reuses the repository's RPC protocol (`src/execution/sandbox-main.ts`), so the app's
-execution code, deadlines, cancellation and file primitives are the same as for a remote host. The
-only difference is where isolation comes from: the container's namespaces and limits replace a
-per-command `bwrap` and cgroup, and PTC reports isolation mode `container`.
-
-PTC (code mode) is enabled in the sandbox image but is **not** granted in the default zero-setup
-deployment: `computer` stays `unavailable` until the operator declares
-`PLATFORM_SANDBOX_VERIFIED=1` for an acceptance-tested OS-isolated execution plane. In the legacy
-`ALLOW_LEGACY_CATALOG=1` mode it is exposed when a bot's `profile.ptc` switch and scope permit it.
-Each nested tool call must also pass its own capability-group and scope checks; enabling PTC grants
-no additional groups and has no role-based rejection. A PTC session opens in the bot's own
-directory; its runner maps that directory to the virtual `/workspace`, so a file written by the
-model's bash tool is visible to a script at `/workspace/<name>`.
+Phase 1 migrates Bash / Read / Write / Edit only. `CODEMODE_ENABLED=0`: codemode would need remote
+PTC, which the shared host deliberately does not advertise (`health.check` reports `ptc: false`,
+`directBash: true`, `fileTools: true`, `sharedMode: "rw"`). The zero-setup manifest grants `shell`
+when the RPC transport is configured and leaves `ptc` off regardless of `CODEMODE_ENABLED`. CC,
+Herdr and the other installed CLIs are not separate Agent tools in this phase; a bot reaches them
+through Bash on the shared host.
 
 ## Limitations
 
-- Raw bash can still traverse `/workspaces` and read another bot's directory (`ls /workspaces`).
-  File primitives and each session's working directory stay confined, and `/data` is not mounted,
-  but a determined command in one bot is not fenced off from sibling directories. Per-bot mount
-  namespaces inside the sandbox would need kernel features the container's `cap_drop: ALL` does
-  not grant.
+- By design, raw bash can traverse `/workspaces` and read another bot's directory. There is no OS
+  isolation between bots; file primitives and each session's default working directory stay confined
+  to `/workspaces/<botId>`, and `/data` is not mounted into the execution host. Do not treat this as
+  a multi-tenant boundary.
 - The concurrency bound is per RPC connection; the app holds one connection, so it is the
-  deployment's global bound. A second client would get its own three slots.
-- Sandbox sessions are connection-scoped and not replayed: a reconnect starts new sessions.
+  deployment's global bound. A second client would get its own slots.
+- Sessions are connection-scoped and not replayed: a reconnect starts new sessions. An RPC
+  disconnect never re-runs a command automatically.
 - Cancelling a request stops its RPC execution. A command whose outcome is unknown is reported as
   such and never re-run automatically.
 
@@ -112,4 +114,3 @@ docker compose -f docker-compose.yml -f docker-compose.mitm.yml \
 ```
 
 Set `CONSOLE_INGRESS_TARGET` only if the MITM client address is not `10.89.143.3:8787`.
-

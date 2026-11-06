@@ -1,13 +1,15 @@
-# Multi-bot dashboard on one machine: the app and its sandbox container.
+# Multi-bot dashboard on one machine: the app and a local stand-in for the shared Execution Host.
 #
 # Usage (from the repository root):
 #   cp dashboard/.env.example dashboard/.env    # then fill in the model key and WEB_TOKEN
 #   docker compose -f docker-compose.yml -f dashboard/docker-compose.dashboard.yml \
 #     --env-file dashboard/.env up -d --build
 #
-# The overlay replaces the base service's env file with dashboard/.env, publishes the console on
-# the host's loopback address only, and adds the sandbox. There is no remote execution gateway:
-# the app reaches the sandbox over the Unix socket on the shared volume.
+# The overlay replaces the base service's env file with dashboard/.env, publishes the console on the
+# host's loopback address only, and adds a local Execution Host. The production topology is
+# docker-compose.rpc.yml: the app reaches the shared CVM host over the existing mTLS RPC gateway.
+# Here both containers run on one Docker host and share a Unix socket volume instead. See
+# docs/runbook-shared-execution-host.md for the CVM steps (none are applied by this file).
 services:
   personal-agent:
     # The app image is the repository's root Dockerfile, so a clean host can start with one command.
@@ -25,69 +27,75 @@ services:
       CONSOLE_PORT: "8787"
       CONSOLE_WEB_DIR: /app/dashboard/web
       # Zero-setup is the default. The legacy dashboard acceptance harness (run.sh) sets this to 1
-      # so its explicit profile/PTC assertions keep running; normal deployments leave it at 0.
+      # so its explicit-profile assertions keep running; normal deployments leave it at 0.
       ALLOW_LEGACY_CATALOG: "${ALLOW_LEGACY_CATALOG:-0}"
-      # Same-host sandbox over a Unix socket. Every bot's directory is `/workspaces/<botId>`.
+      # Both containers are on this host: the app talks to the Execution Host over a Unix socket.
+      # Every bot's default directory is /workspaces/<botId> on the shared workspace volume.
       EXECUTION_MODE: remote
       EXECUTION_REMOTE_TRANSPORT: rpc
       EXECUTION_REMOTE_CWD: /workspaces
       EXECUTION_RPC_TRANSPORT: unix
       EXECUTION_RPC_SOCKET: /run/aster/rpc.sock
-      # Deployment enables code mode; each bot's profile.ptc and toolScope authorize access.
-      CODEMODE_ENABLED: "1"
+      # Phase 1 migrates Bash / Read / Write / Edit only. Codemode would require remote PTC, which
+      # the shared host deliberately does not advertise; leaving it off keeps startup fail-closed.
+      CODEMODE_ENABLED: "0"
       CODEMODE_SCRIPT_FIRST: "0"
     ports:
       # Loopback only: the token is the second gate, never the only one.
       - "127.0.0.1:8787:8787"
     volumes:
       - personal-agent-data:/data
-      - sandbox-runtime:/run/aster:ro
+      - execution-runtime:/run/aster:ro
     mem_limit: 2g
     pids_limit: 256
     depends_on:
-      aster-sandbox:
+      execution-host:
         condition: service_healthy
 
-  aster-sandbox:
-    image: ${ASTER_SANDBOX_IMAGE:-aster-sandbox:local}
+  # Local stand-in for the single shared CVM Computer / Execution Host (single-user MVP). It is the
+  # same image as the app, started on rpc-main.js in shared-host mode as uid 1000. There is no
+  # per-bot container, no per-bot UID, no OS-level isolation and no PTC: one host serves every
+  # bot's Bash / Read / Write / Edit. Production does not use this service; see the runbook.
+  execution-host:
+    image: ${ASTER_IMAGE:-aster:local}
     build:
       context: .
-      dockerfile: dashboard/sandbox.Dockerfile
+      dockerfile: Dockerfile
+    entrypoint: ["node", "dist/src/execution/rpc-main.js"]
     restart: unless-stopped
     init: true
-    # The sandbox sees only the bot workspaces and the socket volume; no app data, no network.
-    network_mode: "none"
-    read_only: true
+    # Dedicated non-root uid; rpc-main.js refuses to start as root in shared-host mode.
     user: "1000:1000"
-    cap_drop: ["ALL"]
-    security_opt:
-      - no-new-privileges:true
+    volumes:
+      - execution-workspaces:/workspaces
+      - execution-runtime:/run/aster
+    environment:
+      EXECUTION_AGENT_SHARED_HOST: "1"
+      EXECUTION_AGENT_UNIX_SOCKET: /run/aster/rpc.sock
+      EXECUTION_AGENT_WORKSPACES: /workspaces
+      EXECUTION_AGENT_TMP_ROOT: /tmp/aster-sessions
+      EXECUTION_AGENT_SHELL: /bin/bash
+      EXECUTION_AGENT_PATH: /usr/local/bin:/usr/bin:/bin
+      EXECUTION_AGENT_MAX_CONCURRENT: "3"
+      EXECUTION_AGENT_MAX_SESSIONS: "32"
+      EXECUTION_AGENT_TEST_EXECUTOR: "0"
+      EXECUTION_AGENT_OUTPUT_CHUNK_BYTES: "32768"
+      EXECUTION_AGENT_OUTPUT_BYTES_PER_SECOND: "4194304"
+      PTC_ENABLED: "0"
     tmpfs:
       - /tmp:mode=1777,size=256m
-    volumes:
-      - sandbox-workspaces:/workspaces
-      - sandbox-runtime:/home/aster/run
-    environment:
-      ASTER_SANDBOX_SOCKET: /home/aster/run/rpc.sock
-      ASTER_SANDBOX_WORKSPACES: /workspaces
-      ASTER_SANDBOX_TMP_ROOT: /tmp/aster-sessions
-      ASTER_SANDBOX_CONCURRENCY: "3"
-      ASTER_SANDBOX_MAX_SESSIONS: "32"
-      ASTER_SANDBOX_PTC: "1"
-      ASTER_SANDBOX_SHELL: /bin/bash
-      ASTER_SANDBOX_PATH: /usr/local/bin:/usr/bin:/bin
     mem_limit: 2g
     pids_limit: 512
     stop_grace_period: 20s
     healthcheck:
       # The socket file is the only readiness signal: the agent creates it after listening.
-      test: ["CMD", "node", "-e", "require('node:fs').accessSync('/home/aster/run/rpc.sock')"]
+      test: ["CMD", "node", "-e", "require('node:fs').accessSync('/run/aster/rpc.sock')"]
       interval: 5s
       timeout: 3s
       retries: 12
 
 volumes:
-  sandbox-runtime:
-    name: ${ASTER_SANDBOX_RUNTIME_VOLUME:-aster-sandbox-runtime}
-  sandbox-workspaces:
-    name: ${ASTER_SANDBOX_WORKSPACES_VOLUME:-aster-sandbox-workspaces}
+  execution-runtime:
+    name: ${ASTER_EXECUTION_RUNTIME_VOLUME:-aster-execution-runtime}
+  execution-workspaces:
+    name: ${ASTER_EXECUTION_WORKSPACES_VOLUME:-aster-execution-workspaces}

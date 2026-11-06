@@ -1,13 +1,14 @@
-// Sandbox acceptance: speak the deployment's own RPC protocol over the shared Unix socket,
+// Shared-host acceptance: speak the deployment's own RPC protocol over the shared Unix socket,
 // with no model in the loop. Run it inside the application image:
 //
 //   docker run --rm --network none --user 1000:1000 \
 //     --mount type=volume,source=<runtime volume>,target=/run/aster,readonly \
-//     --mount type=bind,source=./dashboard/acceptance/sandbox-check.mjs,target=/tmp/check.mjs,readonly \
-//     --entrypoint node <app image> /tmp/check.mjs
+//     --mount type=bind,source=./dashboard/acceptance/execution-host-check.mjs,target=/check.mjs,readonly \
+//     --entrypoint node <app image> /check.mjs
 //
-// This is the deterministic half of acceptance 4/5/7: it proves the container boundaries even when
-// the model happens to answer differently from its instructions.
+// This is the deterministic half of acceptance 4/5/7: it proves the Phase 1 shared-host boundaries
+// even when the model happens to answer differently from its instructions. One non-root Execution
+// Host serves every bot; there is no per-bot container and no OS-level isolation in this MVP.
 import { readRpcClientConfig } from "/app/dist/src/execution/rpc-config.js";
 import { connectRpcClient } from "/app/dist/src/execution/rpc-connect.js";
 
@@ -42,20 +43,22 @@ function run(sessionId, command, cwd, timeoutMs = 60_000) {
 
 try {
   const health = await client.health();
-  check("S1 sandbox protocol is reachable", health !== undefined,
-    `isolation ${health.isolation?.mode ?? "?"}, ptc ${health.ptc === true}`);
-  check("S1 the sandbox reports container isolation", health.isolation?.mode === "container");
+  check("S1 the shared host RPC protocol is reachable", health !== undefined,
+    `directBash ${health.directBash === true}, fileTools ${health.fileTools === true}, sharedMode ${health.sharedMode ?? "?"}, ptc ${health.ptc === true}`);
+  check("S1 Phase 1 advertises Bash and file primitives on one shared host",
+    health.directBash === true && health.fileTools === true
+      && health.sharedMode === "rw" && health.ptc === false && health.testExecutor === false);
 
   await client.openSession(sessionA, { cwd: cwdA });
   await client.openSession(sessionB, { cwd: cwdB });
 
   const aWrite = await run(sessionA, "printf 'hello-from-A' > a.txt && pwd && ls -a", cwdA).promise;
-  check("S4 A writes a file inside its own directory",
+  check("S4 A writes a file inside its own default directory",
     aWrite.exitCode === 0 && aWrite.output.includes(cwdA) && aWrite.output.includes("a.txt"),
     JSON.stringify(aWrite).slice(0, 200));
 
   const bList = await run(sessionB, "pwd && ls -a", cwdB).promise;
-  check("S4 B does not see A's file",
+  check("S4 B's own default directory does not contain A's file",
     bList.exitCode === 0 && bList.output.includes(cwdB) && !bList.output.includes("a.txt"),
     JSON.stringify(bList).slice(0, 200));
 
@@ -79,21 +82,21 @@ try {
   check("S4 the file primitive cannot reach /data",
     appData?.code === "permission_denied", appData?.code ?? "no error");
 
-  // The base image declares VOLUME /data, so an empty /data exists in the sandbox; what matters is
-  // that no application data is mounted there.
+  // The base image declares VOLUME /data, so an empty /data exists in the execution host; what
+  // matters is that no application data is mounted there.
   const data = await run(sessionB, "ls -A /data", cwdB).promise;
-  check("S4 /data carries no app data inside the sandbox",
+  check("S4 /data carries no app data inside the execution host",
     data.exitCode !== 0 || data.output.trim() === "",
     `exit ${data.exitCode}${data.output.trim() === "" ? "" : ` entries: ${data.output.trim()}`}`);
 
-  // Informational: raw bash can still list sibling bot directories; file primitives and each
-  // session's working directory stay confined. Recorded for the report, not counted as a failure.
+  // Informational: by design raw bash shares the host and can list sibling bot directories. This
+  // is the accepted single-user MVP boundary, not a per-bot isolation failure.
   const siblings = await run(sessionB, "ls /workspaces", cwdB).promise;
   if (siblings.exitCode === 0 && siblings.output.includes(`bot-a-${stamp}`)) {
-    console.info("NOTE raw bash can list sibling bot directories; per-bot mount namespaces are a known limit");
+    console.info("NOTE raw bash can list sibling bot directories; the shared host provides no OS-level isolation by design");
   }
 
-  // Acceptance 5: the deployment-wide bound is the sandbox connection's concurrency (3).
+  // Acceptance 5: the deployment-wide bound is the execution host's concurrency (3).
   const started = Date.now();
   const [sleepA, sleepB] = [
     run(sessionA, "sleep 30; echo SLEPT-A", cwdA, 90_000).promise,
@@ -127,7 +130,7 @@ try {
   console.info(JSON.stringify({ status: failed.length === 0 ? "ok" : "failed", checks: results }, null, 2));
   process.exitCode = failed.length === 0 ? 0 : 1;
 } catch (error) {
-  check("sandbox acceptance completed", false, error instanceof Error ? error.message : String(error));
+  check("shared-host acceptance completed", false, error instanceof Error ? error.message : String(error));
   console.info(JSON.stringify({ status: "failed", checks: results }, null, 2));
   process.exitCode = 1;
 } finally {

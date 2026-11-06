@@ -199,9 +199,10 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
  * request body or a model parameter. A credential is read once and kept in host configuration: it
  * is never written into a bot row, a tool declaration, a log line or a prompt.
  *
- * `PLATFORM_SANDBOX_VERIFIED=1` is an operator's declaration that this deployment passed the OS
- * isolation acceptance runbook. It is rejected without a configured remote execution transport,
- * because a flag alone cannot turn the host's own bash into an isolated Computer capability.
+ * Phase 1's Computer capability comes from a configured RPC execution face: one shared CVM
+ * Computer / Execution Host for all bots (single-user MVP, no OS-level isolation). No OS-isolation
+ * declaration is needed; the startup RPC `health.check` and each bot's workspace probe stay
+ * fail-closed, so an unreachable or incomplete execution face never produces a Ready bot.
  */
 export type PlatformConfig = {
   readonly facts: PlatformDependencies;
@@ -217,21 +218,15 @@ export function readPlatformConfig(env: NodeJS.ProcessEnv = process.env): Platfo
   if (webApiKey !== undefined && ccrProfile) {
     throw new ConfigurationError("Configure either PLATFORM_WEB_SEARCH_API_KEY or CCR_PROFILE, not both");
   }
-  const sandboxRaw = env.PLATFORM_SANDBOX_VERIFIED?.trim();
-  if (sandboxRaw !== undefined && sandboxRaw !== "" && sandboxRaw !== "0" && sandboxRaw !== "1") {
-    throw new ConfigurationError("PLATFORM_SANDBOX_VERIFIED must be 0 or 1");
-  }
-  const sandboxVerified = sandboxRaw === "1";
-  if (sandboxVerified && readExecutionConfig(env) === undefined) {
-    throw new ConfigurationError("PLATFORM_SANDBOX_VERIFIED=1 requires EXECUTION_MODE=remote and a verified OS sandbox");
-  }
+  const execution = readExecutionConfig(env);
   const facts: PlatformDependencies = Object.freeze({
     memoryEnabled: readMemoryConfig(env).enabled,
     webConfigured: webApiKey !== undefined || Boolean(ccrProfile),
     webViaPlatformCredential: webApiKey !== undefined,
     taskDeliverable: readReminderConfig(env).enabled && readTelegramEnabled(env),
     ptcConfigured: readCodemodeConfig(env).enabled,
-    sandboxVerified,
+    // A rpc transport owns Bash and the file primitives; ssh only carries shell commands.
+    computerHost: execution?.transport === "rpc",
     // No OAuth integration is connected in this phase; the platform never claims one.
     mcpConnected: false,
   });
