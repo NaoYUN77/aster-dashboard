@@ -24,10 +24,12 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir -p "$run_root/source/scripts/ci" "$run_root/runtime"
+mkdir -p "$run_root/source/scripts/ci" "$run_root/source/dashboard" "$run_root/runtime"
 # Only public Compose definitions and the acceptance driver enter the operator.
 # Identical host/container paths let Docker resolve the generated bind sources.
+# The dashboard overlay is a -f input of the topology driver's dashboard check.
 for file in docker-compose.yml docker-compose.build.yml \
+  dashboard/docker-compose.dashboard.yml \
   scripts/ci/compose-topology.mjs; do
   cp -- "$source_root/$file" "$run_root/source/$file"
 done
