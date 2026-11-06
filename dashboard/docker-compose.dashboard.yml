@@ -24,13 +24,16 @@ services:
       CONSOLE_HOST: 0.0.0.0
       CONSOLE_PORT: "8787"
       CONSOLE_WEB_DIR: /app/dashboard/web
+      # Zero-setup is the default. The legacy dashboard acceptance harness (run.sh) sets this to 1
+      # so its explicit profile/PTC assertions keep running; normal deployments leave it at 0.
+      ALLOW_LEGACY_CATALOG: "${ALLOW_LEGACY_CATALOG:-0}"
       # Same-host sandbox over a Unix socket. Every bot's directory is `/workspaces/<botId>`.
       EXECUTION_MODE: remote
       EXECUTION_REMOTE_TRANSPORT: rpc
       EXECUTION_REMOTE_CWD: /workspaces
       EXECUTION_RPC_TRANSPORT: unix
       EXECUTION_RPC_SOCKET: /run/aster/rpc.sock
-      # Code mode is available to the programmer role only; the role decides the tool list.
+      # Deployment enables code mode; each bot's profile.ptc and toolScope authorize access.
       CODEMODE_ENABLED: "1"
       CODEMODE_SCRIPT_FIRST: "0"
     ports:

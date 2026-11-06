@@ -18,10 +18,14 @@ import { fileURLToPath } from "node:url";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { openAgent } from "./agent.js";
 import { BotManager } from "./bot-manager.js";
-import { ConfigurationError, configureEnvProxy, readConfig, readMemoryConfig } from "./config.js";
+import { ConfigurationError, configureEnvProxy, readConfig, readLegacyCatalogEnabled, readMemoryConfig } from "./config.js";
 import { startConsole, type ConsoleHandle } from "./console.js";
 import { StateError } from "./errors.js";
 import { Inbox } from "./inbox.js";
+import {
+  buildPlatformCapabilities, buildProvisioningRuntime,
+  localWorkspaceCheck, verifiedRemoteWorkspaceCheck,
+} from "./platform-runtime.js";
 import { ReminderScheduler, ReminderStore } from "./reminders.js";
 import { failureCode, serveTelegram, TelegramClient } from "./telegram.js";
 import { startTrace, type TraceRuntime } from "./trace.js";
@@ -35,6 +39,11 @@ export type ServiceOptions = {
   readonly models?: Models;
   readonly signal?: AbortSignal;
   readonly log?: (line: string) => void;
+  /**
+   * Host-internal compatibility switch for the pre-zero-setup catalog HTTP surface. Tests set it;
+   * a deployment does not, so the browser cannot choose capabilities or tool scopes.
+   */
+  readonly allowLegacyCatalog?: boolean;
 };
 
 export type ServiceHandle = {
@@ -92,10 +101,25 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
     // Tracing is auxiliary: absent keys or an exporter failure must not stop the bot.
     trace = startTrace(config.trace);
     await mkdir(config.dataDir, { recursive: true });
+    // The bootstrap bot's workspace is the single-bot installation's directory. Create it here so
+    // a fresh DATA_DIR can pass the provisioning health check instead of booting a failed bot.
+    // A remote deployment's cwd belongs to the execution side and is never created locally.
+    if (config.execution === undefined) {
+      await mkdir(join(config.dataDir, "workspace"), { recursive: true, mode: 0o700 });
+    }
     reminderStore = config.reminders === undefined
       ? undefined
       : new ReminderStore(join(config.dataDir, "reminders.sqlite"), { limits: config.reminders });
     inbox = new Inbox(join(config.dataDir, "inbox.sqlite"));
+    const inboxDb = inbox;
+
+    // Host-verified deployment facts become one frozen manifest. The integration extension must
+    // exist before openAgent(), so it joins the governed registry before the harness opens.
+    const legacy = options.allowLegacyCatalog === true || readLegacyCatalogEnabled(env);
+    const platform = buildPlatformCapabilities({
+      facts: config.platform.facts,
+      integrations: inboxDb,
+    });
 
     // Telegram is optional: a console-only host has no bot identity to present and no polling loop.
     let client: TelegramClient | undefined;
@@ -114,7 +138,22 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
     agent = await openAgent(config, options.models, undefined, {
       signal,
       memory: readMemoryConfig(env),
+      ...(legacy ? {} : { extraExtensions: [platform.integrationExtension] }),
       ...(reminderStore === undefined ? {} : { reminderStore }),
+    });
+    // A local workspace is checked on disk. A remote one is checked against the execution-face
+    // health probe that openAgent() already performed at startup; an unverifiable face stays
+    // fail-closed and retryable instead of being reported as Ready.
+    const provisioningRuntime = buildProvisioningRuntime({
+      agent,
+      registry: agent.registry,
+      workspaceCheck: config.execution === undefined
+        ? localWorkspaceCheck
+        : verifiedRemoteWorkspaceCheck(agent.executionProbe),
+      rootConversationId: agent.rootId,
+      // configureBot may have allocated a replacement transcript (or a brand-new bot's first one).
+      // Persist that id before the health check, so a retry never allocates a second conversation.
+      onConfigured: (id, conversationId) => inboxDb.setBotConversation(id, conversationId),
     });
     scheduler = reminderStore === undefined || client === undefined
       ? undefined
@@ -131,6 +170,13 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       bootstrapChannel: config.telegramEnabled ? "telegram" : "console",
       ptc: config.codemode !== undefined,
       web: config.ccrProfile !== undefined,
+      manifest: platform.manifest,
+      integrations: platform.integrations,
+      ...(legacy ? {} : { provisioningRuntime }),
+      // A single deployment is one tenant. Real multi-user isolation still requires a separate
+      // DATA_DIR per user; the column and the workspace subtree keep the seam explicit.
+      userId: "owner",
+      ...(legacy ? { allowLegacyCatalog: true } : {}),
       signal,
       log: console.error,
     });
@@ -142,6 +188,7 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
         bots,
         signal,
         log: console.error,
+        ...(legacy ? { allowLegacyCatalog: true } : {}),
       });
       log(`Console listening on ${consoleHandle.address}; open it with the WEB_TOKEN from the environment.`);
     }

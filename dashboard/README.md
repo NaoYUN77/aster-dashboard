@@ -35,22 +35,32 @@ The compose overlay requires Compose with `!override` support (Docker Compose 2.
 loopback/token boundary, drives the console and the sandbox, and verifies that a restart keeps the
 bots and their history. `acceptance/README.md` maps each criterion to the evidence it prints. The
 run uses its own compose project and volume names, so it never touches another deployment's data.
+That kit targets the legacy explicit profile/PTC surface and sets `ALLOW_LEGACY_CATALOG=1` itself;
+the zero-setup flow is covered by `test/zero-setup.test.ts` and `test/zero-setup-wiring.test.ts`.
 
 ## Bots
 
-Each bot is one ownerless durable conversation in `inbox.sqlite` (`bots` table) and one worker that
-answers its requests in arrival order. Creating a bot creates the conversation first and then the
-row; a restart reconfigures each stored conversation and starts its worker again.
+Each bot is one durable conversation in `inbox.sqlite` (`bots` table) and one worker that answers
+its requests in arrival order. Zero-setup is the default: on first start the host creates and
+initializes the bootstrap bot `default` (root conversation, `/workspaces` directory so an existing
+single-bot installation still sees its files), and the console is immediately usable. Creating
+another bot needs only a name; `POST /api/bots` accepts `name`, optional `systemPrompt` and
+optional `botId`. The host derives the model, workspace, credentials, session and effective tool
+catalog — the browser cannot supply a path, a credential, a tool list or a capability switch.
 
-The browser's create and capability-settings forms send a `profile` object containing independent
-`core`, `shell`, `files`, `web`, `ptc`, `memory`, `reminders` and `mcp` booleans. These switches and
-`toolScope` govern the installed tools; legacy role metadata does not override them. Existing bots
-can change their profile while idle through `PATCH /api/bots/:id`. See
-[the tool catalog](../docs/tool-catalog.md) for the switch groups and old role defaults.
+Capabilities come from the platform manifest, not from a user form. Unconfigured services are shown
+as `unavailable` in the console's platform status panel and `GET /api/platform`; a bot missing only
+optional capabilities is `degraded` (still chat-capable), while a failed workspace/session/tool
+health check is `failed` and blocks chat. Initialization is idempotent, persisted in
+`bot_provisioning`, re-verified on every restart and retryable via `POST /api/bots/:id/retry`.
+Integration authorization requests only record `authorization_pending`; this phase does not connect
+OAuth services or claim a successful connection.
 
-The host decides the model and workspace. The bootstrap
-bot `default` points at the root conversation and keeps `/workspaces` as its directory, so an
-existing single-bot installation can still see its files.
+The explicit eight-switch `profile` / `toolScope` surface and `PATCH /api/bots/:id` remain only
+behind the host-only `ALLOW_LEGACY_CATALOG=1` switch, which `dashboard/acceptance/run.sh` sets for
+its legacy explicit-profile/PTC checks. See [the tool catalog](../docs/tool-catalog.md) for switch
+groups, scope rules and the historical database upgrade, and
+[ADR-0023](../docs/adr/zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md) for the design.
 
 ## Sandbox
 
@@ -67,10 +77,14 @@ execution code, deadlines, cancellation and file primitives are the same as for 
 only difference is where isolation comes from: the container's namespaces and limits replace a
 per-command `bwrap` and cgroup, and PTC reports isolation mode `container`.
 
-PTC (code mode) is enabled in the sandbox and exposed when a bot's `ptc` switch and scope permit it.
-The old role defaults enable it for `programmer`; any role can supply an explicit switch pack. A PTC session
-opens in the bot's own directory; its runner maps that directory to the virtual `/workspace`, so a
-file written by the model's bash tool is visible to a script at `/workspace/<name>`.
+PTC (code mode) is enabled in the sandbox image but is **not** granted in the default zero-setup
+deployment: `computer` stays `unavailable` until the operator declares
+`PLATFORM_SANDBOX_VERIFIED=1` for an acceptance-tested OS-isolated execution plane. In the legacy
+`ALLOW_LEGACY_CATALOG=1` mode it is exposed when a bot's `profile.ptc` switch and scope permit it.
+Each nested tool call must also pass its own capability-group and scope checks; enabling PTC grants
+no additional groups and has no role-based rejection. A PTC session opens in the bot's own
+directory; its runner maps that directory to the virtual `/workspace`, so a file written by the
+model's bash tool is visible to a script at `/workspace/<name>`.
 
 ## Limitations
 

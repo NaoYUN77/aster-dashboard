@@ -1,5 +1,4 @@
 import type { ToolRegistration } from "@earendil-works/pi-durable";
-import type { BotRole } from "./inbox.js";
 import type { ToolRecord } from "./tools.js";
 
 export type ToolScope = {
@@ -19,7 +18,7 @@ export type ToolDefinition = {
 export const CATALOG_GROUPS = ["core", "shell", "files", "web", "ptc", "memory", "reminders", "mcp"] as const;
 type ToolGroup = typeof CATALOG_GROUPS[number];
 
-/** Independent tool-group switches; every field is required, with no role or preset identity. */
+/** Independent tool-group switches; every field is required. */
 export type CatalogProfile = { readonly [Group in ToolGroup]: boolean };
 
 export function parseCatalogProfile(value: unknown): CatalogProfile {
@@ -40,13 +39,11 @@ export function serializeCatalogProfile(profile: CatalogProfile): string {
   return JSON.stringify(parseCatalogProfile(profile));
 }
 
-/** Compatibility defaults for old role-only callers and one-time database migration. */
-export function profileForRole(role: BotRole): CatalogProfile {
-  return parseCatalogProfile({
-    core: true, shell: true, files: true, web: role === "researcher", ptc: role === "programmer",
-    memory: true, reminders: true, mcp: true,
-  });
-}
+/** Explicit initial switches for the bootstrap bot and the console's creation form. */
+export const DEFAULT_CATALOG_PROFILE: CatalogProfile = Object.freeze({
+  core: true, shell: true, files: true, web: false, ptc: false,
+  memory: true, reminders: true, mcp: true,
+});
 
 /** Preserve the legacy capability projection for older clients; deployment availability is a ceiling. */
 export function legacyCapabilitiesForProfile(
@@ -94,7 +91,8 @@ function groupFor(name: string, record?: ToolRecord): ToolGroup | undefined {
   if (name === "read" || name === "write" || name === "edit") return "files";
   if (name.startsWith("memory_") || name.startsWith("working_")) return "memory";
   if (name.startsWith("reminder_")) return "reminders";
-  if (name === "current_time" || name === "tool_search") return "core";
+  // Integration status and authorization requests are platform core, not external capabilities.
+  if (name === "current_time" || name === "tool_search" || name.startsWith("integration_")) return "core";
   return undefined;
 }
 
@@ -124,15 +122,4 @@ export function scopeAllows(scope: ToolScope, profile: CatalogProfile, name: str
   if (group === undefined || !profile[group]) return false;
   if (scope.allow.length > 0 && !scope.allow.includes(name)) return false;
   return !scope.deny.includes(name);
-}
-
-/** Legacy configureBot callers select groups directly; explicit profiles take precedence. */
-export function profileForCapabilities(capabilities: readonly string[]): CatalogProfile {
-  const known = new Set(["bash", "files", "ptc", "web"]);
-  if (capabilities.some((name) => !known.has(name))) throw new Error("Bot capabilities contain unknown tools");
-  return parseCatalogProfile({
-    core: true, shell: capabilities.includes("bash"), files: capabilities.includes("files"),
-    web: capabilities.includes("web"), ptc: capabilities.includes("ptc"),
-    memory: true, reminders: true, mcp: true,
-  });
 }

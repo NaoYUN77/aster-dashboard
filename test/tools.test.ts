@@ -7,7 +7,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { connectMcp } from "../src/mcp.js";
-import { profileForRole } from "../src/tool-catalog.js";
+import { DEFAULT_CATALOG_PROFILE } from "../src/tool-catalog.js";
 import { createToolRegistry, currentTime, personalTools, type GovernedTool } from "../src/tools.js";
 
 const example = (name: string, parameters = Type.Object({})) => defineTool({
@@ -95,7 +95,7 @@ test("conversation catalog denies host and nested tool execution outside its pro
   const outside = defineTool({ name: "outside", description: "outside", parameters: Type.Object({}),
     execute: async () => { runs++; return { output: [] }; } });
   const registry = createToolRegistry([personalTools, defineExtension({ name: "extra", tools: [outside] })], { log: () => {} });
-  registry.setConversationCatalog(41, profileForRole("assistant"), { allow: [], deny: [] }, new Set(["current_time"]));
+  registry.setConversationCatalog(41, DEFAULT_CATALOG_PROFILE, { allow: [], deny: [] }, new Set(["current_time"]));
   const registered = registry.snapshot().tools().find(({ tool }) => tool.name === "outside")!.tool;
   const result = await registered.execute({}, {
     conversationId: 41, taskId: 2, callId: "scoped",

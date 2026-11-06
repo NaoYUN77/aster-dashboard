@@ -1,7 +1,15 @@
 import { DatabaseSync } from "node:sqlite";
 import { StateError } from "./errors.js";
 import { splitReply, type TextRequest } from "./messages.js";
-import { profileForRole, parseCatalogProfile, serializeCatalogProfile, parseToolScope, serializeToolScope, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
+import { parseCatalogProfile, serializeCatalogProfile, parseToolScope, serializeToolScope, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
+import { migrateBotCatalog } from "./bot-catalog-migration.js";
+import { CAPABILITY_IDS, type CapabilityId } from "./platform-capabilities.js";
+import { INTEGRATION_IDS, type IntegrationId, type IntegrationRow } from "./integrations.js";
+import type {
+  ProvisioningRecord, ProvisioningSettlement, ProvisioningState,
+} from "./bot-provisioner.js";
+
+export type { ProvisioningRecord, ProvisioningSettlement } from "./bot-provisioner.js";
 
 export interface Job extends TextRequest {
   status: "pending" | "ready" | "sent" | "failed" | "uncertain";
@@ -10,9 +18,6 @@ export interface Job extends TextRequest {
   receivedAt: string | null;
   repliedAt: string | null;
 }
-
-/** Legacy role metadata, used only to supply defaults when no catalog profile was provided. */
-export type BotRole = "assistant" | "researcher" | "programmer";
 
 export type BotStatus = "active" | "disabled";
 
@@ -23,30 +28,30 @@ export type BotStatus = "active" | "disabled";
 export interface BotRecord {
   botId: string;
   name: string;
-  role: BotRole;
   conversationId: string;
   systemPrompt: string;
-  /** Legacy capability projection retained for configureBot and older clients. */
+  /** Compatibility projection for older readers; profile switches govern authorization. */
   tools: string;
   profile: CatalogProfile;
   toolScope: string;
   status: BotStatus;
   createdAt: string;
+  /** Deployment-local tenant. Workspaces and credentials are never shared across this value. */
+  userId: string;
 }
 
 export interface BotRegistration {
   botId: string;
   name: string;
-  role: BotRole;
   conversationId: string;
   systemPrompt: string;
   tools: string;
-  /** Optional to keep direct legacy Inbox callers source-compatible. */
-  profile?: CatalogProfile;
+  profile: CatalogProfile;
   toolScope?: ToolScope;
+  /** Host-assigned; never accepted from a browser body. Defaults to the single owner. */
+  userId?: string;
 }
 
-const BOT_ROLES: ReadonlySet<string> = new Set(["assistant", "researcher", "programmer"]);
 const BOT_TOOLS: ReadonlySet<string> = new Set(["bash", "files", "ptc", "web"]);
 /** Bot ids are directory names under the workspace root, so the shape is fixed and short. */
 export const BOT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
@@ -105,14 +110,32 @@ export class Inbox {
       CREATE TABLE IF NOT EXISTS bots (
         botId TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        role TEXT NOT NULL,
         conversationId TEXT NOT NULL UNIQUE,
         systemPrompt TEXT NOT NULL,
         tools TEXT NOT NULL,
-        profile TEXT,
-        toolScope TEXT,
+        profile TEXT NOT NULL,
+        toolScope TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'active',
         createdAt TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS bot_provisioning (
+        botId TEXT PRIMARY KEY REFERENCES bots(botId) ON DELETE CASCADE,
+        state TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        manifestFingerprint TEXT NOT NULL,
+        workspace TEXT,
+        startedAt TEXT NOT NULL,
+        finishedAt TEXT,
+        error TEXT,
+        unavailable TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE IF NOT EXISTS integrations (
+        service TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        requestId TEXT,
+        requestedAt TEXT,
+        updatedAt TEXT
       );
     `);
     // Existing databases predate the timestamps. Adding a nullable column leaves those rows unknown
@@ -123,21 +146,16 @@ export class Inbox {
     addColumn(this.db, "deliveries", "updatedAt", "TEXT");
     addColumn(this.db, "bots", "profile", "TEXT");
     addColumn(this.db, "bots", "toolScope", "TEXT");
-    // Only legacy rows are migrated; an explicit switch pack survives every subsequent startup.
-    this.transaction(() => {
-      const legacy = this.db.prepare(`SELECT botId, role, profile FROM bots
-        WHERE profile IS NULL OR profile = '' OR profile IN ('research', 'chief', 'programmer')`).all();
-      const update = this.db.prepare("UPDATE bots SET profile = ? WHERE botId = ?");
-      for (const row of legacy) {
-        const role = row.profile === "research" ? "researcher"
-          : row.profile === "chief" ? "assistant"
-          : row.profile === "programmer" ? "programmer" : row.role;
-        if (role !== "assistant" && role !== "researcher" && role !== "programmer") throw new StateError("Bot role is invalid during catalog migration");
-        if (typeof row.botId !== "string") throw new StateError("Bot id is invalid during catalog migration");
-        update.run(serializeCatalogProfile(profileForRole(role)), row.botId);
-      }
-      this.db.prepare("UPDATE bots SET toolScope = '{\"allow\":[],\"deny\":[]}' WHERE toolScope IS NULL OR toolScope = ''").run();
-    });
+    try {
+      this.transaction(() => migrateBotCatalog(this.db));
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+    // Added only after a successful catalog upgrade, so a failed legacy conversion leaves the
+    // original table byte-for-byte recoverable. An existing single-owner installation keeps its
+    // one tenant; new rows can name another.
+    addColumn(this.db, "bots", "userId", "TEXT NOT NULL DEFAULT 'owner'");
   }
 
   bindIdentity(botId: string, ownerId: string): void {
@@ -254,19 +272,19 @@ export class Inbox {
   /** Register the bootstrap bot without overwriting an operator's later edits. */
   ensureBot(registration: BotRegistration): BotRecord {
     validateBot(registration);
-    const profile = serializeCatalogProfile(registration.profile === undefined ? profileForRole(registration.role) : registration.profile);
+    const profile = serializeCatalogProfile(registration.profile);
     const toolScope = serializeToolScope(registration.toolScope ?? { allow: [], deny: [] });
-    this.db.prepare(`INSERT OR IGNORE INTO bots (botId, name, role, conversationId, systemPrompt, tools, profile, toolScope, createdAt)
+    this.db.prepare(`INSERT OR IGNORE INTO bots (botId, name, conversationId, systemPrompt, tools, profile, toolScope, createdAt, userId)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       registration.botId,
       registration.name,
-      registration.role,
       registration.conversationId,
       registration.systemPrompt,
       registration.tools,
       profile,
       toolScope,
       timestamp(),
+      registration.userId ?? "owner",
     );
     return this.bot(registration.botId) as BotRecord;
   }
@@ -274,19 +292,19 @@ export class Inbox {
   createBot(registration: BotRegistration): BotRecord {
     validateBot(registration);
     if (this.bot(registration.botId) !== undefined) throw new StateError("Bot already exists");
-    const profile = serializeCatalogProfile(registration.profile === undefined ? profileForRole(registration.role) : registration.profile);
+    const profile = serializeCatalogProfile(registration.profile);
     const toolScope = serializeToolScope(registration.toolScope ?? { allow: [], deny: [] });
-    this.db.prepare(`INSERT INTO bots (botId, name, role, conversationId, systemPrompt, tools, profile, toolScope, createdAt)
+    this.db.prepare(`INSERT INTO bots (botId, name, conversationId, systemPrompt, tools, profile, toolScope, createdAt, userId)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       registration.botId,
       registration.name,
-      registration.role,
       registration.conversationId,
       registration.systemPrompt,
       registration.tools,
       profile,
       toolScope,
       timestamp(),
+      registration.userId ?? "owner",
     );
     return this.bot(registration.botId) as BotRecord;
   }
@@ -303,6 +321,78 @@ export class Inbox {
 
   bots(): BotRecord[] {
     return this.db.prepare("SELECT * FROM bots ORDER BY rowid").all().map(decodeBot);
+  }
+
+  /** Bots belonging to one deployment-local tenant; a caller never enumerates another's. */
+  botsForUser(userId: string): readonly BotRecord[] {
+    return this.db.prepare("SELECT * FROM bots WHERE userId = ? ORDER BY rowid").all(userId).map(decodeBot);
+  }
+
+  // --- Zero-setup provisioning: one durable row per bot, written only inside BEGIN IMMEDIATE. ---
+
+  /** An interrupted `provisioning` row is an unknown result; a new claim increments the attempt. */
+  claimProvisioning(botId: string, fingerprint: string, startedAt: string): ProvisioningRecord {
+    return this.transaction(() => {
+      const previous = this.provisioning(botId);
+      const attempt = (previous?.attempt ?? 0) + 1;
+      this.db.prepare(`INSERT INTO bot_provisioning
+        (botId, state, attempt, manifestFingerprint, workspace, startedAt, finishedAt, error, unavailable)
+        VALUES (?, 'provisioning', ?, ?, ?, ?, NULL, NULL, ?)
+        ON CONFLICT(botId) DO UPDATE SET
+          state = 'provisioning', attempt = excluded.attempt,
+          manifestFingerprint = excluded.manifestFingerprint, workspace = excluded.workspace,
+          startedAt = excluded.startedAt, finishedAt = NULL, error = NULL,
+          unavailable = excluded.unavailable`).run(
+        botId, attempt, fingerprint, previous?.workspace ?? null, startedAt,
+        JSON.stringify(previous?.unavailable ?? []),
+      );
+      return this.provisioning(botId)!;
+    });
+  }
+
+  finishProvisioning(botId: string, result: ProvisioningSettlement): ProvisioningRecord {
+    return this.transaction(() => {
+      if (this.provisioning(botId) === undefined) throw new StateError("Provisioning claim is missing");
+      const changed = this.db.prepare(`UPDATE bot_provisioning SET state = ?, workspace = ?,
+        finishedAt = ?, error = ?, unavailable = ? WHERE botId = ?`).run(
+        result.state, result.workspace, result.finishedAt, result.error,
+        JSON.stringify(result.unavailable), botId,
+      );
+      if (changed.changes !== 1) throw new StateError("Provisioning record not found");
+      return this.provisioning(botId)!;
+    });
+  }
+
+  provisioning(botId: string): ProvisioningRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM bot_provisioning WHERE botId = ?").get(botId);
+    return row === undefined ? undefined : decodeProvisioning(row);
+  }
+
+  provisioningRecords(): readonly ProvisioningRecord[] {
+    return this.db.prepare("SELECT * FROM bot_provisioning ORDER BY botId").all().map(decodeProvisioning);
+  }
+
+  // --- External integration state: this phase has no path that fabricates a connection. ---
+
+  integrations(): readonly IntegrationRow[] {
+    return this.db.prepare("SELECT * FROM integrations ORDER BY service").all().map(decodeIntegration);
+  }
+
+  setIntegration(row: IntegrationRow): void {
+    if (!INTEGRATION_IDS.includes(row.service)) throw new StateError("Unknown external integration");
+    if (!INTEGRATION_STATES.includes(row.state)) throw new StateError("Invalid integration state");
+    // No OAuth flow exists yet. Refusing the write keeps the durable state honest even if a future
+    // caller tries to shortcut the authorization step.
+    if (row.state === "connected") throw new StateError("OAuth integration is not implemented; a service cannot be connected in this phase");
+    this.transaction(() => {
+      this.db.prepare(`INSERT INTO integrations (service, state, reason, requestId, requestedAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(service) DO UPDATE SET
+          state = excluded.state, reason = excluded.reason, requestId = excluded.requestId,
+          requestedAt = excluded.requestedAt, updatedAt = excluded.updatedAt`).run(
+        row.service, row.state, row.reason, row.requestId, row.requestedAt, row.updatedAt,
+      );
+    });
   }
 
   /** Point a bot at the conversation its durable transcript actually lives in. */
@@ -402,11 +492,12 @@ export class Inbox {
       AND NOT EXISTS (SELECT 1 FROM deliveries WHERE requestId = ? AND status != 'sent')`).run(requestId, requestId);
   }
 
-  private transaction(operation: () => void): void {
+  private transaction<T>(operation: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      operation();
+      const result = operation();
       this.db.exec("COMMIT");
+      return result;
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -442,19 +533,19 @@ export function isBotId(value: unknown): value is string {
 }
 
 function validateBot(registration: BotRegistration): void {
+  if (Object.keys(registration).some((key) => !["botId", "name", "conversationId", "systemPrompt", "tools", "profile", "toolScope", "userId"].includes(key))) throw new StateError("Bot registration has unknown fields");
   if (!isBotId(registration.botId)) {
     throw new StateError("Bot id must be 1-32 lowercase letters, digits, '-' or '_'");
   }
   if (registration.name.trim() === "" || registration.name.length > 80) {
     throw new StateError("Bot name must be 1-80 characters");
   }
-  if (!BOT_ROLES.has(registration.role)) throw new StateError("Bot role must be assistant, researcher or programmer");
   if (registration.conversationId.trim() === "") throw new StateError("Bot conversation is required");
   if (registration.systemPrompt.length > 8_000) throw new StateError("Bot prompt must be at most 8000 characters");
   const tools = parseBotTools(registration.tools);
   if (tools !== registration.tools) throw new StateError("Bot tools must be normalized before storage");
   try {
-    parseCatalogProfile(registration.profile === undefined ? profileForRole(registration.role) : registration.profile);
+    parseCatalogProfile(registration.profile);
     parseToolScope(registration.toolScope ?? { allow: [], deny: [] });
   } catch (error) { throw new StateError(error instanceof Error ? error.message : "Bot catalog is invalid"); }
 }
@@ -462,6 +553,51 @@ function validateBot(registration: BotRegistration): void {
 function decodeBot(row: object): BotRecord {
   const stored = row as Omit<BotRecord, "profile"> & { profile: unknown };
   return { ...stored, profile: parseCatalogProfile(stored.profile) };
+}
+
+const PROVISIONING_STATES: readonly string[] = ["provisioning", "ready", "degraded", "failed"];
+const INTEGRATION_STATES: readonly string[] = ["disconnected", "authorization_pending", "connected"];
+
+/** Durable rows are untrusted at the storage boundary: an invalid enum is a host error, not a default. */
+function decodeProvisioning(row: object): ProvisioningRecord {
+  const raw = row as Record<string, unknown>;
+  if (!PROVISIONING_STATES.includes(String(raw.state))) throw new StateError("Invalid provisioning state");
+  const attempt = Number(raw.attempt);
+  if (!Number.isSafeInteger(attempt) || attempt < 1) throw new StateError("Invalid provisioning attempt");
+  return Object.freeze({
+    botId: String(raw.botId),
+    state: raw.state as ProvisioningState,
+    attempt,
+    manifestFingerprint: String(raw.manifestFingerprint),
+    workspace: raw.workspace == null ? null : String(raw.workspace),
+    startedAt: String(raw.startedAt),
+    finishedAt: raw.finishedAt == null ? null : String(raw.finishedAt),
+    error: raw.error == null ? null : String(raw.error),
+    unavailable: decodeCapabilityIds(raw.unavailable),
+  });
+}
+
+function decodeCapabilityIds(value: unknown): readonly CapabilityId[] {
+  let parsed: unknown;
+  try { parsed = JSON.parse(typeof value === "string" ? value : "[]"); } catch { throw new StateError("Provisioning capabilities are invalid JSON"); }
+  if (!Array.isArray(parsed) || parsed.some((id) => typeof id !== "string" || !CAPABILITY_IDS.includes(id as CapabilityId))) {
+    throw new StateError("Provisioning capabilities are invalid");
+  }
+  return Object.freeze([...parsed] as CapabilityId[]);
+}
+
+function decodeIntegration(row: object): IntegrationRow {
+  const raw = row as Record<string, unknown>;
+  if (!INTEGRATION_IDS.includes(raw.service as IntegrationId)) throw new StateError("Unknown external integration");
+  if (!INTEGRATION_STATES.includes(String(raw.state))) throw new StateError("Invalid integration state");
+  return Object.freeze({
+    service: raw.service as IntegrationId,
+    state: raw.state as IntegrationRow["state"],
+    reason: String(raw.reason),
+    requestId: raw.requestId == null ? null : String(raw.requestId),
+    requestedAt: raw.requestedAt == null ? null : String(raw.requestedAt),
+    updatedAt: raw.updatedAt == null ? null : String(raw.updatedAt),
+  });
 }
 
 /** SQLite has no `ADD COLUMN IF NOT EXISTS`; re-running the migration must stay a no-op. */

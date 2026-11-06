@@ -61,7 +61,14 @@ export interface ToolRegistry extends Registry {
   records(): readonly ToolRecord[];
   setMcpAvailability(server: string, state: ToolAvailability): void;
   /** Bind the profile-resolved catalog to one durable conversation. */
-  setConversationCatalog(conversationId: number, profile: CatalogProfile, scope: ToolScope, names: ReadonlySet<string>): void;
+  setConversationCatalog(
+    conversationId: number,
+    profile: CatalogProfile,
+    scope: ToolScope,
+    names: ReadonlySet<string>,
+    /** Exact-name reasons for tools closed by an unavailable platform capability. */
+    reasons?: ReadonlyMap<string, string>,
+  ): void;
   /** Host-only switch; disabling does not remove declarations or alter replay policy. */
   setDisabled(name: string, disabled: boolean): void;
 }
@@ -109,7 +116,12 @@ export function createToolRegistry(
   // Whether the model surface currently declares the tool; a hidden tool stays registered for scripts.
   let modelCallable = new Map<string, boolean>();
   const availability = new Map<string, ToolAvailability>();
-  const conversationCatalogs = new Map<number, { readonly profile: CatalogProfile; readonly scope: ToolScope; readonly names: ReadonlySet<string> }>();
+  const conversationCatalogs = new Map<number, {
+    readonly profile: CatalogProfile;
+    readonly scope: ToolScope;
+    readonly names: ReadonlySet<string>;
+    readonly reasons: ReadonlyMap<string, string>;
+  }>();
   const disabled = new Set<string>();
   const listeners = new Set<() => void>();
   const notify = () => { for (const listener of [...listeners]) listener(); };
@@ -140,8 +152,9 @@ export function createToolRegistry(
       code = "TOOL_REGISTRATION_CHANGED";
       message = `Tool ${name} changed after this call was admitted; the old implementation was not executed. Retry the request.`;
     } else if (catalog !== undefined && (!catalog.names.has(name) || !scopeAllows(catalog.scope, catalog.profile, name, record))) {
-      code = "TOOL_SCOPE_DENIED";
-      message = `Tool ${name} is outside this bot's catalog profile and tool scope; this call was not executed.`;
+      const reason = catalog.reasons.get(name);
+      code = reason === undefined ? "TOOL_SCOPE_DENIED" : "TOOL_CAPABILITY_UNAVAILABLE";
+      message = reason ?? `Tool ${name} is outside this bot's catalog profile and tool scope; this call was not executed.`;
     } else if (record.state === "disabled") {
       code = "TOOL_DISABLED";
       message = `Tool ${name} is disabled; this call was not sent. Ask the owner to enable it.`;
@@ -283,8 +296,13 @@ export function createToolRegistry(
       }
       notify();
     },
-    setConversationCatalog(conversationId, profile, scope, names) {
-      conversationCatalogs.set(conversationId, { profile: parseCatalogProfile(profile), scope: parseToolScope(scope), names: new Set(names) });
+    setConversationCatalog(conversationId, profile, scope, names, reasons) {
+      conversationCatalogs.set(conversationId, {
+        profile: parseCatalogProfile(profile),
+        scope: parseToolScope(scope),
+        names: new Set(names),
+        reasons: new Map(reasons ?? []),
+      });
     },
     setMcpAvailability(server, state) {
       availability.set(server, state);

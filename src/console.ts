@@ -3,13 +3,21 @@
 // Interface: `startConsole()` listens on the configured address and returns a handle whose
 // `close()` stops accepting connections and detaches every event stream. Routes:
 //   GET  /                        the static page
-//   GET  /api/bots                bots with their run state
-//   POST /api/bots                create a bot with capability switches and an optional scope
-//   PATCH /api/bots/:id           change an idle bot's catalog switches and optional scope
+//   GET  /api/bots                bots with their run and provisioning state
+//   POST /api/bots                create a bot from a name alone (zero-setup)
+//   GET  /api/platform            host-verified capability manifest and provisioning records
+//   GET  /api/integrations        durable, honest external-service connection states
+//   POST /api/integrations/:service/authorization-requests
+//                                 record an authorization request; never claims a connection
+//   POST /api/bots/:id/retry      retry a failed initialization on the same resources
 //   POST /api/bots/:id/messages   durably accept one request; answers with its id
 //   POST /api/bots/:id/cancel     withdraw the bot's pending request and stop its run
 //   GET  /api/bots/:id/history    the conversation's model-visible history
 //   GET  /api/bots/:id/events     server-sent events for that conversation
+//
+// Compatibility: `allowLegacyCatalog` is a host-internal switch (never a request field) that keeps
+// `POST /api/bots` with explicit `profile`/`toolScope` and `PATCH /api/bots/:id` for pre-zero-setup
+// callers. It is off in production, so a browser cannot name a tool, capability or scope.
 //
 // Inputs: the validated console configuration, the bot manager and the shutdown signal. Nothing
 // from a request names a path, a model, a tool or a conversation: those are host decisions.
@@ -28,7 +36,10 @@ import type { ConsoleConfig } from "./config.js";
 import { NotFoundError, StateError } from "./errors.js";
 
 const MAX_BODY_BYTES = 64 * 1024;
-const BOT_PATH = /^\/api\/bots\/([a-z0-9][a-z0-9_-]{0,31})(\/(messages|cancel|history|events))?$/;
+const BOT_PATH = /^\/api\/bots\/([a-z0-9][a-z0-9_-]{0,31})(\/(messages|cancel|history|events|retry))?$/;
+const INTEGRATION_PATH = /^\/api\/integrations\/([a-z_]+)(\/authorization-requests)?$/;
+const CREATE_FIELDS: readonly string[] = ["name", "systemPrompt", "botId", "profile", "toolScope"];
+const ZERO_SETUP_CREATE_FIELDS: readonly string[] = ["name", "systemPrompt", "botId"];
 /** Comment frames keep proxies and browsers from closing an idle stream. */
 const HEARTBEAT_MS = 20_000;
 
@@ -43,6 +54,8 @@ export type ConsoleOptions = {
   readonly bots: BotManager;
   readonly signal: AbortSignal;
   readonly log?: (line: string) => void;
+  /** Host-internal compatibility switch; never read from a request or a bot row. */
+  readonly allowLegacyCatalog?: boolean;
 };
 
 /** Compared without an early exit, so a wrong token cannot be narrowed by timing. */
@@ -193,19 +206,43 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
       send(response, 200, { bots: bots.views() });
       return;
     }
+    if (method === "GET" && url.pathname === "/api/platform") {
+      send(response, 200, bots.platform());
+      return;
+    }
+    if (method === "GET" && url.pathname === "/api/integrations") {
+      send(response, 200, { integrations: bots.platform().integrations });
+      return;
+    }
+    const integrationMatch = INTEGRATION_PATH.exec(url.pathname);
+    if (integrationMatch !== null) {
+      if (method === "POST" && integrationMatch[2] !== undefined) {
+        // The service name is validated against the host's fixed list; no free-form endpoint,
+        // credential or callback can be supplied by the caller.
+        send(response, 202, bots.requestAuthorization(integrationMatch[1]));
+        return;
+      }
+      send(response, 404, { error: "not found" });
+      return;
+    }
     if (method === "POST" && url.pathname === "/api/bots") {
       if (bots.views().length >= config.maxBots) {
         send(response, 409, { error: "bot limit reached" });
         return;
       }
-      const body = (await readJson(request)) as Record<string, unknown>;
+      const input = await readJson(request);
+      if (input === null || typeof input !== "object" || Array.isArray(input)) throw new StateError("Bot configuration must be an object");
+      const body = input as Record<string, unknown>;
+      const allowed = options.allowLegacyCatalog === true ? CREATE_FIELDS : ZERO_SETUP_CREATE_FIELDS;
+      if (Object.keys(body).some((key) => !allowed.includes(key))) throw new StateError("Bot configuration has unknown fields");
       const bot = await bots.create({
         name: body.name,
-        role: body.role,
         systemPrompt: body.systemPrompt,
         botId: body.botId,
-        profile: body.profile,
-        toolScope: body.toolScope,
+        // A zero-setup browser cannot send catalog switches at all; the platform resolves them.
+        ...(options.allowLegacyCatalog === true
+          ? { profile: body.profile, toolScope: body.toolScope }
+          : {}),
       });
       send(response, 201, { bot });
       return;
@@ -217,12 +254,16 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
     }
     const botId = match[1] as string;
     const action = match[3];
-    if (method === "PATCH" && action === undefined) {
+    if (method === "PATCH" && action === undefined && options.allowLegacyCatalog === true) {
       const input = await readJson(request);
       if (input === null || typeof input !== "object" || Array.isArray(input)) throw new StateError("Bot catalog update must be an object");
       const body = input as Record<string, unknown>;
       if (Object.keys(body).some((key) => key !== "profile" && key !== "toolScope")) throw new StateError("Bot catalog update has unknown fields");
       send(response, 200, { bot: await bots.updateCatalog(botId, { profile: body.profile, toolScope: body.toolScope }) });
+      return;
+    }
+    if (method === "POST" && action === "retry") {
+      send(response, 200, { bot: await bots.retry(botId) });
       return;
     }
     if (method === "POST" && action === "messages") {

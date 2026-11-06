@@ -79,3 +79,4 @@ spec 在功能开发完成后删除，ADR 及其记录长期保留。ADR 中的 
 | 0020 | 远程 PTC sandbox（脚本与工具同在执行 VPS；2026-11-02 修订为统一 RPC） | Accepted，2026-11-02 | [remote-ptc-sandbox/0020-remote-ptc-sandbox.md](remote-ptc-sandbox/0020-remote-ptc-sandbox.md) |
 | 0021 | 控制面与执行面分离，工具执行先下沉到执行 VPS | Proposed，2026-10-31 | [0021-control-execution-split.md](0021-control-execution-split.md) |
 | 0022 | 提醒由宿主持久化并在进程内调度 | Accepted，2026-11-05 | [reminders/0022-reminders-in-process-scheduler.md](reminders/0022-reminders-in-process-scheduler.md) |
+| 0023 | 开箱即用的 Bot 运行环境与平台能力清单 | Accepted，2026-11-06 | [zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md](zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md) |

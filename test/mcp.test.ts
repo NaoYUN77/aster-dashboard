@@ -22,7 +22,7 @@ import { buildMcpTool, connectMcp, mcpToolName, openMcpConnection, type McpConne
 import type { McpFileConfig, McpServerConfig } from "../src/mcp-config.js";
 import type { TextRequest } from "../src/messages.js";
 import { readToolCatalog, readToolLedger } from "../src/tool-ledger.js";
-import { profileForRole } from "../src/tool-catalog.js";
+import { DEFAULT_CATALOG_PROFILE } from "../src/tool-catalog.js";
 import { createToolRegistry, type GovernedTool } from "../src/tools.js";
 
 const unusedApi = undefined as unknown as ToolExecutionApi;
@@ -570,8 +570,8 @@ test("MCP switches gate pinned declarations, discovery and calls independently f
     const models = createModels(); models.setProvider(faux.provider);
     const appConfig = readConfig({ TELEGRAM_BOT_TOKEN: "test", TELEGRAM_OWNER_ID: "1", MODEL_PROVIDER: "openai", MODEL_ID: "faux-1", OPENAI_API_KEY: "test", DATA_DIR: directory });
     app = await openAgent(appConfig, models, undefined, { mcp: host });
-    const enabled = await app.configureBot({ botId: "enabled", cwd: directory, prompt: "", tools: [], catalogProfile: profileForRole("assistant") });
-    const disabled = await app.configureBot({ botId: "disabled", cwd: directory, prompt: "", tools: [], catalogProfile: { ...profileForRole("assistant"), mcp: false } });
+    const enabled = await app.configureBot({ botId: "enabled", cwd: directory, prompt: "", catalogProfile: DEFAULT_CATALOG_PROFILE });
+    const disabled = await app.configureBot({ botId: "disabled", cwd: directory, prompt: "", catalogProfile: { ...DEFAULT_CATALOG_PROFILE, mcp: false } });
     assert.ok(enabled.tools.includes("mcp__s__resident"));
     assert.ok(!disabled.tools.some((name) => name.startsWith("mcp__")));
     const last = (messages: readonly Message[]) => messages.findLast((message) => message.role === "toolResult");

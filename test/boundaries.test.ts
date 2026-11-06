@@ -9,9 +9,9 @@ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { GrammyError } from "grammy";
 import type { Update } from "grammy/types";
 import { Inbox } from "../src/inbox.js";
-import { parseCatalogProfile, profileForRole } from "../src/tool-catalog.js";
+import { parseCatalogProfile } from "../src/tool-catalog.js";
 import { StateError } from "../src/errors.js";
-import { readConfig } from "../src/config.js";
+import { readConfig, type RuntimeConfig } from "../src/config.js";
 import { createProviderModels, PROVIDERS, requireModel } from "../src/providers.js";
 import { splitReply } from "../src/messages.js";
 import { serveTelegram, toRequest } from "../src/telegram.js";
@@ -26,7 +26,20 @@ const update: Update = {
 };
 const request = toRequest(update, "42", "99")!;
 
-test("legacy bot rows migrate to role profiles with an empty persisted tool scope", async () => {
+// Freeze historical expectations independently of current bootstrap defaults and migration code.
+const migratedBase = {
+  core: true, shell: true, files: true, web: false, ptc: false,
+  memory: true, reminders: true, mcp: true,
+};
+
+function assertNoLegacyColumn(path: string): void {
+  const raw = new DatabaseSync(path);
+  try {
+    assert.ok(raw.prepare("PRAGMA table_info(bots)").all().every((column) => column.name !== "role"));
+  } finally { raw.close(); }
+}
+
+test("legacy bot rows convert to switches and physically drop the old column", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-bot-profile-migration-"));
   const path = join(directory, "inbox.sqlite");
   const legacy = new DatabaseSync(path);
@@ -34,25 +47,32 @@ test("legacy bot rows migrate to role profiles with an empty persisted tool scop
     botId TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, conversationId TEXT NOT NULL UNIQUE,
     systemPrompt TEXT NOT NULL, tools TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', createdAt TEXT NOT NULL
   );`);
-  legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, 'active', ?)").run("researcher", "Researcher", "researcher", "11", "", "bash,files,web", new Date().toISOString());
-  legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, 'active', ?)").run("coder", "Coder", "programmer", "12", "", "bash,files,ptc", new Date().toISOString());
+  const insert = legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, 'active', ?)");
+  for (const role of ["assistant", "researcher", "programmer"]) {
+    insert.run(role, role, role, role, "kept prompt", "bash,files", "2026-11-06T00:00:00.000Z");
+  }
   legacy.close();
   let inbox: Inbox | undefined;
   try {
     inbox = new Inbox(path);
-    assert.deepEqual(inbox.bot("researcher")?.profile, profileForRole("researcher"));
-    assert.deepEqual(inbox.bot("coder")?.profile, profileForRole("programmer"));
-    assert.equal(inbox.bot("researcher")?.toolScope, "{\"allow\":[],\"deny\":[]}");
+    assert.deepEqual(inbox.bot("assistant")?.profile, migratedBase);
+    assert.deepEqual(inbox.bot("researcher")?.profile, { ...migratedBase, web: true });
+    assert.deepEqual(inbox.bot("programmer")?.profile, { ...migratedBase, ptc: true });
+    for (const bot of inbox.bots()) {
+      assert.equal(Object.hasOwn(bot, "role"), false);
+      assert.equal(bot.toolScope, '{"allow":[],"deny":[]}');
+    }
+    assertNoLegacyColumn(path);
   } finally {
     inbox?.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("named profiles migrate once while explicit switches, scopes and legacy strings survive reopening", async () => {
+test("stored profiles take precedence and survive reopening after the old column is removed", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-bot-switch-migration-"));
   const path = join(directory, "inbox.sqlite");
-  const custom = parseCatalogProfile({ ...profileForRole("assistant"), shell: false, web: true, ptc: true, mcp: false });
+  const custom = parseCatalogProfile({ ...migratedBase, shell: false, web: true, ptc: true, mcp: false });
   const scope = { allow: ["codemode", "web_search"], deny: ["web_fetch"] };
   const legacy = new DatabaseSync(path);
   legacy.exec(`CREATE TABLE bots (
@@ -62,33 +82,94 @@ test("named profiles migrate once while explicit switches, scopes and legacy str
   );`);
   const insert = legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)");
   for (const [id, profile] of [["chief", "chief"], ["research", "research"], ["programmer", "programmer"], ["custom", JSON.stringify(custom)]]) {
-    insert.run(id!, id!, "assistant", id!, "kept prompt", "bash,files", profile!, JSON.stringify(scope), "2026-11-06T00:00:00.000Z");
+    // A valid stored profile must not depend on the obsolete column, even if it is invalid.
+    insert.run(id!, id!, id === "custom" ? "obsolete-invalid" : "assistant", id!, "kept prompt", "bash,files", profile!, JSON.stringify(scope), "2026-11-06T00:00:00.000Z");
   }
   legacy.close();
   let inbox: Inbox | undefined;
   try {
     for (let reopen = 0; reopen < 2; reopen++) {
       inbox = new Inbox(path);
-      assert.deepEqual(inbox.bot("chief")?.profile, profileForRole("assistant"));
-      assert.deepEqual(inbox.bot("research")?.profile, profileForRole("researcher"));
-      assert.deepEqual(inbox.bot("programmer")?.profile, profileForRole("programmer"));
+      assert.deepEqual(inbox.bot("chief")?.profile, migratedBase);
+      assert.deepEqual(inbox.bot("research")?.profile, { ...migratedBase, web: true });
+      assert.deepEqual(inbox.bot("programmer")?.profile, { ...migratedBase, ptc: true });
       assert.deepEqual(inbox.bot("custom")?.profile, custom);
       for (const bot of inbox.bots()) {
+        assert.equal(Object.hasOwn(bot, "role"), false);
         assert.equal(bot.tools, "bash,files");
         assert.equal(bot.systemPrompt, "kept prompt");
         assert.equal(bot.conversationId, bot.botId);
         assert.deepEqual(JSON.parse(bot.toolScope), scope);
+        assert.equal(bot.createdAt, "2026-11-06T00:00:00.000Z");
       }
+      assertNoLegacyColumn(path);
       inbox.close(); inbox = undefined;
     }
     const raw = new DatabaseSync(path);
-    assert.deepEqual(JSON.parse(String(raw.prepare("SELECT profile FROM bots WHERE botId = 'custom'").get()!.profile)), custom);
+    assert.equal(raw.prepare("SELECT profile FROM bots WHERE botId = 'custom'").get()!.profile, JSON.stringify(custom));
     raw.prepare("UPDATE bots SET profile = ? WHERE botId = 'custom'").run('{"shell":"yes"}');
     raw.close();
     inbox = new Inbox(path);
     assert.throws(() => inbox!.bot("custom"), /must be a boolean/);
   } finally {
     inbox?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("invalid legacy data rolls back earlier conversions and retains the old column for repair", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-bot-migration-rollback-"));
+  try {
+    for (const [index, bad] of [
+      { role: "unknown", profile: null, scope: null },
+      { role: "assistant", profile: '{"shell":"yes"}', scope: null },
+      { role: "assistant", profile: "chief", scope: '{"allow":42}' },
+    ].entries()) {
+      const path = join(directory, `${index}.sqlite`);
+      const legacy = new DatabaseSync(path);
+      legacy.exec(`CREATE TABLE bots (
+        botId TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, conversationId TEXT NOT NULL UNIQUE,
+        systemPrompt TEXT NOT NULL, tools TEXT NOT NULL, profile TEXT, toolScope TEXT,
+        status TEXT NOT NULL DEFAULT 'active', createdAt TEXT NOT NULL
+      );`);
+      const insert = legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, '', 'bash,files', ?, ?, 'active', '2026-11-06T00:00:00.000Z')");
+      insert.run("first", "First", "researcher", "1", null, null);
+      insert.run("bad", "Bad", bad.role, "2", bad.profile, bad.scope);
+      const before = legacy.prepare("SELECT * FROM bots").all();
+      legacy.close();
+      assert.throws(() => new Inbox(path), /catalog profile|tool scope/);
+      const raw = new DatabaseSync(path);
+      try {
+        assert.ok(raw.prepare("PRAGMA table_info(bots)").all().some((column) => column.name === "role"));
+        assert.deepEqual(raw.prepare("SELECT * FROM bots").all(), before);
+        raw.prepare("UPDATE bots SET profile = ?, toolScope = ? WHERE botId = 'bad'").run(JSON.stringify(migratedBase), '{"allow":[],"deny":[]}');
+      } finally { raw.close(); }
+      const repaired = new Inbox(path);
+      try {
+        assert.deepEqual(repaired.bot("first")?.profile, { ...migratedBase, web: true });
+        assertNoLegacyColumn(path);
+      } finally { repaired.close(); }
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("new databases register bots with required switches and reject obsolete fields", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-bot-new-schema-"));
+  const path = join(directory, "inbox.sqlite");
+  const inbox = new Inbox(path);
+  const registration = { botId: "new", name: "New", conversationId: "1", systemPrompt: "", tools: "bash,files", profile: migratedBase };
+  try {
+    assertNoLegacyColumn(path);
+    const { profile: _profile, ...missing } = registration;
+    assert.throws(() => inbox.createBot(missing as Parameters<Inbox["createBot"]>[0]), /catalog profile/);
+    assert.throws(() => inbox.ensureBot({ ...registration, role: "assistant" } as Parameters<Inbox["ensureBot"]>[0]), /unknown fields/);
+    assert.throws(() => inbox.createBot({ ...registration, role: "assistant" } as Parameters<Inbox["createBot"]>[0]), /unknown fields/);
+    const bot = inbox.createBot(registration);
+    assert.equal(Object.hasOwn(bot, "role"), false);
+    inbox.setBotCatalog(bot.botId, { ...migratedBase, ptc: true }, { allow: ["codemode"], deny: [] });
+    assert.deepEqual(inbox.bot(bot.botId)?.profile, { ...migratedBase, ptc: true });
+  } finally {
+    inbox.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -164,7 +245,7 @@ test("restart preserves confirmed segments and quarantines only the interrupted 
 test("reconciling partial delivery sends stored remainder without rerunning agent", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-delivery-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: RuntimeConfig = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   let executions = 0;
   const firstShutdown = new AbortController();
   const sent: string[] = [];
@@ -260,7 +341,7 @@ test("an unknown model id is rejected with provider examples", () => {
 test("oversized input is refused explicitly instead of being silently dropped", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-input-limit-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: RuntimeConfig = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     inbox.accept(1, { ...request, text: "x".repeat(16_001) });
     const shutdown = new AbortController();
@@ -431,7 +512,7 @@ test("prune retains the newest 100 sent requests and every unfinished request", 
 test("Telegram rejection is failed while a transport failure is uncertain, and neither resends", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-send-errors-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: RuntimeConfig = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     inbox.accept(1, { ...request, requestId: "telegram:99:1" });
     inbox.accept(2, { ...request, requestId: "telegram:99:2" });
@@ -467,7 +548,7 @@ test("Telegram rejection is failed while a transport failure is uncertain, and n
 test("a truncated agent answer is delivered with an explicit incompleteness notice", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-truncated-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: RuntimeConfig = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     inbox.accept(1, { ...request, requestId: "telegram:99:1" });
     const sent: string[] = [];
@@ -511,7 +592,7 @@ test("malformed Telegram updates are rejected at the boundary", () => {
 test("invalid updates are skipped without writing an unusable checkpoint", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-invalid-update-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: RuntimeConfig = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     const sent: string[] = [];
     const shutdown = new AbortController();
@@ -564,7 +645,7 @@ test("invalid updates are skipped without writing an unusable checkpoint", async
 test("a failed agent session stops polling and leaves the request pending", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-session-failure-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: RuntimeConfig = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     inbox.accept(1, { ...request, requestId: "telegram:99:1" });
     const fatal = Object.assign(
@@ -600,7 +681,7 @@ test("a local storage failure while saving a reply is fatal", async () => {
     next: () => ({ ...request, requestId: "telegram:99:1", status: "pending", reply: null }),
     saveReply: () => { throw new Error("database is locked"); },
   } as unknown as Inbox;
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: "unused", mcpConfigPath: "unused/mcp.json", mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: RuntimeConfig = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: "unused", mcpConfigPath: "unused/mcp.json", mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   await assert.rejects(
     serveTelegram(config, "99", inbox, async () => "reply", new AbortController().signal, {
       updates: async () => [],
@@ -613,7 +694,7 @@ test("a local storage failure while saving a reply is fatal", async () => {
 test("a model failure is delivered as a notice and later requests still run", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-model-failure-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+  const config: RuntimeConfig = { token: "fake", ownerId: "42", telegramEnabled: true, console: undefined, provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
   try {
     inbox.accept(1, { ...request, requestId: "telegram:99:1" });
     inbox.accept(2, { ...request, requestId: "telegram:99:2" });

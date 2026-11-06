@@ -21,7 +21,7 @@ import {
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { readMemoryConfig, type MemoryConfig, type readConfig } from "./config.js";
+import { readMemoryConfig, type MemoryConfig, type RuntimeConfig } from "./config.js";
 import { ConfigurationError, StateError } from "./errors.js";
 import { createCodemodeHost, LOCAL_SCRIPT_TOOLS, REMOTE_SCRIPT_TOOLS, restrictScriptTools } from "./codemode.js";
 import { BrokerClient, BrokerClientError } from "./execution/broker-client.js";
@@ -33,6 +33,7 @@ import { connectMcp, type McpHost } from "./mcp.js";
 import { readMcpConfig } from "./mcp-config.js";
 import type { TextRequest } from "./messages.js";
 import { createLoopGuard } from "./loop-guard.js";
+import type { ExecutionProbe } from "./platform-runtime.js";
 import { createMemoryIntegration, hasUnsubmittedMemoryProjection, isMemoryError, memoryAppError, type MemoryIntegration } from "./memory/integration.js";
 import { createProviderModels, requireModel } from "./providers.js";
 import { createReminderExtension, type ReminderStore } from "./reminders.js";
@@ -40,9 +41,10 @@ import { createToolRegistry, personalTools, type ToolAuthority } from "./tools.j
 import { beginRequest, traceExtension, type TraceOutcome } from "./trace.js";
 import { hasUnfinishedModelToolCalls, hideFromModel, SCRIPT_ONLY_TOOLS } from "./tool-exposure.js";
 import { createCcrWebExtension } from "./ccr-web-tools.js";
+import { createWebExtension } from "./web-tools.js";
 import { inspectGithubToolRecovery, readResidentTools, withToolLedger } from "./tool-ledger.js";
 import { installMcpTools, orderedMcpExtensions } from "./tool-pins.js";
-import { catalogFor, parseCatalogProfile, parseToolScope, profileForCapabilities, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
+import { catalogFor, parseCatalogProfile, parseToolScope, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
 
 const context = BACKGROUND_CONTEXT;
 // Failures the request can recover from in-process; anything else thrown by the durable calls means the Session is unusable.
@@ -134,6 +136,11 @@ export type OpenAgentOptions = {
    * `readConfig` keeps its own shape, so the caller supplies this instead of re-reading process.env.
    */
   readonly memory?: MemoryConfig;
+  /**
+   * Host-owned extensions installed before the harness opens. They are part of the one governed
+   * registry: a model cannot install, widen or grant itself a tool through these.
+   */
+  readonly extraExtensions?: readonly Extension[];
 };
 
 /**
@@ -150,11 +157,14 @@ export type BotConversationProfile = {
   readonly channel?: "telegram" | "console";
   /** Operator-written system prompt for this bot; empty keeps only the base instructions. */
   readonly prompt: string;
-  /** Legacy capability list; retained for existing BotManager/configureBot callers. */
-  readonly tools: readonly string[];
-  /** The catalog profile and scope narrow the runtime tool registry for this conversation. */
-  readonly catalogProfile?: CatalogProfile;
+  /** The explicit catalog switches and scope select tools for this conversation. */
+  readonly catalogProfile: CatalogProfile;
   readonly toolScope?: ToolScope;
+  /**
+   * Exact-name reasons for tools closed by an unavailable platform capability. Host-only: these
+   * become the execution-boundary denial message, never a model parameter or a declaration.
+   */
+  readonly capabilityReasons?: ReadonlyMap<string, string>;
 };
 
 export type ConfiguredBot = {
@@ -178,7 +188,7 @@ export type ConversationWatcher = {
 };
 
 export async function openAgent(
-  config: ReturnType<typeof readConfig>,
+  config: RuntimeConfig,
   models?: Models,
   storage?: Storage,
   options: OpenAgentOptions = {},
@@ -197,6 +207,9 @@ export async function openAgent(
   let executionClient: BrokerClient | undefined;
   let rpcClient: RpcExecutionClient | undefined;
   let executionId: string | undefined;
+  // Record what the startup probe actually saw. Provisioning reads this instead of assuming that
+  // a configured remote path means a working execution face.
+  let executionProbe: ExecutionProbe | undefined;
   if (execution?.transport === "ssh") {
     const client = new BrokerClient({
       socketPath: execution.brokerSocket,
@@ -206,6 +219,10 @@ export async function openAgent(
       const pong = await client.ping(options.signal === undefined ? {} : { signal: options.signal });
       executionClient = client;
       executionId = pong.executionId;
+      executionProbe = Object.freeze({
+        mode: "ssh" as const, protocol: null, executionId: pong.executionId,
+        directBash: null, fileTools: null, sharedMode: null,
+      });
     } catch (error) {
       client.abortAll();
       const reason = error instanceof BrokerClientError ? error.message : "execution broker check failed";
@@ -231,6 +248,14 @@ export async function openAgent(
       }
       rpcClient = client;
       executionId = health.executionId;
+      executionProbe = Object.freeze({
+        mode: "rpc" as const,
+        protocol: health.protocol,
+        executionId: health.executionId,
+        directBash: health.directBash ?? null,
+        fileTools: health.fileTools ?? null,
+        sharedMode: health.sharedMode ?? null,
+      });
     } catch (error) {
       await client.close().catch(() => undefined);
       const reason = error instanceof RpcClientError ? error.message : error instanceof Error ? error.message : "execution agent check failed";
@@ -307,6 +332,9 @@ ${channel === "console"
   const instructions = baseInstructions(workingDirectory, "telegram");
 
   const registry = createToolRegistry([codingExtension, scriptPolicy(personalTools)], { authority: options.toolAuthority, log: options.toolReviewLog });
+  // Platform-owned extensions join the same governed registry before the harness opens, so their
+  // declarations, deferred discovery and execution review are indistinguishable from built-ins.
+  for (const extension of options.extraExtensions ?? []) registry.install(extension);
   // Reminders are host-owned tools; the model never supplies the receiving chat.
   if (options.reminderStore !== undefined) {
     registry.install(createReminderExtension(options.reminderStore, { chatId: config.ownerId }));
@@ -319,9 +347,14 @@ ${channel === "console"
   // its bound; the next user request starts a fresh run with cleared counters.
   const loopGuard = createLoopGuard(options.toolReviewLog ?? console.error);
   registry.install(loopGuard.extension);
-  const webExtension = config.ccrProfile === undefined
-    ? undefined
-    : scriptPolicy(createCcrWebExtension({ command: config.ccrCommand ?? "ccr", profile: config.ccrProfile }));
+  // Exactly one web implementation is installed: both define web_search/web_fetch and a duplicate
+  // registration is a startup error. The platform credential is host-only; the CCR path needs the
+  // external CLI. An unconfigured deployment installs neither and reports Web as unavailable.
+  const webExtension = config.platform?.webApiKey !== undefined
+    ? scriptPolicy(createWebExtension({ apiKey: config.platform.webApiKey }))
+    : config.ccrProfile === undefined
+      ? undefined
+      : scriptPolicy(createCcrWebExtension({ command: config.ccrCommand ?? "ccr", profile: config.ccrProfile }));
   if (webExtension !== undefined) registry.install(webExtension);
   // Memory wiring (MEM-07) goes through the one composition entry; with MEMORY_ENABLED=0 the
   // application keeps exactly its previous registry, settings and request path. The memory
@@ -581,6 +614,10 @@ ${channel === "console"
     return {
       /** The bootstrap conversation; the default bot owns it. */
       rootId: String(root.id),
+      /** The governed registry, so the host can verify core-tool availability during provisioning. */
+      registry,
+      /** The startup execution-face probe result; undefined for a local deployment. */
+      executionProbe,
       // This signal stops the host's wait during shutdown; close() preserves recovery.
       reply: (request: TextRequest, signal: AbortSignal) => runRequest(root, request, signal),
       /** The same request path for any bot's conversation. */
@@ -592,22 +629,9 @@ ${channel === "console"
        * caller sends through the console can widen them.
        */
       async configureBot(profile: BotConversationProfile): Promise<ConfiguredBot> {
-        const catalogProfile = profile.catalogProfile === undefined
-          ? profileForCapabilities(profile.tools)
-          : parseCatalogProfile(profile.catalogProfile);
+        if (Object.keys(profile).some((key) => !["botId", "conversationId", "cwd", "channel", "prompt", "catalogProfile", "toolScope", "capabilityReasons"].includes(key))) throw new ConfigurationError("Bot configuration has unknown fields");
+        const catalogProfile = parseCatalogProfile(profile.catalogProfile);
         const requestedScope = parseToolScope(profile.toolScope ?? { allow: [], deny: [] });
-        // Legacy callers still require their requested deployment extensions. Explicit switch packs
-        // select from installed tools, independently of role and the legacy capability projection.
-        if (profile.catalogProfile === undefined && catalogProfile.ptc && codemode === undefined) {
-          throw new ConfigurationError(
-            `Bot "${profile.botId}" requires code mode, but CODEMODE_ENABLED is not set on this deployment`,
-          );
-        }
-        if (profile.catalogProfile === undefined && catalogProfile.web && webExtension === undefined) {
-          throw new ConfigurationError(
-            `Bot "${profile.botId}" requires web tools, but CCR_PROFILE is not set on this deployment`,
-          );
-        }
         const wantsPtc = catalogProfile.ptc;
         const wantsWeb = catalogProfile.web;
         const snapshot = registry.snapshot();
@@ -652,7 +676,7 @@ ${channel === "console"
             }, context);
           }
         }
-        registry.setConversationCatalog(conversation.id, catalogProfile, requestedScope, catalog.names);
+        registry.setConversationCatalog(conversation.id, catalogProfile, requestedScope, catalog.names, profile.capabilityReasons);
         botCwds.set(conversation.id, profile.cwd);
         const agent = await conversation.agent(context);
         return {
@@ -729,7 +753,7 @@ ${channel === "console"
  * an explicitly configured file that cannot be read or parsed fails startup, like other config.
  */
 async function openMcpHost(
-  config: ReturnType<typeof readConfig>,
+  config: RuntimeConfig,
   registry: ReturnType<typeof createToolRegistry>,
   signal: AbortSignal | undefined,
 ): Promise<McpHost> {

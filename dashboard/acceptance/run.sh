@@ -29,6 +29,9 @@ export ASTER_SANDBOX_IMAGE=${ASTER_SANDBOX_IMAGE:-aster-sandbox:local}
 export ASTER_APP_VOLUME=${ASTER_APP_VOLUME:-aster-acceptance-app}
 export ASTER_SANDBOX_RUNTIME_VOLUME=${ASTER_SANDBOX_RUNTIME_VOLUME:-aster-acceptance-runtime}
 export ASTER_SANDBOX_WORKSPACES_VOLUME=${ASTER_SANDBOX_WORKSPACES_VOLUME:-aster-acceptance-workspaces}
+# This harness exercises the pre-zero-setup explicit profile/PTC surface. Production deployments
+# keep ALLOW_LEGACY_CATALOG unset (zero-setup); only this acceptance run opts into the old surface.
+export ALLOW_LEGACY_CATALOG=1
 
 compose() {
   docker compose --project-name "$PROJECT" \

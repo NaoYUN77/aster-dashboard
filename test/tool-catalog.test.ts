@@ -2,23 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool } from "@earendil-works/pi-durable";
-import { CATALOG_GROUPS, catalogFor, legacyCapabilitiesForProfile, parseCatalogProfile, parseToolScope, profileForCapabilities, profileForRole, serializeCatalogProfile } from "../src/tool-catalog.js";
+import { CATALOG_GROUPS, catalogFor, legacyCapabilitiesForProfile, parseCatalogProfile, parseToolScope, serializeCatalogProfile } from "../src/tool-catalog.js";
 import type { ToolRecord } from "../src/tools.js";
 
 const tool = (name: string) => defineTool({ name, description: `${name} description`, parameters: Type.Object({}), execute: async () => ({ output: [] }) });
 const all = parseCatalogProfile(Object.fromEntries(CATALOG_GROUPS.map((group) => [group, true])));
 const emptyScope = { allow: [], deny: [] };
 
-test("legacy roles supply switch defaults and capabilities remain a deployment-limited projection", () => {
-  const assistant = { core: true, shell: true, files: true, web: false, ptc: false, memory: true, reminders: true, mcp: true };
-  assert.deepEqual(profileForRole("assistant"), assistant);
-  assert.deepEqual(profileForRole("researcher"), { ...assistant, web: true });
-  assert.deepEqual(profileForRole("programmer"), { ...assistant, ptc: true });
+test("capability strings are a deployment-limited projection of explicit switches", () => {
   assert.equal(legacyCapabilitiesForProfile(all, { ptc: true, web: true }), "bash,files,ptc,web");
   assert.equal(legacyCapabilitiesForProfile(all, { ptc: false, web: false }), "bash,files");
   assert.equal(legacyCapabilitiesForProfile({ ...all, shell: false, files: false }, { ptc: true, web: true }), "ptc,web");
-  assert.deepEqual(profileForCapabilities(["ptc", "web"]), { ...all, shell: false, files: false });
-  assert.throws(() => profileForCapabilities(["arbitrary"]), /unknown/);
 });
 
 test("profiles require all boolean switches and round-trip canonical JSON", () => {

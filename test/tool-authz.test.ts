@@ -13,7 +13,7 @@ import { openAgent } from "../src/agent.js";
 import { readConfig, readMemoryConfig } from "../src/config.js";
 import { connectMcp, type McpConnection, type McpToolInfo } from "../src/mcp.js";
 import { validateMcpConfig } from "../src/mcp-config.js";
-import { profileForRole } from "../src/tool-catalog.js";
+import { DEFAULT_CATALOG_PROFILE } from "../src/tool-catalog.js";
 import { createToolRegistry, type GovernedTool, type ToolAuthority } from "../src/tools.js";
 
 const context = BACKGROUND_CONTEXT;
@@ -166,7 +166,7 @@ test("PTC does not reopen disabled shell, file or MCP groups for direct and nest
     await root.configure({ model: { provider: "faux", modelId: "faux-1" } }, context);
     // Include all names to simulate an old admitted registration. The current group switches must
     // still reject execution, including nested calls, even when an old exact-name set contains it.
-    registry.setConversationCatalog(root.id, { ...profileForRole("assistant"), ptc: true, shell: false, files: false, mcp: false },
+    registry.setConversationCatalog(root.id, { ...DEFAULT_CATALOG_PROFILE, ptc: true, shell: false, files: false, mcp: false },
       { allow: [], deny: [] }, new Set(["bash", "read", "mcp__s__action", "codemode"]));
     assert.equal((await (await root.submit({ type: "input", content: "try the disabled groups" }, context)).wait(context)).status, "done");
     assert.equal(effects, 0);

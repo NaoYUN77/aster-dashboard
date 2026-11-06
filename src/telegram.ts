@@ -3,7 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Api, GrammyError } from "grammy";
 import { AbortController as TelegramAbortController, type AbortSignal as TelegramSignal } from "abort-controller";
 import type { Update } from "grammy/types";
-import { hasProxyEnv, type readConfig } from "./config.js";
+import { hasProxyEnv, type RuntimeConfig } from "./config.js";
 import type { Inbox } from "./inbox.js";
 import type { TextRequest } from "./messages.js";
 
@@ -93,7 +93,7 @@ function isFatal(error: unknown): boolean {
 }
 
 export async function serveTelegram(
-  config: ReturnType<typeof readConfig>,
+  config: RuntimeConfig,
   botId: string,
   inbox: Inbox,
   reply: (request: TextRequest, signal: AbortSignal) => Promise<string>,

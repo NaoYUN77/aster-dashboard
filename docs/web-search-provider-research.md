@@ -1,6 +1,6 @@
 # 内置 Web 工具提供商调研与接入依据
 
-状态：历史 DeepSeek Search/Fetch 调研，不再是当前接入方案。2026-11-06 起，researcher 的 `web_search`／`web_fetch` 通过 Claude Code Router profile 启动 Claude Code 原生 WebSearch／WebFetch；见 [README 的 researcher Web 工具](../README.md#researcher-web-工具)。以下内容记录旧 REST 提供商评估与独立 helper 契约，不代表当前生产路径。核对日期：2026-10-29。
+状态：历史 DeepSeek Search/Fetch 调研，不再是当前接入方案。2026-11-06 起，显式开启 `profile.web` 的 bot 通过 Claude Code Router profile 提供 `web_search`／`web_fetch`，调用 Claude Code 原生 WebSearch／WebFetch；见 [README 的 Web 工具](../README.md#web-工具)。以下内容记录旧 REST 提供商评估与独立 helper 契约，不代表当前生产路径。核对日期：2026-10-29。
 
 ## 1. 建议
 

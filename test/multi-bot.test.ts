@@ -17,20 +17,11 @@ import {
   fauxToolCall,
   type FauxResponseFactory,
 } from "@earendil-works/pi-ai/providers/faux";
-import { toolsForRole } from "../src/bot-manager.js";
-import { profileForRole } from "../src/tool-catalog.js";
+import { DEFAULT_CATALOG_PROFILE } from "../src/tool-catalog.js";
 import { startService, type ServiceHandle } from "../src/main.js";
 
 const TOKEN = "{{SECRET_5xpdbsvp}}";
 const MODEL = "faux-1";
-
-test("role capability strings keep web tools exclusive to configured researchers", () => {
-  const deployment = { ptc: true, web: true };
-  assert.equal(toolsForRole("assistant", deployment), "bash,files");
-  assert.equal(toolsForRole("researcher", deployment), "bash,files,web");
-  assert.equal(toolsForRole("programmer", deployment), "bash,files,ptc");
-  assert.equal(toolsForRole("researcher", { ptc: true, web: false }), "bash,files");
-});
 
 function environment(dataDir: string): NodeJS.ProcessEnv {
   return {
@@ -44,12 +35,11 @@ function environment(dataDir: string): NodeJS.ProcessEnv {
     MODEL_ID: MODEL,
     OPENAI_API_KEY: "faux",
     MEMORY_ENABLED: "0",
-    // Code mode is on so the programmer role's extra capability is observable; the direct tools
-    // stay visible so both roles share a comparable base surface.
+    // Code mode is on so the PTC switch is observable alongside the direct tools.
     CODEMODE_ENABLED: "1",
     CODEMODE_SCRIPT_FIRST: "0",
-    // A configured CCR profile enables the researcher's native Claude Code web tools.
-    CCR_PROFILE: "test-researcher-profile",
+    // A configured CCR profile makes the web group available.
+    CCR_PROFILE: "test-web-profile",
   };
 }
 
@@ -99,7 +89,7 @@ const responder: FauxResponseFactory = (transcript) => {
   const result = toolResultAfterLastUser(transcript);
   if (request.includes("WRITE-FILE")) {
     return result === undefined
-      ? fauxAssistantMessage(fauxToolCall("bash", { command: "echo hello-from-researcher > a.txt" }, { id: "write" }), { stopReason: "toolUse" })
+      ? fauxAssistantMessage(fauxToolCall("bash", { command: "echo hello-from-web-bot > a.txt" }, { id: "write" }), { stopReason: "toolUse" })
       : fauxAssistantMessage("WROTE");
   }
   if (request.includes("LIST-FILES")) {
@@ -201,7 +191,8 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
   const env = environment(directory);
   let service: ServiceHandle | undefined;
   try {
-    service = await startService({ env, models: scriptedProvider(), log: () => {} });
+    // Legacy catalog HTTP compatibility is a host-only test switch; production is zero-setup.
+    service = await startService({ env, models: scriptedProvider(), log: () => {}, allowLegacyCatalog: true });
     const console = consoleOf(service);
 
     // Acceptance 10 (locally): every route, including the page, needs the token.
@@ -214,46 +205,49 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     assert.equal(listed.status, 200);
     assert.deepEqual(listed.body.bots.map((bot: { botId: string }) => bot.botId), ["default"]);
 
+    assert.ok(listed.body.bots.every((bot: object) => !Object.hasOwn(bot, "role")));
+
     // Acceptance 2: two bots, two conversations.
-    const researcher = await console.call("/api/bots", {
-      name: "Researcher",
-      role: "researcher",
-      systemPrompt: "You research.",
+    const webBot = await console.call("/api/bots", {
+      name: "Web Bot",
+      profile: { ...DEFAULT_CATALOG_PROFILE, web: true },
+      systemPrompt: "Use web tools when needed.",
     });
-    assert.equal(researcher.status, 201);
-    const programmer = await console.call("/api/bots", {
-      name: "Programmer",
-      role: "programmer",
-      systemPrompt: "You program.",
+    assert.equal(webBot.status, 201);
+    const scriptBot = await console.call("/api/bots", {
+      name: "Script Bot",
+      profile: { ...DEFAULT_CATALOG_PROFILE, ptc: true },
+      systemPrompt: "Use code mode when needed.",
     });
-    assert.equal(programmer.status, 201);
+    assert.equal(scriptBot.status, 201);
     const scoped = await console.call("/api/bots", {
-      name: "Scoped Assistant",
-      role: "assistant",
+      name: "Scoped Bot",
+      profile: DEFAULT_CATALOG_PROFILE,
       systemPrompt: "Use only the command tool.",
       toolScope: { allow: ["bash"], deny: [] },
     });
     assert.equal(scoped.status, 201);
-    const researcherId = researcher.body.bot.botId as string;
-    const programmerId = programmer.body.bot.botId as string;
-    assert.notEqual(researcher.body.bot.conversationId, programmer.body.bot.conversationId);
+    const webBotId = webBot.body.bot.botId as string;
+    const scriptBotId = scriptBot.body.bot.botId as string;
+    assert.notEqual(webBot.body.bot.conversationId, scriptBot.body.bot.conversationId);
+    for (const { body } of [webBot, scriptBot, scoped]) assert.equal(Object.hasOwn(body.bot, "role"), false);
 
-    // Acceptance 3: only the programmer has code mode and only the researcher has web access.
-    assert.ok(researcher.body.bot.loadedTools.includes("bash"));
-    assert.ok(researcher.body.bot.loadedTools.includes("web_search"));
-    assert.ok(researcher.body.bot.loadedTools.includes("web_fetch"));
-    assert.ok(!researcher.body.bot.loadedTools.includes("codemode"));
-    assert.ok(programmer.body.bot.loadedTools.includes("codemode"));
-    assert.ok(!programmer.body.bot.loadedTools.includes("web_search"));
-    assert.ok(!programmer.body.bot.loadedTools.includes("web_fetch"));
-    assert.ok(researcher.body.bot.tools.includes("web"));
-    assert.ok(!programmer.body.bot.tools.includes("web"));
-    assert.deepEqual(scoped.body.bot.profile, profileForRole("assistant"));
+    // Acceptance 3: explicit web/PTC switches select different tools.
+    assert.ok(webBot.body.bot.loadedTools.includes("bash"));
+    assert.ok(webBot.body.bot.loadedTools.includes("web_search"));
+    assert.ok(webBot.body.bot.loadedTools.includes("web_fetch"));
+    assert.ok(!webBot.body.bot.loadedTools.includes("codemode"));
+    assert.ok(scriptBot.body.bot.loadedTools.includes("codemode"));
+    assert.ok(!scriptBot.body.bot.loadedTools.includes("web_search"));
+    assert.ok(!scriptBot.body.bot.loadedTools.includes("web_fetch"));
+    assert.ok(webBot.body.bot.tools.includes("web"));
+    assert.ok(!scriptBot.body.bot.tools.includes("web"));
+    assert.deepEqual(scoped.body.bot.profile, DEFAULT_CATALOG_PROFILE);
     assert.deepEqual(scoped.body.bot.toolScope, { allow: ["bash"], deny: [] });
     assert.deepEqual(scoped.body.bot.loadedTools, ["bash"]);
 
-    const customProfile = { ...profileForRole("assistant"), shell: false, files: false, web: true, ptc: true, mcp: false };
-    const custom = await console.call("/api/bots", { name: "Custom", role: "assistant", profile: customProfile });
+    const customProfile = { ...DEFAULT_CATALOG_PROFILE, shell: false, files: false, web: true, ptc: true, mcp: false };
+    const custom = await console.call("/api/bots", { name: "Custom", profile: customProfile });
     assert.equal(custom.status, 201);
     assert.deepEqual(custom.body.bot.profile, customProfile);
     assert.deepEqual(custom.body.bot.tools, ["ptc", "web"]);
@@ -262,7 +256,7 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     assert.ok(!custom.body.bot.loadedTools.includes("bash"));
     assert.ok(!custom.body.bot.loadedTools.includes("read"));
     for (const profile of [null, "research", { ...customProfile, shell: "yes" }, { core: true }, { ...customProfile, extra: true }]) {
-      assert.equal((await console.call("/api/bots", { name: "Invalid", role: "assistant", profile })).status, 400);
+      assert.equal((await console.call("/api/bots", { name: "Invalid", profile })).status, 400);
     }
     const updatedProfile = { ...customProfile, files: true, reminders: false };
     const update = await fetch(`${console.base}/api/bots/${custom.body.bot.botId}`, {
@@ -288,44 +282,54 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     await assert.rejects(service.bots.updateCatalog(custom.body.bot.botId, { profile: customProfile }), /must be idle/);
     assert.deepEqual((await changing).toolScope, { allow: [], deny: ["write"] });
     const explicit = await service.agent.configureBot({
-      botId: "host-explicit", cwd: directory, prompt: "", tools: ["bash", "files"],
+      botId: "host-explicit", cwd: directory, prompt: "",
       catalogProfile: customProfile,
     });
     assert.ok(explicit.tools.includes("codemode") && explicit.tools.includes("web_search"));
     assert.ok(!explicit.tools.includes("bash") && !explicit.tools.includes("read"));
-    const legacy = await service.agent.configureBot({ botId: "host-legacy", cwd: directory, prompt: "", tools: ["ptc", "web"] });
-    assert.ok(legacy.tools.includes("codemode") && legacy.tools.includes("web_search"));
-    assert.ok(!legacy.tools.includes("bash") && !legacy.tools.includes("read"));
+    // Host configuration also requires switches and rejects removed configuration inputs.
+    for (const invalid of [
+      { botId: "host-invalid", cwd: directory, prompt: "" },
+      { botId: "host-invalid", cwd: directory, prompt: "", catalogProfile: customProfile, tools: ["ptc", "web"] },
+      { botId: "host-invalid", cwd: directory, prompt: "", catalogProfile: customProfile, role: "programmer" },
+    ]) {
+      await assert.rejects(service.agent.configureBot(invalid as Parameters<typeof service.agent.configureBot>[0]), /catalog profile|unknown fields/);
+    }
 
-    // Unknown bots are 404 and an invalid role is 400.
     assert.equal((await console.call("/api/bots/nobody/messages", { text: "hi" })).status, 404);
-    assert.equal((await console.call("/api/bots", { name: "X", role: "admin" })).status, 400);
+    assert.equal((await console.call("/api/bots", { name: "Missing profile" })).status, 400);
+    for (const role of ["assistant", "researcher", "programmer"]) {
+      assert.equal((await console.call("/api/bots", { name: "Removed field", profile: customProfile, role })).status, 400);
+    }
+    await assert.rejects(service.bots.create({ name: "Removed field", systemPrompt: "", profile: customProfile, role: "assistant" } as Parameters<typeof service.bots.create>[0]), /unknown fields/);
+    assert.equal(Object.hasOwn(custom.body.bot, "role"), false);
+    assert.equal(Object.hasOwn(updated, "role"), false);
 
     // Acceptance 4 (local): A's file is not in B's working directory.
-    assert.equal((await console.call(`/api/bots/${researcherId}/messages`, { text: "WRITE-FILE" })).status, 202);
+    assert.equal((await console.call(`/api/bots/${webBotId}/messages`, { text: "WRITE-FILE" })).status, 202);
     const wrote = await waitFor("the write to finish", async () => {
-      const texts = assistantTexts(await history(console, researcherId));
+      const texts = assistantTexts(await history(console, webBotId));
       return texts.includes("WROTE") ? texts : undefined;
     });
     assert.deepEqual(wrote, ["WROTE"]);
     assert.equal(
-      (await readFile(join(directory, "workspaces", researcherId, "a.txt"), "utf8")).trim(),
-      "hello-from-researcher",
+      (await readFile(join(directory, "workspaces", webBotId, "a.txt"), "utf8")).trim(),
+      "hello-from-web-bot",
     );
 
-    assert.equal((await console.call(`/api/bots/${programmerId}/messages`, { text: "LIST-FILES" })).status, 202);
+    assert.equal((await console.call(`/api/bots/${scriptBotId}/messages`, { text: "LIST-FILES" })).status, 202);
     const listedText = await waitFor("the listing to finish", async () => {
-      const texts = assistantTexts(await history(console, programmerId));
+      const texts = assistantTexts(await history(console, scriptBotId));
       return texts[0];
     });
     assert.doesNotMatch(listedText, /a\.txt/);
 
     // Acceptance 6: live events move from a run start to a run end.
     const events = await collectEvents(
-      `${console.base}/api/bots/${researcherId}/events?token=${TOKEN}`,
+      `${console.base}/api/bots/${webBotId}/events?token=${TOKEN}`,
       (kinds) => kinds.includes("run_end"),
       async () => {
-        await console.call(`/api/bots/${researcherId}/messages`, { text: "LIST-FILES" });
+        await console.call(`/api/bots/${webBotId}/messages`, { text: "LIST-FILES" });
       },
     );
     assert.ok(events.includes("run_start"), `expected run_start in ${events.join(",")}`);
@@ -333,23 +337,23 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     assert.ok(events.includes("tool"), `expected a tool event in ${events.join(",")}`);
 
     // Acceptance 7: cancelling A stops A's sleep and leaves B alone.
-    assert.equal((await console.call(`/api/bots/${researcherId}/messages`, { text: "SLEEP-LONG" })).status, 202);
-    await assert.rejects(service.bots.updateCatalog(researcherId, { profile: customProfile }), /must be idle/);
+    assert.equal((await console.call(`/api/bots/${webBotId}/messages`, { text: "SLEEP-LONG" })).status, 202);
+    await assert.rejects(service.bots.updateCatalog(webBotId, { profile: customProfile }), /must be idle/);
     // Give the run time to reach its `sleep 30` command, so the cancel interrupts real work.
     await new Promise((resolve) => setTimeout(resolve, 1_500));
-    const quick = await console.call(`/api/bots/${programmerId}/messages`, { text: "QUICK" });
+    const quick = await console.call(`/api/bots/${scriptBotId}/messages`, { text: "QUICK" });
     assert.equal(quick.status, 202);
-    await waitFor("the programmer's quick run", async () => {
-      const texts = assistantTexts(await history(console, programmerId));
+    await waitFor("the script bot's quick run", async () => {
+      const texts = assistantTexts(await history(console, scriptBotId));
       return texts.at(-1) === "OK" ? texts : undefined;
     }, 20_000);
-    const stopped = await console.call(`/api/bots/${researcherId}/cancel`, {});
+    const stopped = await console.call(`/api/bots/${webBotId}/cancel`, {});
     assert.equal(stopped.status, 200);
     assert.equal(stopped.body.cancelled, true);
     await new Promise((resolve) => setTimeout(resolve, 500));
-    const afterCancel = assistantTexts(await history(console, researcherId));
+    const afterCancel = assistantTexts(await history(console, webBotId));
     assert.ok(!afterCancel.includes("SLEPT"), "a cancelled run must not be saved as an answer");
-    assert.equal(assistantTexts(await history(console, programmerId)).at(-1), "OK");
+    assert.equal(assistantTexts(await history(console, scriptBotId)).at(-1), "OK");
 
     // The default bot keeps the legacy working directory, not a per-bot one.
     assert.equal(service.bots.views().length, 5);
@@ -357,22 +361,24 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     // Acceptance 8 (local): bots, conversations and history survive a restart.
     const beforeRestart = await console.call("/api/bots");
     await service.close();
-    service = await startService({ env, models: scriptedProvider(), log: () => {} });
+    // Legacy catalog HTTP compatibility is a host-only test switch; production is zero-setup.
+    service = await startService({ env, models: scriptedProvider(), log: () => {}, allowLegacyCatalog: true });
     const restarted = consoleOf(service);
     const afterRestart = await restarted.call("/api/bots");
+    assert.ok(afterRestart.body.bots.every((bot: object) => !Object.hasOwn(bot, "role")));
     assert.deepEqual(
       afterRestart.body.bots.map((bot: { botId: string; conversationId: string }) => [bot.botId, bot.conversationId]),
       beforeRestart.body.bots.map((bot: { botId: string; conversationId: string }) => [bot.botId, bot.conversationId]),
     );
     const restoredScope = afterRestart.body.bots.find((bot: { botId: string }) => bot.botId === scoped.body.bot.botId);
-    assert.deepEqual(restoredScope.profile, profileForRole("assistant"));
+    assert.deepEqual(restoredScope.profile, DEFAULT_CATALOG_PROFILE);
     assert.deepEqual(restoredScope.toolScope, { allow: ["bash"], deny: [] });
     const restoredCustom = afterRestart.body.bots.find((bot: { botId: string }) => bot.botId === custom.body.bot.botId);
     assert.deepEqual(restoredCustom.profile, updatedProfile);
     assert.deepEqual(restoredCustom.toolScope, { allow: [], deny: ["write"] });
     assert.ok(restoredCustom.loadedTools.includes("codemode") && restoredCustom.loadedTools.includes("web_search"));
     assert.ok(!restoredCustom.loadedTools.includes("bash") && !restoredCustom.loadedTools.includes("write"));
-    const restored = assistantTexts(await history(restarted, researcherId));
+    const restored = assistantTexts(await history(restarted, webBotId));
     assert.ok(restored.includes("WROTE"), `history lost after restart: ${restored.join("|")}`);
   } finally {
     await service?.close().catch(() => undefined);

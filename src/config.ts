@@ -6,6 +6,7 @@ import { ConfigurationError } from "./errors.js";
 import { isAbsoluteRemotePath } from "./execution/protocol.js";
 import { readRpcClientConfig, type RpcClientConfig } from "./execution/rpc-config.js";
 import { isProviderId, PROVIDER_IDS, PROVIDERS } from "./providers.js";
+import type { PlatformDependencies } from "./platform-capabilities.js";
 import {
   assertSchema,
   eventDate,
@@ -189,7 +190,74 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     // Proactive sends need a Telegram identity; a console-only instance stores none.
     ...(reminders.enabled && telegramEnabled ? { reminders } : {}),
     trace: readTraceConfig(env),
+    platform: readPlatformConfig(env),
   };
+}
+
+/**
+ * Host-verified deployment facts for the zero-setup runtime. Nothing here comes from a bot row, a
+ * request body or a model parameter. A credential is read once and kept in host configuration: it
+ * is never written into a bot row, a tool declaration, a log line or a prompt.
+ *
+ * `PLATFORM_SANDBOX_VERIFIED=1` is an operator's declaration that this deployment passed the OS
+ * isolation acceptance runbook. It is rejected without a configured remote execution transport,
+ * because a flag alone cannot turn the host's own bash into an isolated Computer capability.
+ */
+export type PlatformConfig = {
+  readonly facts: PlatformDependencies;
+  /** Host-owned Web Search/Fetch credential. Never exposed to the model, a bot row or a log. */
+  readonly webApiKey?: string;
+};
+
+export function readPlatformConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig {
+  const webApiKey = env.PLATFORM_WEB_SEARCH_API_KEY?.trim() || undefined;
+  if (webApiKey !== undefined) assertValidCredentialShape("PLATFORM_WEB_SEARCH_API_KEY", webApiKey);
+  const ccrProfile = env.CCR_PROFILE?.trim();
+  // Both providers install the same tool names; choosing one silently would hide a config error.
+  if (webApiKey !== undefined && ccrProfile) {
+    throw new ConfigurationError("Configure either PLATFORM_WEB_SEARCH_API_KEY or CCR_PROFILE, not both");
+  }
+  const sandboxRaw = env.PLATFORM_SANDBOX_VERIFIED?.trim();
+  if (sandboxRaw !== undefined && sandboxRaw !== "" && sandboxRaw !== "0" && sandboxRaw !== "1") {
+    throw new ConfigurationError("PLATFORM_SANDBOX_VERIFIED must be 0 or 1");
+  }
+  const sandboxVerified = sandboxRaw === "1";
+  if (sandboxVerified && readExecutionConfig(env) === undefined) {
+    throw new ConfigurationError("PLATFORM_SANDBOX_VERIFIED=1 requires EXECUTION_MODE=remote and a verified OS sandbox");
+  }
+  const facts: PlatformDependencies = Object.freeze({
+    memoryEnabled: readMemoryConfig(env).enabled,
+    webConfigured: webApiKey !== undefined || Boolean(ccrProfile),
+    webViaPlatformCredential: webApiKey !== undefined,
+    taskDeliverable: readReminderConfig(env).enabled && readTelegramEnabled(env),
+    ptcConfigured: readCodemodeConfig(env).enabled,
+    sandboxVerified,
+    // No OAuth integration is connected in this phase; the platform never claims one.
+    mcpConnected: false,
+  });
+  return Object.freeze({ facts, ...(webApiKey === undefined ? {} : { webApiKey }) });
+}
+
+/**
+ * The structural config the agent and protocol adapters need. `platform` is optional here: those
+ * modules predate zero-setup and do not need deployment facts, and tests hand-build this shape.
+ * `readConfig()` always supplies it, so a real deployment still gets a frozen, host-verified value.
+ */
+export type RuntimeConfig = Omit<ReturnType<typeof readConfig>, "platform"> & {
+  readonly platform?: PlatformConfig;
+};
+
+/**
+ * Host-only compatibility switch for the pre-zero-setup dashboard acceptance harness. It is read
+ * once by the process owner, defaults to off, and is never a browser field or a user capability
+ * setting. An invalid value is a configuration error, not a silent fallback.
+ */
+export function readLegacyCatalogEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.ALLOW_LEGACY_CATALOG?.trim();
+  if (raw !== undefined && raw !== "" && raw !== "0" && raw !== "1") {
+    throw new ConfigurationError("ALLOW_LEGACY_CATALOG must be 0 or 1");
+  }
+  return raw === "1";
 }
 
 /** One-time reminders (REMINDERS_*). Enabled by default; limits bound each owner's stored rows. */
