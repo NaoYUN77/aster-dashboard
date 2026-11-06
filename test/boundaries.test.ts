@@ -9,6 +9,7 @@ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { GrammyError } from "grammy";
 import type { Update } from "grammy/types";
 import { Inbox } from "../src/inbox.js";
+import { parseCatalogProfile, profileForRole } from "../src/tool-catalog.js";
 import { StateError } from "../src/errors.js";
 import { readConfig } from "../src/config.js";
 import { createProviderModels, PROVIDERS, requireModel } from "../src/providers.js";
@@ -39,9 +40,53 @@ test("legacy bot rows migrate to role profiles with an empty persisted tool scop
   let inbox: Inbox | undefined;
   try {
     inbox = new Inbox(path);
-    assert.equal(inbox.bot("researcher")?.profile, "research");
-    assert.equal(inbox.bot("coder")?.profile, "programmer");
+    assert.deepEqual(inbox.bot("researcher")?.profile, profileForRole("researcher"));
+    assert.deepEqual(inbox.bot("coder")?.profile, profileForRole("programmer"));
     assert.equal(inbox.bot("researcher")?.toolScope, "{\"allow\":[],\"deny\":[]}");
+  } finally {
+    inbox?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("named profiles migrate once while explicit switches, scopes and legacy strings survive reopening", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-bot-switch-migration-"));
+  const path = join(directory, "inbox.sqlite");
+  const custom = parseCatalogProfile({ ...profileForRole("assistant"), shell: false, web: true, ptc: true, mcp: false });
+  const scope = { allow: ["codemode", "web_search"], deny: ["web_fetch"] };
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE bots (
+    botId TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, conversationId TEXT NOT NULL UNIQUE,
+    systemPrompt TEXT NOT NULL, tools TEXT NOT NULL, profile TEXT, toolScope TEXT,
+    status TEXT NOT NULL DEFAULT 'active', createdAt TEXT NOT NULL
+  );`);
+  const insert = legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)");
+  for (const [id, profile] of [["chief", "chief"], ["research", "research"], ["programmer", "programmer"], ["custom", JSON.stringify(custom)]]) {
+    insert.run(id!, id!, "assistant", id!, "kept prompt", "bash,files", profile!, JSON.stringify(scope), "2026-11-06T00:00:00.000Z");
+  }
+  legacy.close();
+  let inbox: Inbox | undefined;
+  try {
+    for (let reopen = 0; reopen < 2; reopen++) {
+      inbox = new Inbox(path);
+      assert.deepEqual(inbox.bot("chief")?.profile, profileForRole("assistant"));
+      assert.deepEqual(inbox.bot("research")?.profile, profileForRole("researcher"));
+      assert.deepEqual(inbox.bot("programmer")?.profile, profileForRole("programmer"));
+      assert.deepEqual(inbox.bot("custom")?.profile, custom);
+      for (const bot of inbox.bots()) {
+        assert.equal(bot.tools, "bash,files");
+        assert.equal(bot.systemPrompt, "kept prompt");
+        assert.equal(bot.conversationId, bot.botId);
+        assert.deepEqual(JSON.parse(bot.toolScope), scope);
+      }
+      inbox.close(); inbox = undefined;
+    }
+    const raw = new DatabaseSync(path);
+    assert.deepEqual(JSON.parse(String(raw.prepare("SELECT profile FROM bots WHERE botId = 'custom'").get()!.profile)), custom);
+    raw.prepare("UPDATE bots SET profile = ? WHERE botId = 'custom'").run('{"shell":"yes"}');
+    raw.close();
+    inbox = new Inbox(path);
+    assert.throws(() => inbox!.bot("custom"), /must be a boolean/);
   } finally {
     inbox?.close();
     await rm(directory, { recursive: true, force: true });

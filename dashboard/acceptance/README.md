@@ -34,7 +34,7 @@ bash dashboard/acceptance/run.sh
 | --- | --- | --- | --- |
 | 1 | overlay 一次 up 成功 | `run.sh` | `compose up -d --build` 退出 0；两个服务 running；sandbox healthy |
 | 2 | 研究员 + 编程 bot，两行 conversationId 不同 | `run.sh` + `console-check.mjs` | `bots` 表两行、conversationId 不同；控制台返回 201 |
-| 3 | prompt/工具隔离，非编程 bot 调不到 PTC | `console-check.mjs` | 两行 systemPrompt 不同；`tools` 列不同（programmer 含 `ptc`）；`loadedTools` 中 researcher 无 `codemode`；researcher 的 run 无 codemode 工具事件 |
+| 3 | prompt/工具隔离，旧角色默认开关中 researcher 不启用 PTC | `console-check.mjs` | 两行 systemPrompt 不同；`tools` 列不同（programmer 含 `ptc`）；`loadedTools` 中 researcher 无 `codemode`；researcher 的 run 无 codemode 工具事件 |
 | 4 | sandbox 内 A 写 a.txt、B ls 看不到；文件原语不能越出会话根或读到 `/data` | `console-check.mjs` + `sandbox-check.mjs` | A 的 bash 输出自己的 `/workspaces/<botId>`；B 的列目录没有 `acceptance-a.txt`；B 执行 `ls -A /data` 无条目（基础镜像自带空 `/data`）；`file.readText` 对 `../`、兄弟 bot 和 `/data` 返回 `permission_denied`；A/B 的 `pwd` 各自独立 |
 | 5 | 两个 `sleep 30` 并行约 30 秒 | `console-check.mjs` + `sandbox-check.mjs` | 两个 bot 同时发任务，总耗时 < 48s（串行约 60s） |
 | 6 | 事件流实时、running→terminal | `console-check.mjs` | SSE 依次收到 `run_start` → 工具事件 → `run_end`（同一次运行内） |
@@ -67,8 +67,8 @@ curl -sN "http://127.0.0.1:8787/api/bots/<botId>/events?token=$WEB_TOKEN"
 
 ## PTC / codemode
 
-- codemode 在 overlay 中开启（`CODEMODE_ENABLED=1`），但角色的工具清单由宿主决定：
-  `programmer` 才加载 `codemode`，其它角色不加载（验收第 3 条）。
+- codemode 在 overlay 中开启（`CODEMODE_ENABLED=1`），由 bot 的 `profile.ptc` 与 `toolScope` 决定是否可用。
+  验收第 3 条使用旧角色默认开关：`programmer` 开启、`researcher` 关闭；显式 profile 可让任意角色开启 PTC。
 - sandbox 内的 PTC runner 以 bot 自己的目录为工作区，并把它映射成虚拟 `/workspace`；
   模型在 bash 中写的文件与 PTC 脚本看到的 `/workspace/<name>` 是同一份。
 - 隔离来源是容器本身（`network none`、`cap_drop ALL`、非 root、只读根文件系统），

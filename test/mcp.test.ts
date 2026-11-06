@@ -22,6 +22,7 @@ import { buildMcpTool, connectMcp, mcpToolName, openMcpConnection, type McpConne
 import type { McpFileConfig, McpServerConfig } from "../src/mcp-config.js";
 import type { TextRequest } from "../src/messages.js";
 import { readToolCatalog, readToolLedger } from "../src/tool-ledger.js";
+import { profileForRole } from "../src/tool-catalog.js";
 import { createToolRegistry, type GovernedTool } from "../src/tools.js";
 
 const unusedApi = undefined as unknown as ToolExecutionApi;
@@ -551,6 +552,58 @@ test("an MCP tool is hidden until tool_search loads it, then callable", { timeou
     const request: TextRequest = { requestId: "telegram:test:1", conversationId: "telegram:test", senderId: "1", text: "Echo something." };
     assert.equal(await app.reply(request, new AbortController().signal), "done");
     assert.equal(connection.calls.length, 1, "the MCP server was called once");
+  } finally {
+    await app?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("MCP switches gate pinned declarations, discovery and calls independently for each bot", { timeout: 30_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-mcp-switches-"));
+  let app: Awaited<ReturnType<typeof openAgent>> | undefined;
+  try {
+    const connection = fakeConnection("s", [tool("echo"), tool("resident")]);
+    const host = await connectMcp({ ...config(stdioServer("s")), tools: { mcp__s__resident: { pin: true } } }, {
+      dataDir: directory, reserved: new Set(), log: () => {}, connect: async () => connection,
+    });
+    const faux = fauxProvider({ provider: "openai" });
+    const models = createModels(); models.setProvider(faux.provider);
+    const appConfig = readConfig({ TELEGRAM_BOT_TOKEN: "test", TELEGRAM_OWNER_ID: "1", MODEL_PROVIDER: "openai", MODEL_ID: "faux-1", OPENAI_API_KEY: "test", DATA_DIR: directory });
+    app = await openAgent(appConfig, models, undefined, { mcp: host });
+    const enabled = await app.configureBot({ botId: "enabled", cwd: directory, prompt: "", tools: [], catalogProfile: profileForRole("assistant") });
+    const disabled = await app.configureBot({ botId: "disabled", cwd: directory, prompt: "", tools: [], catalogProfile: { ...profileForRole("assistant"), mcp: false } });
+    assert.ok(enabled.tools.includes("mcp__s__resident"));
+    assert.ok(!disabled.tools.some((name) => name.startsWith("mcp__")));
+    const last = (messages: readonly Message[]) => messages.findLast((message) => message.role === "toolResult");
+    const blocked = () => [
+      () => fauxAssistantMessage(fauxToolCall("tool_search", { query: "echo" }), { stopReason: "toolUse" as const }),
+      (transcript: { messages: readonly Message[] }) => {
+        assert.deepEqual(last(transcript.messages)?.details, { loaded: [] });
+        return fauxAssistantMessage(fauxToolCall("mcp__s__resident", {}), { stopReason: "toolUse" });
+      },
+      (transcript: { messages: readonly Message[] }) => {
+        assert.ok(last(transcript.messages)?.isError);
+        return fauxAssistantMessage("blocked");
+      },
+    ];
+    faux.setResponses(blocked());
+    const request = (id: string): TextRequest => ({ requestId: `console:${id}:test-switches`, conversationId: id, senderId: "console", text: "use MCP" });
+    assert.equal(await app.replyFor(disabled.conversationId, request("disabled"), new AbortController().signal), "blocked");
+    assert.equal(connection.calls.length, 0);
+    faux.setResponses([
+      () => fauxAssistantMessage(fauxToolCall("tool_search", { query: "echo" }), { stopReason: "toolUse" }),
+      (transcript) => {
+        assert.deepEqual(last(transcript.messages)?.details, { loaded: ["mcp__s__echo"] });
+        return fauxAssistantMessage(fauxToolCall("mcp__s__echo", {}), { stopReason: "toolUse" });
+      },
+      (transcript) => { assert.equal(last(transcript.messages)?.isError, false); return fauxAssistantMessage("allowed"); },
+    ]);
+    assert.equal(await app.replyFor(enabled.conversationId, request("enabled"), new AbortController().signal), "allowed");
+    assert.equal(connection.calls.length, 1);
+    connection.setAvailability("unavailable"); connection.setAvailability("available");
+    faux.setResponses(blocked());
+    assert.equal(await app.replyFor(disabled.conversationId, { ...request("disabled"), requestId: "console:disabled:test-again" }, new AbortController().signal), "blocked");
+    assert.equal(connection.calls.length, 1, "another bot's load and service restoration cannot reopen MCP");
   } finally {
     await app?.close();
     await rm(directory, { recursive: true, force: true });

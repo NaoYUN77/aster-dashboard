@@ -4,7 +4,8 @@
 // `close()` stops accepting connections and detaches every event stream. Routes:
 //   GET  /                        the static page
 //   GET  /api/bots                bots with their run state
-//   POST /api/bots                create a bot from a name, a role and a system prompt
+//   POST /api/bots                create a bot with capability switches and an optional scope
+//   PATCH /api/bots/:id           change an idle bot's catalog switches and optional scope
 //   POST /api/bots/:id/messages   durably accept one request; answers with its id
 //   POST /api/bots/:id/cancel     withdraw the bot's pending request and stop its run
 //   GET  /api/bots/:id/history    the conversation's model-visible history
@@ -203,6 +204,7 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
         role: body.role,
         systemPrompt: body.systemPrompt,
         botId: body.botId,
+        profile: body.profile,
         toolScope: body.toolScope,
       });
       send(response, 201, { bot });
@@ -215,6 +217,14 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
     }
     const botId = match[1] as string;
     const action = match[3];
+    if (method === "PATCH" && action === undefined) {
+      const input = await readJson(request);
+      if (input === null || typeof input !== "object" || Array.isArray(input)) throw new StateError("Bot catalog update must be an object");
+      const body = input as Record<string, unknown>;
+      if (Object.keys(body).some((key) => key !== "profile" && key !== "toolScope")) throw new StateError("Bot catalog update has unknown fields");
+      send(response, 200, { bot: await bots.updateCatalog(botId, { profile: body.profile, toolScope: body.toolScope }) });
+      return;
+    }
     if (method === "POST" && action === "messages") {
       const body = (await readJson(request)) as Record<string, unknown>;
       const accepted = bots.send(botId, body.text);

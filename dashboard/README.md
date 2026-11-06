@@ -42,13 +42,13 @@ Each bot is one ownerless durable conversation in `inbox.sqlite` (`bots` table) 
 answers its requests in arrival order. Creating a bot creates the conversation first and then the
 row; a restart reconfigures each stored conversation and starts its worker again.
 
-| role | model-visible tools |
-| --- | --- |
-| assistant | bash, read, write, edit |
-| researcher | bash, read, write, edit |
-| programmer | bash, read, write, edit, codemode |
+The browser's create and capability-settings forms send a `profile` object containing independent
+`core`, `shell`, `files`, `web`, `ptc`, `memory`, `reminders` and `mcp` booleans. These switches and
+`toolScope` govern the installed tools; legacy role metadata does not override them. Existing bots
+can change their profile while idle through `PATCH /api/bots/:id`. See
+[the tool catalog](../docs/tool-catalog.md) for the switch groups and old role defaults.
 
-The role is decided by the host; the browser never names a tool, a model or a path. The bootstrap
+The host decides the model and workspace. The bootstrap
 bot `default` points at the root conversation and keeps `/workspaces` as its directory, so an
 existing single-bot installation can still see its files.
 
@@ -67,7 +67,8 @@ execution code, deadlines, cancellation and file primitives are the same as for 
 only difference is where isolation comes from: the container's namespaces and limits replace a
 per-command `bwrap` and cgroup, and PTC reports isolation mode `container`.
 
-PTC (code mode) is enabled in the sandbox and exposed only to the `programmer` role. A PTC session
+PTC (code mode) is enabled in the sandbox and exposed when a bot's `ptc` switch and scope permit it.
+The old role defaults enable it for `programmer`; any role can supply an explicit switch pack. A PTC session
 opens in the bot's own directory; its runner maps that directory to the virtual `/workspace`, so a
 file written by the model's bash tool is visible to a script at `/workspace/<name>`.
 

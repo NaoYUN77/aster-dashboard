@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { StateError } from "./errors.js";
 import { splitReply, type TextRequest } from "./messages.js";
-import { profileForRole, parseToolScope, serializeToolScope, type CatalogProfileId, type ToolScope } from "./tool-catalog.js";
+import { profileForRole, parseCatalogProfile, serializeCatalogProfile, parseToolScope, serializeToolScope, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
 
 export interface Job extends TextRequest {
   status: "pending" | "ready" | "sent" | "failed" | "uncertain";
@@ -11,7 +11,7 @@ export interface Job extends TextRequest {
   repliedAt: string | null;
 }
 
-/** A bot's declared role decides its workspace and the tools it is offered. */
+/** Legacy role metadata, used only to supply defaults when no catalog profile was provided. */
 export type BotRole = "assistant" | "researcher" | "programmer";
 
 export type BotStatus = "active" | "disabled";
@@ -28,7 +28,7 @@ export interface BotRecord {
   systemPrompt: string;
   /** Legacy capability projection retained for configureBot and older clients. */
   tools: string;
-  profile: CatalogProfileId;
+  profile: CatalogProfile;
   toolScope: string;
   status: BotStatus;
   createdAt: string;
@@ -42,7 +42,7 @@ export interface BotRegistration {
   systemPrompt: string;
   tools: string;
   /** Optional to keep direct legacy Inbox callers source-compatible. */
-  profile?: CatalogProfileId;
+  profile?: CatalogProfile;
   toolScope?: ToolScope;
 }
 
@@ -123,11 +123,21 @@ export class Inbox {
     addColumn(this.db, "deliveries", "updatedAt", "TEXT");
     addColumn(this.db, "bots", "profile", "TEXT");
     addColumn(this.db, "bots", "toolScope", "TEXT");
-    // Upgrade existing role/capability rows once into the profile contract; keep `tools` intact.
-    this.db.prepare(`UPDATE bots SET profile = CASE role
-      WHEN 'researcher' THEN 'research' WHEN 'programmer' THEN 'programmer' ELSE 'chief' END
-      WHERE profile IS NULL OR profile = ''`).run();
-    this.db.prepare("UPDATE bots SET toolScope = '{\"allow\":[],\"deny\":[]}' WHERE toolScope IS NULL OR toolScope = ''").run();
+    // Only legacy rows are migrated; an explicit switch pack survives every subsequent startup.
+    this.transaction(() => {
+      const legacy = this.db.prepare(`SELECT botId, role, profile FROM bots
+        WHERE profile IS NULL OR profile = '' OR profile IN ('research', 'chief', 'programmer')`).all();
+      const update = this.db.prepare("UPDATE bots SET profile = ? WHERE botId = ?");
+      for (const row of legacy) {
+        const role = row.profile === "research" ? "researcher"
+          : row.profile === "chief" ? "assistant"
+          : row.profile === "programmer" ? "programmer" : row.role;
+        if (role !== "assistant" && role !== "researcher" && role !== "programmer") throw new StateError("Bot role is invalid during catalog migration");
+        if (typeof row.botId !== "string") throw new StateError("Bot id is invalid during catalog migration");
+        update.run(serializeCatalogProfile(profileForRole(role)), row.botId);
+      }
+      this.db.prepare("UPDATE bots SET toolScope = '{\"allow\":[],\"deny\":[]}' WHERE toolScope IS NULL OR toolScope = ''").run();
+    });
   }
 
   bindIdentity(botId: string, ownerId: string): void {
@@ -244,7 +254,7 @@ export class Inbox {
   /** Register the bootstrap bot without overwriting an operator's later edits. */
   ensureBot(registration: BotRegistration): BotRecord {
     validateBot(registration);
-    const profile = registration.profile ?? profileForRole(registration.role);
+    const profile = serializeCatalogProfile(registration.profile === undefined ? profileForRole(registration.role) : registration.profile);
     const toolScope = serializeToolScope(registration.toolScope ?? { allow: [], deny: [] });
     this.db.prepare(`INSERT OR IGNORE INTO bots (botId, name, role, conversationId, systemPrompt, tools, profile, toolScope, createdAt)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
@@ -264,7 +274,7 @@ export class Inbox {
   createBot(registration: BotRegistration): BotRecord {
     validateBot(registration);
     if (this.bot(registration.botId) !== undefined) throw new StateError("Bot already exists");
-    const profile = registration.profile ?? profileForRole(registration.role);
+    const profile = serializeCatalogProfile(registration.profile === undefined ? profileForRole(registration.role) : registration.profile);
     const toolScope = serializeToolScope(registration.toolScope ?? { allow: [], deny: [] });
     this.db.prepare(`INSERT INTO bots (botId, name, role, conversationId, systemPrompt, tools, profile, toolScope, createdAt)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
@@ -282,15 +292,17 @@ export class Inbox {
   }
 
   bot(botId: string): BotRecord | undefined {
-    return this.db.prepare("SELECT * FROM bots WHERE botId = ?").get(botId) as BotRecord | undefined;
+    const row = this.db.prepare("SELECT * FROM bots WHERE botId = ?").get(botId);
+    return row === undefined ? undefined : decodeBot(row);
   }
 
   botByConversation(conversationId: string): BotRecord | undefined {
-    return this.db.prepare("SELECT * FROM bots WHERE conversationId = ?").get(conversationId) as BotRecord | undefined;
+    const row = this.db.prepare("SELECT * FROM bots WHERE conversationId = ?").get(conversationId);
+    return row === undefined ? undefined : decodeBot(row);
   }
 
   bots(): BotRecord[] {
-    return this.db.prepare("SELECT * FROM bots ORDER BY rowid").all() as unknown as BotRecord[];
+    return this.db.prepare("SELECT * FROM bots ORDER BY rowid").all().map(decodeBot);
   }
 
   /** Point a bot at the conversation its durable transcript actually lives in. */
@@ -307,9 +319,9 @@ export class Inbox {
     this.db.prepare(`UPDATE bots SET tools = ? WHERE botId = ?`).run(normalized, botId);
   }
 
-  setBotCatalog(botId: string, profile: CatalogProfileId, toolScope: ToolScope): void {
+  setBotCatalog(botId: string, profile: CatalogProfile, toolScope: ToolScope): void {
     const scope = serializeToolScope(toolScope);
-    const changed = this.db.prepare("UPDATE bots SET profile = ?, toolScope = ? WHERE botId = ?").run(profile, scope, botId);
+    const changed = this.db.prepare("UPDATE bots SET profile = ?, toolScope = ? WHERE botId = ?").run(serializeCatalogProfile(profile), scope, botId);
     if (changed.changes !== 1) throw new StateError("Bot not found");
   }
 
@@ -441,10 +453,15 @@ function validateBot(registration: BotRegistration): void {
   if (registration.systemPrompt.length > 8_000) throw new StateError("Bot prompt must be at most 8000 characters");
   const tools = parseBotTools(registration.tools);
   if (tools !== registration.tools) throw new StateError("Bot tools must be normalized before storage");
-  const profile = registration.profile ?? profileForRole(registration.role);
-  if (profile !== "research" && profile !== "chief" && profile !== "programmer") throw new StateError("Bot catalog profile is invalid");
-  try { parseToolScope(registration.toolScope ?? { allow: [], deny: [] }); }
-  catch (error) { throw new StateError(error instanceof Error ? error.message : "Bot tool scope is invalid"); }
+  try {
+    parseCatalogProfile(registration.profile === undefined ? profileForRole(registration.role) : registration.profile);
+    parseToolScope(registration.toolScope ?? { allow: [], deny: [] });
+  } catch (error) { throw new StateError(error instanceof Error ? error.message : "Bot catalog is invalid"); }
+}
+
+function decodeBot(row: object): BotRecord {
+  const stored = row as Omit<BotRecord, "profile"> & { profile: unknown };
+  return { ...stored, profile: parseCatalogProfile(stored.profile) };
 }
 
 /** SQLite has no `ADD COLUMN IF NOT EXISTS`; re-running the migration must stay a no-op. */

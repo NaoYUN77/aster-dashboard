@@ -2,7 +2,6 @@ import type { ToolRegistration } from "@earendil-works/pi-durable";
 import type { BotRole } from "./inbox.js";
 import type { ToolRecord } from "./tools.js";
 
-export type CatalogProfileId = "research" | "chief" | "programmer";
 export type ToolScope = {
   /** Optional exact-name allowlist; empty means the profile defaults remain intact. */
   readonly allow: readonly string[];
@@ -17,37 +16,49 @@ export type ToolDefinition = {
   readonly inputSchema: unknown;
 };
 
-type ToolGroup = "core" | "shell" | "files" | "web" | "ptc" | "memory" | "reminders" | "mcp";
+export const CATALOG_GROUPS = ["core", "shell", "files", "web", "ptc", "memory", "reminders", "mcp"] as const;
+type ToolGroup = typeof CATALOG_GROUPS[number];
 
-export type CatalogProfile = {
-  readonly id: CatalogProfileId;
-  /** Group selectors also cover tools discovered later through MCP tools/list. */
-  readonly defaultTools: readonly ToolGroup[];
-};
+/** Independent tool-group switches; every field is required, with no role or preset identity. */
+export type CatalogProfile = { readonly [Group in ToolGroup]: boolean };
 
-export const CATALOG_PROFILES: Readonly<Record<CatalogProfileId, CatalogProfile>> = Object.freeze({
-  research: Object.freeze({ id: "research", defaultTools: ["core", "shell", "files", "web", "memory", "reminders", "mcp"] as const }),
-  chief: Object.freeze({ id: "chief", defaultTools: ["core", "shell", "files", "memory", "reminders", "mcp"] as const }),
-  programmer: Object.freeze({ id: "programmer", defaultTools: ["core", "shell", "files", "ptc", "memory", "reminders", "mcp"] as const }),
-});
-
-/** Existing roles are persisted as profiles; this is the single compatibility mapping. */
-export function profileForRole(role: BotRole): CatalogProfileId {
-  if (role === "researcher") return "research";
-  if (role === "programmer") return "programmer";
-  return "chief";
+export function parseCatalogProfile(value: unknown): CatalogProfile {
+  let input = value;
+  if (typeof input === "string") {
+    try { input = JSON.parse(input) as unknown; } catch { throw new Error("Bot catalog profile is invalid JSON"); }
+  }
+  if (input === null || typeof input !== "object" || Array.isArray(input)) throw new Error("Bot catalog profile must be an object");
+  const raw = input as Record<string, unknown>;
+  if (Object.keys(raw).some((key) => !CATALOG_GROUPS.includes(key as ToolGroup))) throw new Error("Bot catalog profile has unknown fields");
+  for (const group of CATALOG_GROUPS) {
+    if (!Object.hasOwn(raw, group) || typeof raw[group] !== "boolean") throw new Error(`Bot catalog profile ${group} must be a boolean`);
+  }
+  return Object.freeze(Object.fromEntries(CATALOG_GROUPS.map((group) => [group, raw[group]])) as CatalogProfile);
 }
 
-/** Preserve the legacy capability projection consumed by configureBot and older console clients. */
-export function legacyCapabilitiesForRole(
-  role: BotRole,
+export function serializeCatalogProfile(profile: CatalogProfile): string {
+  return JSON.stringify(parseCatalogProfile(profile));
+}
+
+/** Compatibility defaults for old role-only callers and one-time database migration. */
+export function profileForRole(role: BotRole): CatalogProfile {
+  return parseCatalogProfile({
+    core: true, shell: true, files: true, web: role === "researcher", ptc: role === "programmer",
+    memory: true, reminders: true, mcp: true,
+  });
+}
+
+/** Preserve the legacy capability projection for older clients; deployment availability is a ceiling. */
+export function legacyCapabilitiesForProfile(
+  profile: CatalogProfile,
   deployment: { readonly ptc: boolean; readonly web: boolean },
 ): string {
-  const names = ["bash", "files"];
-  const profile = profileForRole(role);
-  if (profile === "programmer" && deployment.ptc) names.push("ptc");
-  if (profile === "research" && deployment.web) names.push("web");
-  return names.join(",");
+  return [
+    ...(profile.shell ? ["bash"] : []),
+    ...(profile.files ? ["files"] : []),
+    ...(profile.ptc && deployment.ptc ? ["ptc"] : []),
+    ...(profile.web && deployment.web ? ["web"] : []),
+  ].join(",");
 }
 
 export function parseToolScope(value: unknown): ToolScope {
@@ -88,40 +99,40 @@ function groupFor(name: string, record?: ToolRecord): ToolGroup | undefined {
 }
 
 /**
- * Adapt the runtime registry (including tools/list declarations) into catalog definitions and the
- * effective exact-name set. Unknown host tools are closed by default until assigned a catalog group.
+ * Adapt the runtime registry (including tools/list declarations) into the effective catalog.
+ * Unknown host tools are closed by default until assigned a catalog group.
  */
 export function catalogFor(
   registrations: readonly { readonly tool: ToolRegistration; readonly record?: ToolRecord }[],
-  profile: CatalogProfileId,
+  profileInput: CatalogProfile,
   scopeInput: ToolScope,
 ): { readonly definitions: readonly ToolDefinition[]; readonly names: ReadonlySet<string> } {
+  const profile = parseCatalogProfile(profileInput);
   const scope = parseToolScope(scopeInput);
-  const groups = new Set(CATALOG_PROFILES[profile].defaultTools);
-  const defaults = new Set<string>();
+  const allowed = new Set<string>();
   const definitions: ToolDefinition[] = [];
   for (const { tool, record } of registrations) {
-    const group = groupFor(tool.name, record);
-    if (group === undefined || !groups.has(group)) continue;
-    defaults.add(tool.name);
+    if (!scopeAllows(scope, profile, tool.name, record)) continue;
+    allowed.add(tool.name);
     definitions.push(Object.freeze({ name: tool.name, description: tool.description, inputSchema: tool.parameters }));
   }
-  const allowed = new Set(scope.allow.length === 0 ? defaults : scope.allow.filter((name) => defaults.has(name)));
-  for (const name of scope.deny) allowed.delete(name);
   return { definitions: Object.freeze(definitions), names: allowed };
 }
 
-export function scopeAllows(scopeInput: ToolScope, profile: CatalogProfileId, name: string, record?: ToolRecord): boolean {
-  const scope = parseToolScope(scopeInput);
+export function scopeAllows(scope: ToolScope, profile: CatalogProfile, name: string, record?: ToolRecord): boolean {
   const group = groupFor(name, record);
-  if (group === undefined || !CATALOG_PROFILES[profile].defaultTools.includes(group)) return false;
+  if (group === undefined || !profile[group]) return false;
   if (scope.allow.length > 0 && !scope.allow.includes(name)) return false;
   return !scope.deny.includes(name);
 }
 
-/** Legacy configureBot callers are mapped from capabilities; explicit profiles take precedence. */
-export function profileForCapabilities(capabilities: readonly string[]): CatalogProfileId {
-  if (capabilities.includes("ptc")) return "programmer";
-  if (capabilities.includes("web")) return "research";
-  return "chief";
+/** Legacy configureBot callers select groups directly; explicit profiles take precedence. */
+export function profileForCapabilities(capabilities: readonly string[]): CatalogProfile {
+  const known = new Set(["bash", "files", "ptc", "web"]);
+  if (capabilities.some((name) => !known.has(name))) throw new Error("Bot capabilities contain unknown tools");
+  return parseCatalogProfile({
+    core: true, shell: capabilities.includes("bash"), files: capabilities.includes("files"),
+    web: capabilities.includes("web"), ptc: capabilities.includes("ptc"),
+    memory: true, reminders: true, mcp: true,
+  });
 }

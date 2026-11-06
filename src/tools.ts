@@ -5,7 +5,7 @@ import { CODEMODE_TOOL_NAME } from "@earendil-works/pi-durable/codemode";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { TOOL_SEARCH_TOOL_NAME } from "@earendil-works/pi-durable/tool-search";
 import { argumentBytes, beginTrace, recordGeneration, recordRegistryDecision } from "./trace.js";
-import { scopeAllows, type CatalogProfileId, type ToolScope } from "./tool-catalog.js";
+import { parseCatalogProfile, parseToolScope, scopeAllows, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
 
 export const currentTime = defineTool({
   name: "current_time",
@@ -61,7 +61,7 @@ export interface ToolRegistry extends Registry {
   records(): readonly ToolRecord[];
   setMcpAvailability(server: string, state: ToolAvailability): void;
   /** Bind the profile-resolved catalog to one durable conversation. */
-  setConversationCatalog(conversationId: number, profile: CatalogProfileId, scope: ToolScope, names: ReadonlySet<string>): void;
+  setConversationCatalog(conversationId: number, profile: CatalogProfile, scope: ToolScope, names: ReadonlySet<string>): void;
   /** Host-only switch; disabling does not remove declarations or alter replay policy. */
   setDisabled(name: string, disabled: boolean): void;
 }
@@ -109,7 +109,7 @@ export function createToolRegistry(
   // Whether the model surface currently declares the tool; a hidden tool stays registered for scripts.
   let modelCallable = new Map<string, boolean>();
   const availability = new Map<string, ToolAvailability>();
-  const conversationCatalogs = new Map<number, { readonly profile: CatalogProfileId; readonly scope: ToolScope; readonly names: ReadonlySet<string> }>();
+  const conversationCatalogs = new Map<number, { readonly profile: CatalogProfile; readonly scope: ToolScope; readonly names: ReadonlySet<string> }>();
   const disabled = new Set<string>();
   const listeners = new Set<() => void>();
   const notify = () => { for (const listener of [...listeners]) listener(); };
@@ -284,7 +284,7 @@ export function createToolRegistry(
       notify();
     },
     setConversationCatalog(conversationId, profile, scope, names) {
-      conversationCatalogs.set(conversationId, { profile, scope, names: new Set(names) });
+      conversationCatalogs.set(conversationId, { profile: parseCatalogProfile(profile), scope: parseToolScope(scope), names: new Set(names) });
     },
     setMcpAvailability(server, state) {
       availability.set(server, state);

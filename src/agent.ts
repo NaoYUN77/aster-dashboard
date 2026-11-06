@@ -42,7 +42,7 @@ import { hasUnfinishedModelToolCalls, hideFromModel, SCRIPT_ONLY_TOOLS } from ".
 import { createCcrWebExtension } from "./ccr-web-tools.js";
 import { inspectGithubToolRecovery, readResidentTools, withToolLedger } from "./tool-ledger.js";
 import { installMcpTools, orderedMcpExtensions } from "./tool-pins.js";
-import { catalogFor, parseToolScope, profileForCapabilities, type CatalogProfileId, type ToolScope } from "./tool-catalog.js";
+import { catalogFor, parseCatalogProfile, parseToolScope, profileForCapabilities, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
 
 const context = BACKGROUND_CONTEXT;
 // Failures the request can recover from in-process; anything else thrown by the durable calls means the Session is unusable.
@@ -153,7 +153,7 @@ export type BotConversationProfile = {
   /** Legacy capability list; retained for existing BotManager/configureBot callers. */
   readonly tools: readonly string[];
   /** The catalog profile and scope narrow the runtime tool registry for this conversation. */
-  readonly catalogProfile?: CatalogProfileId;
+  readonly catalogProfile?: CatalogProfile;
   readonly toolScope?: ToolScope;
 };
 
@@ -592,31 +592,27 @@ ${channel === "console"
        * caller sends through the console can widen them.
        */
       async configureBot(profile: BotConversationProfile): Promise<ConfiguredBot> {
-        const wantsPtc = profile.tools.includes("ptc");
-        const wantsWeb = profile.tools.includes("web");
-        const catalogProfile = profile.catalogProfile ?? profileForCapabilities(profile.tools);
+        const catalogProfile = profile.catalogProfile === undefined
+          ? profileForCapabilities(profile.tools)
+          : parseCatalogProfile(profile.catalogProfile);
         const requestedScope = parseToolScope(profile.toolScope ?? { allow: [], deny: [] });
-        if (wantsWeb && catalogProfile !== "research") {
-          throw new ConfigurationError(`Bot "${profile.botId}" can use web tools only with the research catalog profile`);
-        }
-        if (wantsPtc && codemode === undefined) {
+        // Legacy callers still require their requested deployment extensions. Explicit switch packs
+        // select from installed tools, independently of role and the legacy capability projection.
+        if (profile.catalogProfile === undefined && catalogProfile.ptc && codemode === undefined) {
           throw new ConfigurationError(
             `Bot "${profile.botId}" requires code mode, but CODEMODE_ENABLED is not set on this deployment`,
           );
         }
-        if (wantsWeb && webExtension === undefined) {
+        if (profile.catalogProfile === undefined && catalogProfile.web && webExtension === undefined) {
           throw new ConfigurationError(
             `Bot "${profile.botId}" requires web tools, but CCR_PROFILE is not set on this deployment`,
           );
         }
-        const denied = new Set(requestedScope.deny);
-        if (!wantsPtc) denied.add("codemode");
-        if (!wantsWeb) { denied.add("web_search"); denied.add("web_fetch"); }
-        const effectiveScope: ToolScope = { allow: requestedScope.allow, deny: [...denied] };
+        const wantsPtc = catalogProfile.ptc;
+        const wantsWeb = catalogProfile.web;
         const snapshot = registry.snapshot();
-        const catalog = catalogFor(snapshot.tools().map(({ tool }) => ({ tool, record: registry.lookup(tool.name) })), catalogProfile, effectiveScope);
-        const catalogNames = new Set(catalog.definitions.map(({ name }) => name));
-        const selectedTools = snapshot.tools().filter(({ tool }) => catalog.names.has(tool.name) && catalogNames.has(tool.name));
+        const catalog = catalogFor(snapshot.tools().map(({ tool }) => ({ tool, record: registry.lookup(tool.name) })), catalogProfile, requestedScope);
+        const selectedTools = snapshot.tools().filter(({ tool }) => catalog.names.has(tool.name));
         const modelTools = selectedTools.filter(({ tool }) => tool.deferred !== true).map(({ tool }) => tool);
         const remove = [
           ...(codemode !== undefined && !wantsPtc ? [codemode.extension] : []),
@@ -629,8 +625,8 @@ ${channel === "console"
             baseInstructions(profile.cwd, profile.channel ?? (profile.conversationId === "root" ? "telegram" : "console")),
             profile.prompt.trim(),
           ].filter((part) => part !== "").join("\n"),
-          // Capabilities select the PTC/Web extensions; the catalog filters every host and MCP tool
-          // through the same profile plus scope for declarations and nested execution.
+          // Group switches select installed extensions and filter every host and MCP tool through
+          // the same profile plus scope for declarations and nested execution.
           ...(codemode === undefined && webExtension === undefined
             ? {}
             : { extensions: remove.length === 0 ? null : { remove } }),
@@ -656,7 +652,7 @@ ${channel === "console"
             }, context);
           }
         }
-        registry.setConversationCatalog(conversation.id, catalogProfile, effectiveScope, catalog.names);
+        registry.setConversationCatalog(conversation.id, catalogProfile, requestedScope, catalog.names);
         botCwds.set(conversation.id, profile.cwd);
         const agent = await conversation.agent(context);
         return {
