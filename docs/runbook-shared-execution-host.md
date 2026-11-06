@@ -234,13 +234,23 @@ JS
 
 预期：`exitCode: 0`，`output` 含 `/workspaces/runbook-...`，`content: "shared-host-ok"`。
 这一条同时证明 Bash、Write（经 bash）、Read（经 `file.readText`）走通既有 mTLS RPC。
-Edit（`file.edit`）可用同一会话的 `client.fileRequest(session, "file.edit", ...)` 补测。
+
+**Edit 没有独立的 wire 方法。** `src/execution/rpc-protocol.ts` 的 `FILE_METHODS` 只含
+`stat` / `exists` / `canonical` / `open` / `read` / `scanLines` / `close` / `readText` /
+`write`（均以 `file.` 为前缀），不存在 `file.edit`。pi-durable 的 `createEditTool()` 在
+`RemoteRpcExecutionEnv` 上依次执行 `readTextFile` → 精确文本替换 → `writeFile`，由
+`src/execution/remote-files.ts:145-167` 分别落到 `file.readText` 与 `file.write`（原子写）。
+补测 Edit 应调用已安装的 `edit` 工具，或在同一会话按「读—改—写」顺序复现该往返
+（`file.readText` 的 `data`、`file.write` 的 `content` 均为 base64）；不得发起 `file.edit`。
+该补测只覆盖工具执行，不覆盖模型循环。
 
 补充负向验收（沿用 Phase 0 的检查，不重复造协议）：
 
 - 错误客户端 CN / 非授信 CA 仍被拒绝（Phase 0 runbook 6.2／6.3）。
 - `EXECUTION_REMOTE_CWD=/shared/aster` 时 `session.open` 被 `sessionWorkspacePath()` 拒绝。
 - `file.readText` 读 `/data/inbox.sqlite` 或 `../<其它 bot>/...` 返回 `permission_denied`。
+- `file.edit` 或任何不在 `FILE_METHODS` 内的 file 方法返回 `invalid_request`
+  （`unknown file method`，`not_started`，见 `src/execution/rpc-server.ts:573`），不产生写副作用。
 - `bash` 请求的 `env` 试图设置 `PATH` / `LANG` / `HOME` / `TMPDIR` / `PTC_INSIDE_SANDBOX`
   时返回 `invalid_request` 且不执行命令；宿主的运行时环境不随 wire 参数覆盖，普通任务变量
   仍可透传（`test/shared-host.test.ts` 覆盖）。`inheritEnv` 被有意忽略，执行服务的进程环境
