@@ -56,6 +56,8 @@ spec 在功能开发完成后删除，ADR 及其记录长期保留。ADR 中的 
 
 ## 索引
 
+当前架构为[共享执行主机](../runbook-shared-execution-host.md) + dashboard 控制台（dash）唯一入口；标为已废弃的 ADR 仅保留历史背景。
+
 | 编号 | 标题 | 状态 | 位置 |
 | --- | --- | --- | --- |
 | 0001 | 生产环境 MCP 以 stdio + token 为主，OAuth 走带外授权 | Accepted，2026-10-28 | [0001-mcp-access-stdio-first-oauth-out-of-band.md](0001-mcp-access-stdio-first-oauth-out-of-band.md) |
@@ -64,18 +66,19 @@ spec 在功能开发完成后删除，ADR 及其记录长期保留。ADR 中的 
 | 0004 | 退役 `workspace/MEMORY.md` | Accepted，2026-10-28 | [0004-retire-workspace-memory-md.md](0004-retire-workspace-memory-md.md) |
 | 0005 | 删除 Agent Vault，改为单服务 | Accepted，2026-10-28 | [0005-remove-agent-vault-single-service.md](0005-remove-agent-vault-single-service.md) |
 | 0006 | 提供商只登记显式 API key | Accepted，2026-10-21 | [0006-explicit-api-key-providers.md](0006-explicit-api-key-providers.md) |
-| 0007 | 投递不承诺恰好一次 | Accepted，2026-10-21 | [0007-delivery-not-exactly-once.md](0007-delivery-not-exactly-once.md) |
+| 0007 | 投递不承诺恰好一次 | 已废弃（历史记录），2026-10-21 | [0007-delivery-not-exactly-once.md](0007-delivery-not-exactly-once.md) |
 | 0008 | 外部工具调用不自动重放 | Accepted，2026-10-21 | [0008-unsafe-tool-replay.md](0008-unsafe-tool-replay.md) |
 | 0009 | 同一回合的工具顺序执行 | Accepted，2026-10-21 | [0009-sequential-tool-execution.md](0009-sequential-tool-execution.md) |
 | 0010 | 状态用内置 SQLite，不另起数据服务 | Accepted，2026-10-21 | [0010-sqlite-no-extra-data-services.md](0010-sqlite-no-extra-data-services.md) |
-| 0011 | Telegram 长轮询，不开公网 webhook | Accepted，2026-10-21 | [0011-telegram-long-polling.md](0011-telegram-long-polling.md) |
+| 0011 | Telegram 长轮询，不开公网 webhook | 已废弃（历史记录），2026-10-21 | [0011-telegram-long-polling.md](0011-telegram-long-polling.md) |
 | 0012 | 安装方式改为 Docker，systemd 只留迁移 | Accepted，2026-10-27 | [0012-docker-replaces-systemd.md](0012-docker-replaces-systemd.md) |
 | 0013 | agent loop 只用 pi-durable | Accepted，2026-10-21 | [0013-pi-durable-agent-loop.md](0013-pi-durable-agent-loop.md) |
 | 0014 | 工具由人注册 | Accepted，2026-10-22 | [0014-humans-register-tools.md](0014-humans-register-tools.md) |
 | 0015 | 旧版画像字段导致 working memory 损坏态 | Accepted，2026-10-31 | [working-memory/0015-legacy-profile-memory-corrupt-state.md](working-memory/0015-legacy-profile-memory-corrupt-state.md) |
 | 0016 | 用户画像暂存 working memory | Accepted，2026-10-29 | [0016-user-profile-working-memory.md](0016-user-profile-working-memory.md) |
 | 0018 | GitHub 官方托管 HTTP MCP 与 OpenBao 只读 PAT | Accepted，2026-11-01（实现与真实链路未验收） | [github-access/0018-github-access.md](github-access/0018-github-access.md) |
-| 0019 | PTC 代码调用工具（codemode） | Accepted，2026-11-02 | [codemode-ptc/0019-codemode-ptc.md](codemode-ptc/0019-codemode-ptc.md) |
-| 0020 | 远程 PTC sandbox（脚本与工具同在执行 VPS；2026-11-02 修订为统一 RPC） | Accepted，2026-11-02 | [remote-ptc-sandbox/0020-remote-ptc-sandbox.md](remote-ptc-sandbox/0020-remote-ptc-sandbox.md) |
+| 0019 | PTC 代码调用工具（codemode） | 已废弃（历史记录），2026-11-02 | 已归档，见 [PTC／codemode 归档](../../archive/ptc-codemode/README.md) |
+| 0020 | 远程 PTC sandbox（脚本与工具同在执行 VPS；2026-11-02 修订为统一 RPC） | 已废弃（历史记录），2026-11-02 | 已归档，见 [PTC／codemode 归档](../../archive/ptc-codemode/README.md) |
 | 0021 | 控制面与执行面分离，工具执行先下沉到执行 VPS | Proposed，2026-10-31 | [0021-control-execution-split.md](0021-control-execution-split.md) |
-| 0022 | 提醒由宿主持久化并在进程内调度 | Accepted，2026-11-05 | [reminders/0022-reminders-in-process-scheduler.md](reminders/0022-reminders-in-process-scheduler.md) |
+| 0022 | 提醒由宿主持久化并在进程内调度 | 已废弃（历史记录），2026-11-05 | [reminders/0022-reminders-in-process-scheduler.md](reminders/0022-reminders-in-process-scheduler.md) |
+| 0023 | 开箱即用的 Bot 运行环境与平台能力清单（含 2026-11-06 共享 CVM Execution Host 修订） | Accepted，2026-11-06 | [zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md](zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md) |

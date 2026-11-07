@@ -7,6 +7,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool, type ToolExecutionApi, type ToolRegistration } from "@earendil-works/pi-durable";
 import { connectMcp } from "../src/mcp.js";
+import { DEFAULT_CATALOG_PROFILE } from "../src/tool-catalog.js";
 import { createToolRegistry, currentTime, personalTools, type GovernedTool } from "../src/tools.js";
 
 const example = (name: string, parameters = Type.Object({})) => defineTool({
@@ -87,6 +88,21 @@ test("a stale executor cannot borrow a replacement registration's authority", as
   assert.equal(result.isError, true);
   assert.equal((result.details as { code?: string }).code, "TOOL_REGISTRATION_CHANGED");
   assert.equal(writes, 0);
+});
+
+test("conversation catalog denies host and nested tool execution outside its profile scope", async () => {
+  let runs = 0;
+  const outside = defineTool({ name: "outside", description: "outside", parameters: Type.Object({}),
+    execute: async () => { runs++; return { output: [] }; } });
+  const registry = createToolRegistry([personalTools, defineExtension({ name: "extra", tools: [outside] })], { log: () => {} });
+  registry.setConversationCatalog(41, DEFAULT_CATALOG_PROFILE, { allow: [], deny: [] }, new Set(["current_time"]));
+  const registered = registry.snapshot().tools().find(({ tool }) => tool.name === "outside")!.tool;
+  const result = await registered.execute({}, {
+    conversationId: 41, taskId: 2, callId: "scoped",
+  } as ToolExecutionApi, BACKGROUND_CONTEXT);
+  assert.equal(result.isError, true);
+  assert.equal((result.details as { code?: string }).code, "TOOL_SCOPE_DENIED");
+  assert.equal(runs, 0);
 });
 
 test("tool wrappers are rejected because they can replace the reviewed executor", () => {

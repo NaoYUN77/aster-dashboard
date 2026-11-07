@@ -10,11 +10,9 @@
 | --- | --- | --- |
 | Node.js | 24.19.0，见 .node-version | 开发与部署运行时，含内置 SQLite |
 | @earendil-works/pi-durable / pi-ai / chord | 1.3.0 | agent 底座、模型适配与执行上下文 |
-| @earendil-works/pi-codemode | 1.3.0 | PTC 脚本沙箱（QuickJS WASM worker） |
 | @earendil-works/pi-mcp | 1.3.0 | MCP 客户端、传输与 OAuth |
 | @langfuse/otel / @langfuse/tracing | 6.1.1 | 可选 Langfuse Cloud Trace 的 span 处理器与观测 API |
 | @opentelemetry/api / sdk-trace-node / exporter-trace-otlp-http | 1.9.0 / 2.12.0 / 0.223.0 | Trace 的 OpenTelemetry 运行时、provider 与 OTLP 导出（MITM 模式使用支持代理的 agent） |
-| Telegram 客户端 grammY | 1.46.0 | Telegram 协议适配 |
 | TypeBox | 1.3.27 | 工具参数 schema，与底座版本对齐 |
 | TypeScript / tsx | 7.0.2 / 4.23.15 | 类型检查、构建与开发执行 |
 

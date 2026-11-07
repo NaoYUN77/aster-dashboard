@@ -8,11 +8,11 @@
 
 | 内容 | 权威来源 | 是否进入仓库 |
 | --- | --- | --- |
-| 公开部署参数（项目名、应用卷名、bot 标识） | 一份环境描述 JSON，经 `deployment-environment` schema 校验 | 只有 `deploy/environments/*.example.json` 占位示例 |
+| 公开部署参数（项目名、应用卷名） | 一份环境描述 JSON，经 `deployment-environment` schema 校验 | 只有 `deploy/environments/*.example.json` 占位示例 |
 | 宿主私有配置（应用 env 文件中的凭据） | 目标机部署目录，权限受限 | 否 |
 | 镜像与 Compose 字节 | 发布清单与后续版本化发布契约 | 是 |
 
-环境描述只包含标识与资源名，不含任何凭据。`identity.botId` 是 Telegram bot 的数字用户 ID，属于标识而非秘密；它让离线检查拒绝两个环境消费同一个 bot。真实 bot 身份与凭据作用范围需要可信适配层核对（阶段 A2），本文件描述的检查不能代替。
+环境描述只包含标识与资源名，不含任何凭据：`schemaVersion`、`kind`、`environment`、`composeProject` 与 `volumes.app`。`assertDistinctEnvironments()` 只按 `environment`、项目名与应用卷名判断两个环境是否冲突；它不核对凭据或业务身份，本文件描述的检查不能代替。
 
 ## 描述格式
 
@@ -68,5 +68,5 @@ npm run deployment:environment -- <command> [options]
 ## 尚未实现
 
 - 测试实例启停／重置入口、合成生产哨兵隔离演练、两环境真实 Linux 并行运行证据（PR A2）。
-- 真实 bot 身份与凭据作用范围的可信核对。
+- 部署机上的凭据、策略内容与业务身份核对（本描述刻意不含凭据）。
 - 宿主资源检查不验证凭据、策略内容、签名或业务就绪；`host` 通过只说明当前查询结果没有冲突。

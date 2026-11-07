@@ -3,15 +3,15 @@
 // Interface
 //   startTrace(config)                    install the process-wide runtime; undefined when disabled
 //   beginRequest(meta)                    start the root observation for one user request
-//   beginTrace(meta)                      start the codemode observation below that request
-//   currentSpan() / traceChild(...)       attach child observations to the ambient codemode span
+//   beginTrace(meta)                      start a tool span below that request
+//   currentSpan() / traceChild(...)       attach child observations to the ambient tool span
 //   recordGeneration(...)                 one LLM generation, from the existing response hook
 //   recordRegistryDecision(...)           one authorization decision, allow or deny
-//   recordLoopGuard(...)                  warning/halt evidence, correlated to its request or codemode span
+//   recordLoopGuard(...)                  warning/halt evidence, correlated to its request or tool span
 //   TraceRuntime.close()                  end abandoned observations, flush, release Langfuse
 //
 // Inputs: host-observed identifiers (conversation, request, task, call, session, job) and lengths,
-// counts and error codes. With LANGFUSE_CAPTURE_CONTENT enabled, the code mode script, nested tool
+// counts and error codes. With LANGFUSE_CAPTURE_CONTENT enabled, tool span inputs, tool
 // arguments and tool results are also attached as observation input/output after credential
 // redaction and size limits. Credentials, authorization headers and provider error messages never
 // enter the trace.
@@ -45,9 +45,9 @@ import type {
 import { defineExtension, hook, ToolTask } from "@earendil-works/pi-durable";
 import { hasProxyEnv, type TraceConfig } from "./config.js";
 
-/** Active requests and active codemode runs are bounded; the oldest is ended as unknown. */
+/** Active requests and active root tool runs are bounded; the oldest is ended as unknown. */
 const ACTIVE_LIMIT = 256;
-/** One codemode trace may not grow without bound through runner messages. */
+/** One trace may not grow without bound through nested events. */
 const MAX_EVENTS_PER_SPAN = 256;
 const FLUSH_TIMEOUT_MS = 5_000;
 /** One captured string field may not exceed this; longer values are cut with a marker. */
@@ -405,7 +405,7 @@ export class TraceRuntime {
   readonly #captureContent: boolean;
   readonly #log: (line: string) => void;
   readonly #requests = new Map<string, TraceSpan>();
-  readonly #codemode = new Map<string, TraceSpan>();
+  readonly #toolSpans = new Map<string, TraceSpan>();
   #closing = false;
 
   constructor(provider: TracerProvider, log: (line: string) => void, ownsProvider: boolean, captureContent = false) {
@@ -456,7 +456,7 @@ export class TraceRuntime {
   begin(options: BeginTraceOptions): TraceSpan | undefined {
     if (this.#closing) return undefined;
     const parent = this.requestFor(options.conversationId);
-    evict(this.#codemode);
+    evict(this.#toolSpans);
     const span = startSpan({
       name: options.name,
       kind: options.kind ?? "tool",
@@ -467,12 +467,12 @@ export class TraceRuntime {
       log: this.#log,
     });
     if (span === undefined) return undefined;
-    this.#codemode.set(`${String(options.conversationId)}\u0000${options.callId ?? ""}`, span);
+    this.#toolSpans.set(`${String(options.conversationId)}\u0000${options.callId ?? ""}`, span);
     return span;
   }
 
   rootFor(conversationId: ConversationId, callId: string): TraceSpan | undefined {
-    return this.#codemode.get(`${String(conversationId)}\u0000${callId}`);
+    return this.#toolSpans.get(`${String(conversationId)}\u0000${callId}`);
   }
 
   recordGeneration(message: AssistantMessage, api: Pick<HookApi, "conversationId" | "taskId">): void {
@@ -534,7 +534,7 @@ export class TraceRuntime {
     result: ToolExecutionResult,
     api: Pick<HookApi, "conversationId" | "taskId">,
   ): undefined {
-    // A nested call belongs to its script; the result belongs to the one root codemode call.
+    // A nested call belongs to its parent; the result belongs to the one root tool call.
     if (call.parent !== undefined) return undefined;
     const span = this.rootFor(api.conversationId, call.id);
     if (span === undefined) return undefined;
@@ -564,8 +564,8 @@ export class TraceRuntime {
 
   async close(): Promise<void> {
     this.#closing = true;
-    for (const span of [...this.#codemode.values()]) span.end("unknown", { abandoned: true, reason: "closed" });
-    this.#codemode.clear();
+    for (const span of [...this.#toolSpans.values()]) span.end("unknown", { abandoned: true, reason: "closed" });
+    this.#toolSpans.clear();
     for (const span of [...this.#requests.values()]) span.end("unknown", { abandoned: true, reason: "closed" });
     this.#requests.clear();
     setLangfuseTracerProvider(null);
@@ -738,13 +738,13 @@ export function beginRequest(options: {
 
 /**
  * The active runtime's hook extension. The composition root installs it in the tool registry, so a
- * codemode span closes with its tool result instead of waiting for process shutdown.
+ * root tool span closes with its tool result instead of waiting for process shutdown.
  */
 export function traceExtension(): Extension | undefined {
   return activeRuntime?.extension;
 }
 
-/** Start a codemode observation when tracing is enabled; a no-op (undefined) otherwise. */
+/** Start a root tool observation when tracing is enabled; a no-op (undefined) otherwise. */
 export function beginTrace(options: BeginTraceOptions): TraceSpan | undefined {
   return activeRuntime?.begin(options);
 }

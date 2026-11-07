@@ -14,9 +14,9 @@ const directory = await mkdtemp(join(tmpdir(), `${project}-`));
 const images = { app: process.env.ASTER_IMAGE ?? "aster:ci" };
 const random = (name) => `ci-${name}-${randomBytes(24).toString("hex")}`;
 const credentials = {
-  telegramToken: `900001:${randomBytes(24).toString("hex")}`,
   modelKey: random("model"),
 };
+const dashboardToken = random("webtoken");
 const file = (name) => join(directory, name).replaceAll("\\", "/");
 let step = "prepare";
 let checks = 0;
@@ -32,11 +32,11 @@ const composeArgs = ["compose", "--project-name", project, "--project-directory"
   "--env-file", file("empty.env"), "-f", join(root, "docker-compose.yml"),
   "-f", join(root, "docker-compose.build.yml"), "-f", file("override.yml")];
 
-function command(program, args, { input, allowFailure = false, timeout = 120_000 } = {}) {
+function command(program, args, { input, allowFailure = false, timeout = 120_000, env = {} } = {}) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(program, args, { cwd: root, stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
       env: { ...process.env, COMPOSE_ENV_FILES: "", COMPOSE_DISABLE_ENV_FILE: "1",
-        ASTER_IMAGE: images.app } });
+        ASTER_IMAGE: images.app, ...env } });
     let output = "";
     let overflow = false;
     let timedOut = false;
@@ -81,11 +81,9 @@ try {
   assert.ok(process.argv.slice(2).every((value) => value === "--render-only"), "unsupported option");
   await chmod(directory, 0o755);
   await writeFile(file("empty.env"), "");
-  // Synthetic app environment: a well-formed token and owner, a real provider/model pair, and
-  // deliberately no provider key. The config-failure check below relies on exactly that gap.
+  // Synthetic app environment: a real provider/model pair and deliberately no provider key.
+  // The config-failure check below relies on exactly that gap.
   await writeFile(file("app.env"), [
-    `TELEGRAM_BOT_TOKEN=${credentials.telegramToken}`,
-    "TELEGRAM_OWNER_ID=424242",
     "MODEL_PROVIDER=deepseek",
     "MODEL_ID=deepseek-flash",
     "",
@@ -99,6 +97,24 @@ volumes:
     name: ${project}-app
 `;
   await writeFile(file("override.yml"), override, { mode: 0o600 });
+  // The dashboard overlay reads its own env file; CI points it at a synthetic one instead of
+  // requiring a developer's `dashboard/.env`.
+  await writeFile(file("dashboard.env"), [
+    `WEB_TOKEN=${dashboardToken}`,
+    "MODEL_PROVIDER=deepseek",
+    "MODEL_ID=deepseek-flash",
+    `DEEPSEEK_API_KEY=${credentials.modelKey}`,
+    "",
+  ].join("\n"), { mode: 0o600 });
+  const dashboardArgs = ["compose", "--project-name", `${project}-dashboard`,
+    "--project-directory", root, "--env-file", file("dashboard.env"),
+    "-f", join(root, "docker-compose.yml"),
+    "-f", join(root, "dashboard/docker-compose.dashboard.yml")];
+  const dashboardEnv = {
+    ASTER_DASHBOARD_ENV_FILE: file("dashboard.env"),
+    ASTER_EXECUTION_RUNTIME_VOLUME: `${project}-runtime`,
+    ASTER_EXECUTION_WORKSPACES_VOLUME: `${project}-workspaces`,
+  };
   await check("compose-single-service-and-production-boundaries", async () => {
     const result = await compose("config", "--format", "json");
     const config = JSON.parse(result.output);
@@ -115,7 +131,7 @@ volumes:
     assert.ok(!app.network_mode, "the app uses direct networking");
     assert.equal(app.environment.DATA_DIR, "/data");
     // The synthetic env file is the one being read: its values are inlined by rendering.
-    assert.equal(app.environment.TELEGRAM_BOT_TOKEN, credentials.telegramToken);
+    assert.ok(!Object.keys(app.environment).some((name) => name.startsWith("TELEGRAM_")));
     assert.equal(app.environment.MODEL_PROVIDER, "deepseek");
     assert.equal(app.environment.DEEPSEEK_API_KEY, undefined);
     assert.deepEqual(Object.keys(config.volumes), ["personal-agent-data"]);
@@ -124,6 +140,74 @@ volumes:
     assert.equal(mounts.length, 1);
     assert.equal(mounts[0].source, "personal-agent-data");
     for (const volume of Object.values(config.volumes)) assert.ok(!volume.external);
+  });
+  await check("dashboard-two-services-shared-host-and-loopback-console", async () => {
+    const result = await command("docker", [...dashboardArgs, "config", "--format", "json"], { env: dashboardEnv });
+    const config = JSON.parse(result.output);
+    assert.deepEqual(Object.keys(config.services).sort(), ["execution-host", "personal-agent"]);
+    const app = config.services["personal-agent"];
+    const host = config.services["execution-host"];
+    // Both services use the repository's one image: there is no separate sandbox image to build.
+    assert.equal(app.build.dockerfile, "Dockerfile");
+    assert.equal(host.build.dockerfile, "Dockerfile");
+    assert.equal(host.image, images.app);
+
+    // The console is reachable only from the host's loopback address.
+    assert.deepEqual(app.ports, [{
+      mode: "ingress", target: 8787, published: "8787", protocol: "tcp", host_ip: "127.0.0.1",
+    }]);
+    assert.equal(String(app.mem_limit), String(2 * 1024 * 1024 * 1024));
+    assert.equal(app.pids_limit, 256);
+    // The overlay's env file replaced the base one; its synthetic values are the ones rendered.
+    assert.equal(app.environment.WEB_TOKEN, dashboardToken);
+    assert.ok(!Object.keys(app.environment).some((name) => name.startsWith("TELEGRAM_")));
+    assert.equal(app.environment.CONSOLE_ENABLED, "1");
+    assert.equal(app.environment.CONSOLE_HOST, "0.0.0.0");
+    assert.equal(app.environment.CONSOLE_PORT, "8787");
+    assert.equal(app.environment.EXECUTION_MODE, "remote");
+    assert.equal(app.environment.EXECUTION_REMOTE_TRANSPORT, "rpc");
+    assert.equal(app.environment.EXECUTION_REMOTE_CWD, "/workspaces");
+    assert.equal(app.environment.EXECUTION_RPC_TRANSPORT, "unix");
+    assert.equal(app.environment.EXECUTION_RPC_SOCKET, "/run/aster/rpc.sock");
+    // Retired feature configuration must not reappear in the app environment.
+    assert.ok(!Object.keys(app.environment).some((name) => /^(CODEMODE_|PTC_|REMINDERS_)/u.test(name)));
+    assert.equal(app.depends_on["execution-host"].condition, "service_healthy");
+
+    // The local stand-in runs as a dedicated non-root uid and claims no OS isolation boundary:
+    // it is one shared host for every bot, not a per-bot container.
+    assert.equal(host.user, "1000:1000");
+    assert.ok(!host.network_mode, "a shared host must not claim a network-none isolation boundary");
+    assert.ok(!host.read_only, "the shared host needs a writable workspace and socket directory");
+    assert.ok(!host.cap_drop, "the shared host does not rely on capability dropping for isolation");
+    assert.ok(!host.ports?.length, "the shared host must not publish ports");
+    assert.deepEqual(host.entrypoint, ["node", "dist/src/execution/rpc-main.js"]);
+    assert.equal(host.environment.EXECUTION_AGENT_SHARED_HOST, "1");
+    assert.equal(host.environment.EXECUTION_AGENT_UNIX_SOCKET, "/run/aster/rpc.sock");
+    assert.equal(host.environment.EXECUTION_AGENT_WORKSPACES, "/workspaces");
+    assert.equal(host.environment.EXECUTION_AGENT_TMP_ROOT, "/tmp/aster-sessions");
+    assert.equal(host.environment.EXECUTION_AGENT_SHELL, "/bin/bash");
+    assert.equal(host.environment.EXECUTION_AGENT_MAX_CONCURRENT, "3");
+    assert.equal(host.environment.EXECUTION_AGENT_TEST_EXECUTOR, "0");
+    assert.equal(host.environment.EXECUTION_AGENT_OUTPUT_CHUNK_BYTES, "32768");
+    assert.equal(host.environment.EXECUTION_AGENT_OUTPUT_BYTES_PER_SECOND, "4194304");
+    assert.ok(!Object.keys(host.environment).some((name) => /^(TELEGRAM_|CODEMODE_|PTC_|REMINDERS_)/u.test(name)));
+
+    // Only the workspaces and socket volumes are mounted; the app's /data volume is never shared.
+    assert.deepEqual(host.volumes.map((volume) => volume.target).sort(), ["/run/aster", "/workspaces"]);
+    const appSocket = app.volumes.find((volume) => volume.target === "/run/aster");
+    const hostSocket = host.volumes.find((volume) => volume.target === "/run/aster");
+    assert.ok(appSocket, "the app must mount the socket volume");
+    assert.ok(hostSocket, "the execution host must mount the socket volume");
+    assert.equal(appSocket.source, hostSocket.source);
+    assert.equal(appSocket.read_only, true);
+    const workspaces = host.volumes.find((volume) => volume.target === "/workspaces");
+    assert.equal(workspaces.source, "execution-workspaces");
+    // Rendered volume sources are the compose keys; the `name` override is what isolates the run.
+    assert.equal(config.volumes["execution-runtime"].name, `${project}-runtime`);
+    assert.equal(config.volumes["execution-workspaces"].name, `${project}-workspaces`);
+    assert.equal(appSocket.source, "execution-runtime");
+    // No remote execution gateway service is part of this overlay.
+    assert.ok(!Object.keys(config.services).some((name) => name.includes("gateway")));
   });
   if (!renderOnly) {
     await check("final-image-present", async () => {
@@ -203,7 +287,7 @@ volumes:
       assertClean(logs.output);
     });
     console.info(`Topology acceptance passed: ${checks} checks; final image; isolated synthetic resources.`);
-    console.info("NOT COVERED: live Telegram/model business flow (needs real credentials; covered by unit tests and the production deployment); release/prod admission.");
+    console.info("NOT COVERED: live dashboard/model business flow (needs real credentials and target-environment acceptance); release/prod admission.");
   } else {
     console.info("Compose render checks passed; runtime topology was not executed.");
   }

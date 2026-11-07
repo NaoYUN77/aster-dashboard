@@ -13,6 +13,7 @@ async function config(t: { after(fn: () => Promise<void>): void }): Promise<PtcC
   const root = await mkdtemp(join(tmpdir(), "aster-workspace-"));
   t.after(async () => { await rm(root, { recursive: true, force: true }); });
   return {
+    isolation: "bwrap",
     workspaceRoot: root,
     sharedWorkspace: undefined,
     sharedWorkspaceMode: "none",

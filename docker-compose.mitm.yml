@@ -16,6 +16,11 @@
 # ~/Aster/secrets/openbao/mitm-proxy-token, override with ASTER_MITM_PROXY_TOKEN) and points
 # ASTER_MITM_TOKEN_FILE at it. The token is never in .env or in the environment; configureEnvProxy()
 # reads it and puts it into the proxy URL userinfo at startup.
+#
+# Mount root: both files live under /run/aster-mitm, not /run/aster. The dashboard overlay mounts a
+# read-only volume at /run/aster for the sandbox socket, and Docker cannot create a mountpoint for a
+# bind file underneath a read-only mount. Keeping the MITM inputs in their own directory lets both
+# overlays apply at once.
 services:
   personal-agent:
     environment:
@@ -26,19 +31,19 @@ services:
       # Node 24 reads HTTP(S)_PROXY for fetch and https.request with this flag (and configureEnvProxy()).
       NODE_USE_ENV_PROXY: "1"
       # Trust the MITM CA certificate on top of Node's bundled root CAs.
-      NODE_EXTRA_CA_CERTS: /run/aster/mitmproxy-ca.pem
+      NODE_EXTRA_CA_CERTS: /run/aster-mitm/mitmproxy-ca.pem
       # The proxy rejects unauthenticated clients; configureEnvProxy() injects this token at startup.
-      ASTER_MITM_TOKEN_FILE: /run/aster/mitm-proxy-token
+      ASTER_MITM_TOKEN_FILE: /run/aster-mitm/mitm-proxy-token
     volumes:
       - type: bind
         source: ${ASTER_MITM_CA_CERT:-${HOME:-/root}/Aster/secrets/openbao/mitmproxy-ca.pem}
-        target: /run/aster/mitmproxy-ca.pem
+        target: /run/aster-mitm/mitmproxy-ca.pem
         read_only: true
         bind:
           create_host_path: false
       - type: bind
         source: ${ASTER_MITM_PROXY_TOKEN:-${HOME:-/root}/Aster/secrets/openbao/mitm-proxy-token}
-        target: /run/aster/mitm-proxy-token
+        target: /run/aster-mitm/mitm-proxy-token
         read_only: true
         bind:
           create_host_path: false

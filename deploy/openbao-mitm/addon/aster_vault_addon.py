@@ -11,8 +11,8 @@ Scope of substitution, deliberately narrow:
 - OpenBao is reached over TLS with the addon's client certificate; the proxy core has neither, so a
   client cannot use this proxy (or any other route) to read OpenBao's unauthenticated health endpoint.
 
-Run with `mitmdump -q` only. Verbose flow output prints request URLs, which would show a real
-Telegram bot token that this addon has just put into the path.
+Run with `mitmdump -q` only. Verbose flow output prints request URLs, which could show a real
+credential that this addon has just put into the path.
 """
 
 import json

@@ -2,10 +2,14 @@
  * Unified wire contract for the resident execution agent. Frames are length-prefixed JSON: a
  * 4-byte big-endian payload length followed by UTF-8 JSON. The protocol is deliberately small and
  * strict; the transport may be a Unix socket for local tests or TCP/TLS with mutual certificates
- * across VPS hosts. Phase 0 exposes the restricted test executor; Phase 1 adds the remote PTC
- * sandbox (`vm.start`/`vm.reply` requests and `vm.message`/`tool.output` events). Phase 2 adds
- * direct `bash` execution (`execute` with `executor: "bash"`) and the bounded `file.*` primitives
- * both direct sessions and PTC nested calls use.
+ * across VPS hosts. The production surface is the Phase 1 shared execution host: direct `bash`
+ * execution (`execute` with `executor: "bash"`) and the bounded `file.*` primitives.
+ *
+ * Versioned wire values of the retired PTC / code mode subsystem (`vm.start`, `vm.reply`,
+ * `vm.message`, `tool.call`, `tool.output` and their payload parsers) are retained here so the
+ * frame format stays stable across a rolling upgrade. They are NEVER executed: the agent rejects
+ * every such request with `not_implemented` and there is no VM, runner or client entry point.
+ * See archive/ptc-codemode/README.md for the retired implementation.
  */
 
 import { validateCommand, validateEnv } from "./protocol.js";
@@ -367,7 +371,11 @@ export type PtcWorkspaceState = {
 };
 
 export type PtcIsolationState = {
-  readonly mode: "bwrap" | "degraded-prlimit";
+  /**
+   * `bwrap`: per-command namespaces on the host; `degraded-prlimit`: explicitly allowed fallback;
+   * `container`: the process already runs inside the deployment's sandbox container.
+   */
+  readonly mode: "bwrap" | "degraded-prlimit" | "container";
   readonly bwrap: boolean;
   readonly userNamespace: boolean;
   readonly cgroup: "v2" | "none";
@@ -481,6 +489,19 @@ function isSafeJobId(value: unknown): value is string {
 
 function isSafeReason(value: unknown): value is string {
   return typeof value === "string" && byteLength(value) <= RPC_MAX_REASON_BYTES;
+}
+
+/** A virtual workspace path: absolute, no traversal, no control characters, never the root itself. */
+function isSafeWorkspacePath(value: unknown): value is string {
+  return typeof value === "string"
+    && value.startsWith("/")
+    && value !== "/"
+    && byteLength(value) <= 4_096
+    && !value.includes("\0")
+    && !value.includes("\r")
+    && !value.includes("\n")
+    && !value.includes("\\")
+    && !value.split("/").includes("..");
 }
 
 function isSafeCorrelationId(value: unknown): value is string {
@@ -1191,12 +1212,18 @@ function validateRequestPayload(method: RpcMethod, payload: unknown): PayloadRes
       return unknown === undefined ? { ok: true, value: payload } : invalid(`unknown payload field: ${unknown}`);
     }
     case "session.open": {
-      const unknown = unexpectedKey(payload, ["sessionId", "jobId", "workspaceReady"]);
+      const unknown = unexpectedKey(payload, ["sessionId", "jobId", "workspaceReady", "cwd"]);
       if (unknown !== undefined) return invalid(`unknown session.open field: ${unknown}`);
       if (!isSafeId(payload.sessionId)) return invalid("sessionId is invalid");
       if (Object.hasOwn(payload, "jobId") && !isSafeJobId(payload.jobId)) return invalid("jobId is invalid");
       if (Object.hasOwn(payload, "workspaceReady") && typeof payload.workspaceReady !== "boolean") {
         return invalid("workspaceReady must be a boolean");
+      }
+      // Same-host sandboxes root each session in the bot workspace the host names. The value is a
+      // virtual POSIX path; the agent maps it below its own configured workspace root and refuses
+      // anything that is not already a direct child of it.
+      if (Object.hasOwn(payload, "cwd") && !isSafeWorkspacePath(payload.cwd)) {
+        return invalid("cwd is invalid");
       }
       return { ok: true, value: payload };
     }

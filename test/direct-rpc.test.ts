@@ -6,8 +6,8 @@ import test from "node:test";
 import { RpcClientError, RpcExecutionClient } from "../src/execution/rpc-client.js";
 import { startRpcAgent } from "../src/execution/rpc-server.js";
 import { listenTlsRpc, tlsRpcTransport } from "../src/execution/rpc-transport.js";
-import type { DirectHost } from "../src/execution/ptc-host.js";
-import { PtcHostError } from "../src/execution/ptc-host.js";
+import type { DirectHost } from "../src/execution/direct-host.js";
+import { DirectHostError } from "../src/execution/direct-host.js";
 import type { RpcBashExecutePayload, RpcFileMethod, RpcSkippedOutput } from "../src/execution/rpc-protocol.js";
 
 const fixtureDirectory = fileURLToPath(new URL("./fixtures/rpc-tls", import.meta.url));
@@ -56,7 +56,7 @@ class RecordingDirectHost implements DirectHost {
       return { info: { name: "a.txt", path: "/shared/a.txt", kind: "file", size: 4, mtimeMs: 1 } };
     }
     if (input.method === "file.readText") return { data: Buffer.from("hola").toString("base64") };
-    throw new PtcHostError("not_found", "missing", "failed");
+    throw new DirectHostError("not_found", "missing", "failed");
   }
 }
 
@@ -171,22 +171,6 @@ test("direct sessions run bash and file primitives over RPC", { timeout: 30_000 
     );
     await assert.rejects(
       client.fileRequest("0123456789abcdef", "file.readText", { path: "shared/a.txt" }),
-      (error: unknown) => error instanceof RpcClientError && error.code === "invalid_request",
-    );
-    await assert.rejects(
-      client.startToolCall("0123456789abcdef", {
-        tool: "bash",
-        callId: 1,
-        args: {
-          command: "id",
-          // Deliberately outside the sandbox workspace; the payload gate must refuse it.
-          cwd: "/etc" as unknown as "/workspace",
-          env: {},
-          inheritEnv: false,
-          timeoutMs: 1_000,
-          window: { maxBytes: 1_024, maxLines: 10, minIntervalMs: 0, bytesPerSecond: 0 },
-        },
-      }).result,
       (error: unknown) => error instanceof RpcClientError && error.code === "invalid_request",
     );
     const healthAfterBadPayloads = await client.health();

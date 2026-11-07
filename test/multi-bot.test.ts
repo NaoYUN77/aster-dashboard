@@ -1,0 +1,413 @@
+// Multi-bot runtime over the local console, exercised end to end with a scripted model.
+//
+// The console is the only surface the owner uses, so these tests send exactly what the browser
+// sends and read exactly what it reads. Everything below is local: the workspace isolation shown
+// here is the Node execution environment's `cwd`, not the container sandbox.
+
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { contentText, type Message } from "@earendil-works/pi-ai";
+import { createModels } from "@earendil-works/pi-ai/models";
+import {
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxToolCall,
+  type FauxResponseFactory,
+} from "@earendil-works/pi-ai/providers/faux";
+import { DEFAULT_CATALOG_PROFILE } from "../src/tool-catalog.js";
+import { startService, type ServiceHandle } from "../src/main.js";
+
+const TOKEN = "{{SECRET_5xpdbsvp}}";
+const MODEL = "faux-1";
+
+function environment(dataDir: string): NodeJS.ProcessEnv {
+  return {
+    DATA_DIR: dataDir,
+    TELEGRAM_ENABLED: "0",
+    CONSOLE_ENABLED: "1",
+    WEB_TOKEN: TOKEN,
+    CONSOLE_HOST: "127.0.0.1",
+    CONSOLE_PORT: "0",
+    MODEL_PROVIDER: "openai",
+    MODEL_ID: MODEL,
+    OPENAI_API_KEY: "faux",
+    MEMORY_ENABLED: "0",
+    // A configured CCR profile makes the web group available.
+    CCR_PROFILE: "test-web-profile",
+  };
+}
+
+type Console = { base: string; call(path: string, body?: unknown): Promise<{ status: number; body: any }> };
+
+function consoleOf(service: ServiceHandle): Console {
+  const port = service.console?.port;
+  assert.ok(port !== undefined, "the console must be listening");
+  const base = `http://127.0.0.1:${port}`;
+  const call = async (path: string, body?: unknown) => {
+    const response = await fetch(`${base}${path}`, {
+      method: body === undefined ? "GET" : "POST",
+      headers: { authorization: `Bearer ${TOKEN}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    return { status: response.status, body: await response.json().catch(() => ({})) };
+  };
+  return { base, call };
+}
+
+function lastUserText(transcript: { messages: readonly Message[] }): string {
+  for (let index = transcript.messages.length - 1; index >= 0; index -= 1) {
+    const message = transcript.messages[index];
+    if (message?.role === "user") return contentText(message.content);
+  }
+  return "";
+}
+
+function toolResultAfterLastUser(transcript: { messages: readonly Message[] }): string | undefined {
+  let lastUser = -1;
+  for (let index = transcript.messages.length - 1; index >= 0; index -= 1) {
+    if (transcript.messages[index]?.role === "user") { lastUser = index; break; }
+  }
+  for (let index = transcript.messages.length - 1; index > lastUser; index -= 1) {
+    const message = transcript.messages[index];
+    if (message?.role === "toolResult") return contentText(message.content);
+  }
+  return undefined;
+}
+
+/**
+ * One responder for every request, routed on the transcript: concurrent bots never compete for
+ * queued responses, so a cancellation test can run one bot while another proceeds.
+ */
+const responder: FauxResponseFactory = (transcript) => {
+  const request = lastUserText(transcript);
+  const result = toolResultAfterLastUser(transcript);
+  if (request.includes("WRITE-FILE")) {
+    return result === undefined
+      ? fauxAssistantMessage(fauxToolCall("bash", { command: "echo hello-from-web-bot > a.txt" }, { id: "write" }), { stopReason: "toolUse" })
+      : fauxAssistantMessage("WROTE");
+  }
+  if (request.includes("LIST-FILES")) {
+    return result === undefined
+      ? fauxAssistantMessage(fauxToolCall("bash", { command: "ls -1" }, { id: "list" }), { stopReason: "toolUse" })
+      : fauxAssistantMessage(result.trim() === "" ? "(empty)" : result.trim());
+  }
+  if (request.includes("SLEEP-LONG")) {
+    return result === undefined
+      ? fauxAssistantMessage(fauxToolCall("bash", { command: "sleep 30" }, { id: "sleep" }), { stopReason: "toolUse" })
+      : fauxAssistantMessage("SLEPT");
+  }
+  return fauxAssistantMessage("OK");
+};
+
+function scriptedProvider() {
+  const faux = fauxProvider({ provider: "openai" });
+  // Every model call takes one response; a generous queue keeps unrelated bots independent.
+  faux.setResponses(Array.from({ length: 200 }, () => responder));
+  const models = createModels();
+  models.setProvider(faux.provider);
+  return models;
+}
+
+async function waitFor<T>(what: string, check: () => Promise<T | undefined>, timeoutMs = 30_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await check();
+    if (value !== undefined) return value;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function history(console: Console, botId: string) {
+  const response = await console.call(`/api/bots/${botId}/history?limit=200`);
+  assert.equal(response.status, 200);
+  return response.body.messages as { role: string; text: string }[];
+}
+
+function assistantTexts(messages: readonly { role: string; text: string }[]): string[] {
+  return messages.filter((message) => message.role === "assistant").map((message) => message.text);
+}
+
+/** Read server-sent events until the predicate matches; the stream is closed with an abort. */
+async function collectEvents(
+  url: string,
+  until: (kinds: string[]) => boolean,
+  run: () => Promise<void>,
+  timeoutMs = 30_000,
+): Promise<string[]> {
+  const controller = new AbortController();
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${TOKEN}` },
+    signal: controller.signal,
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
+  const kinds: string[] = [];
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const deadline = Date.now() + timeoutMs;
+  await run();
+  try {
+    for (;;) {
+      if (until(kinds)) break;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      let timer: NodeJS.Timeout | undefined;
+      const read = await Promise.race([
+        reader.read(),
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), remaining);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      if (read === "timeout" || read.done) break;
+      buffer += decoder.decode(read.value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = frame.split("\n").filter((line) => line.startsWith("data: ")).map((line) => line.slice(6)).join("");
+        if (data !== "") {
+          const payload = JSON.parse(data) as { type: string; events?: { type: string }[] };
+          if (payload.type === "events") for (const event of payload.events ?? []) kinds.push(event.type);
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    controller.abort();
+  }
+  return kinds;
+}
+
+test("the console drives isolated bots and survives a restart", { timeout: 180_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "personal-agent-console-"));
+  const env = environment(directory);
+  let service: ServiceHandle | undefined;
+  try {
+    // Legacy catalog HTTP compatibility is a host-only test switch; production is zero-setup.
+    service = await startService({ env, models: scriptedProvider(), log: () => {}, allowLegacyCatalog: true });
+    const console = consoleOf(service);
+
+    // Acceptance 10 (locally): every API route needs the token. The static page is deliberately
+    // public so the browser can load it before prompting for WEB_TOKEN; it holds no bot data.
+    assert.equal((await fetch(`${console.base}/`)).status, 200);
+    assert.equal((await fetch(`${console.base}/api/bots`)).status, 401);
+    assert.equal((await fetch(`${console.base}/api/bots`, { method: "POST", body: "{}" })).status, 401);
+    assert.equal((await fetch(`${console.base}/api/bots/x/messages`, { method: "POST", body: "{}" })).status, 401);
+
+    const listed = await console.call("/api/bots");
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.body.bots.map((bot: { botId: string }) => bot.botId), ["default"]);
+
+    assert.ok(listed.body.bots.every((bot: object) => !Object.hasOwn(bot, "role")));
+
+    // Acceptance 2: two bots, two conversations.
+    const webBot = await console.call("/api/bots", {
+      name: "Web Bot",
+      profile: { ...DEFAULT_CATALOG_PROFILE, web: true },
+      systemPrompt: "Use web tools when needed.",
+    });
+    assert.equal(webBot.status, 201);
+    // ptc is a retired persisted switch: it must stay off in the catalog and select no tools.
+    const scriptBot = await console.call("/api/bots", {
+      name: "Script Bot",
+      profile: { ...DEFAULT_CATALOG_PROFILE, ptc: true },
+      systemPrompt: "Work without web access.",
+    });
+    assert.equal(scriptBot.status, 201);
+    const scoped = await console.call("/api/bots", {
+      name: "Scoped Bot",
+      profile: DEFAULT_CATALOG_PROFILE,
+      systemPrompt: "Use only the command tool.",
+      toolScope: { allow: ["bash"], deny: [] },
+    });
+    assert.equal(scoped.status, 201);
+    const webBotId = webBot.body.bot.botId as string;
+    const scriptBotId = scriptBot.body.bot.botId as string;
+    assert.notEqual(webBot.body.bot.conversationId, scriptBot.body.bot.conversationId);
+    for (const { body } of [webBot, scriptBot, scoped]) assert.equal(Object.hasOwn(body.bot, "role"), false);
+
+    // Acceptance 3: the explicit web switch selects different tools; the retired ptc switch
+    // stays in the persisted profile but never surfaces the removed codemode tool.
+    assert.ok(webBot.body.bot.loadedTools.includes("bash"));
+    assert.ok(webBot.body.bot.loadedTools.includes("web_search"));
+    assert.ok(webBot.body.bot.loadedTools.includes("web_fetch"));
+    assert.ok(!webBot.body.bot.loadedTools.includes("codemode"), "codemode is retired");
+    assert.ok(!scriptBot.body.bot.loadedTools.includes("codemode"), "codemode is retired even with ptc=true");
+    assert.ok(!scriptBot.body.bot.loadedTools.includes("web_search"));
+    assert.ok(!scriptBot.body.bot.loadedTools.includes("web_fetch"));
+    assert.ok(webBot.body.bot.tools.includes("web"));
+    assert.ok(!scriptBot.body.bot.tools.includes("web"));
+    assert.deepEqual(scoped.body.bot.profile, DEFAULT_CATALOG_PROFILE);
+    assert.deepEqual(scoped.body.bot.toolScope, { allow: ["bash"], deny: [] });
+    assert.deepEqual(scoped.body.bot.loadedTools, ["bash"]);
+
+    const customProfile = { ...DEFAULT_CATALOG_PROFILE, shell: false, files: false, web: true, ptc: true, mcp: false };
+    const custom = await console.call("/api/bots", { name: "Custom", profile: customProfile });
+    assert.equal(custom.status, 201);
+    assert.deepEqual(custom.body.bot.profile, customProfile);
+    // The legacy capability projection lists only live groups; ptc no longer emits a capability.
+    assert.deepEqual(custom.body.bot.tools, ["web"]);
+    assert.ok(!custom.body.bot.loadedTools.includes("codemode"), "codemode is retired");
+    assert.ok(custom.body.bot.loadedTools.includes("web_search"));
+    assert.ok(!custom.body.bot.loadedTools.includes("bash"));
+    assert.ok(!custom.body.bot.loadedTools.includes("read"));
+    for (const profile of [null, "research", { ...customProfile, shell: "yes" }, { core: true }, { ...customProfile, extra: true }]) {
+      assert.equal((await console.call("/api/bots", { name: "Invalid", profile })).status, 400);
+    }
+    const updatedProfile = { ...customProfile, files: true, reminders: false };
+    const update = await fetch(`${console.base}/api/bots/${custom.body.bot.botId}`, {
+      method: "PATCH", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ profile: updatedProfile, toolScope: { allow: [], deny: ["write"] } }),
+    });
+    assert.equal(update.status, 200);
+    const updated = (await update.json()).bot;
+    assert.deepEqual(updated.profile, updatedProfile);
+    assert.equal(updated.conversationId, custom.body.bot.conversationId);
+    assert.ok(updated.loadedTools.includes("read"));
+    assert.ok(!updated.loadedTools.includes("write"));
+    assert.ok(!updated.loadedTools.includes("bash"));
+    assert.ok(!updated.loadedTools.includes("codemode"), "codemode is retired");
+    for (const invalid of [null, [], {}, { profile: "chief" }, { profile: updatedProfile, role: "programmer" }]) {
+      const response = await fetch(`${console.base}/api/bots/${custom.body.bot.botId}`, {
+        method: "PATCH", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify(invalid),
+      });
+      assert.equal(response.status, 400);
+    }
+    const changing = service.bots.updateCatalog(custom.body.bot.botId, { profile: updatedProfile });
+    assert.throws(() => service!.bots.send(custom.body.bot.botId, "during configuration"), /being configured/);
+    await assert.rejects(service.bots.updateCatalog(custom.body.bot.botId, { profile: customProfile }), /must be idle/);
+    assert.deepEqual((await changing).toolScope, { allow: [], deny: ["write"] });
+    const explicit = await service.agent.configureBot({
+      botId: "host-explicit", cwd: directory, prompt: "",
+      catalogProfile: customProfile,
+    });
+    assert.ok(!explicit.tools.includes("codemode") && explicit.tools.includes("web_search"));
+    assert.ok(!explicit.tools.includes("bash") && !explicit.tools.includes("read"));
+    // Host configuration also requires switches and rejects removed configuration inputs.
+    for (const invalid of [
+      { botId: "host-invalid", cwd: directory, prompt: "" },
+      { botId: "host-invalid", cwd: directory, prompt: "", catalogProfile: customProfile, tools: ["ptc", "web"] },
+      { botId: "host-invalid", cwd: directory, prompt: "", catalogProfile: customProfile, role: "programmer" },
+    ]) {
+      await assert.rejects(service.agent.configureBot(invalid as Parameters<typeof service.agent.configureBot>[0]), /catalog profile|unknown fields/);
+    }
+
+    assert.equal((await console.call("/api/bots/nobody/messages", { text: "hi" })).status, 404);
+    assert.equal((await console.call("/api/bots", { name: "Missing profile" })).status, 400);
+    for (const role of ["assistant", "researcher", "programmer"]) {
+      assert.equal((await console.call("/api/bots", { name: "Removed field", profile: customProfile, role })).status, 400);
+    }
+    await assert.rejects(service.bots.create({ name: "Removed field", systemPrompt: "", profile: customProfile, role: "assistant" } as Parameters<typeof service.bots.create>[0]), /unknown fields/);
+    assert.equal(Object.hasOwn(custom.body.bot, "role"), false);
+    assert.equal(Object.hasOwn(updated, "role"), false);
+
+    // Acceptance 4 (local): A's file is not in B's working directory.
+    assert.equal((await console.call(`/api/bots/${webBotId}/messages`, { text: "WRITE-FILE" })).status, 202);
+    const wrote = await waitFor("the write to finish", async () => {
+      const texts = assistantTexts(await history(console, webBotId));
+      return texts.includes("WROTE") ? texts : undefined;
+    });
+    assert.deepEqual(wrote, ["WROTE"]);
+    assert.equal(
+      (await readFile(join(directory, "workspaces", webBotId, "a.txt"), "utf8")).trim(),
+      "hello-from-web-bot",
+    );
+
+    assert.equal((await console.call(`/api/bots/${scriptBotId}/messages`, { text: "LIST-FILES" })).status, 202);
+    const listedText = await waitFor("the listing to finish", async () => {
+      const texts = assistantTexts(await history(console, scriptBotId));
+      return texts[0];
+    });
+    assert.doesNotMatch(listedText, /a\.txt/);
+
+    // Acceptance 6: live events move from a run start to a run end.
+    const events = await collectEvents(
+      `${console.base}/api/bots/${webBotId}/events?token=${TOKEN}`,
+      (kinds) => kinds.includes("run_end"),
+      async () => {
+        await console.call(`/api/bots/${webBotId}/messages`, { text: "LIST-FILES" });
+      },
+    );
+    assert.ok(events.includes("run_start"), `expected run_start in ${events.join(",")}`);
+    assert.ok(events.includes("run_end"), `expected run_end in ${events.join(",")}`);
+    assert.ok(events.includes("tool"), `expected a tool event in ${events.join(",")}`);
+
+    // Acceptance 7: cancelling A stops A's sleep and leaves B alone.
+    assert.equal((await console.call(`/api/bots/${webBotId}/messages`, { text: "SLEEP-LONG" })).status, 202);
+    await assert.rejects(service.bots.updateCatalog(webBotId, { profile: customProfile }), /must be idle/);
+    // Give the run time to reach its `sleep 30` command, so the cancel interrupts real work.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const quick = await console.call(`/api/bots/${scriptBotId}/messages`, { text: "QUICK" });
+    assert.equal(quick.status, 202);
+    await waitFor("the script bot's quick run", async () => {
+      const texts = assistantTexts(await history(console, scriptBotId));
+      return texts.at(-1) === "OK" ? texts : undefined;
+    }, 20_000);
+    const stopped = await console.call(`/api/bots/${webBotId}/cancel`, {});
+    assert.equal(stopped.status, 200);
+    assert.equal(stopped.body.cancelled, true);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const afterCancel = assistantTexts(await history(console, webBotId));
+    assert.ok(!afterCancel.includes("SLEPT"), "a cancelled run must not be saved as an answer");
+    assert.equal(assistantTexts(await history(console, scriptBotId)).at(-1), "OK");
+
+    // The default bot keeps the legacy working directory, not a per-bot one.
+    assert.equal(service.bots.views().length, 5);
+
+    // Acceptance 8 (local): bots, conversations and history survive a restart.
+    const beforeRestart = await console.call("/api/bots");
+    await service.close();
+    // Legacy catalog HTTP compatibility is a host-only test switch; production is zero-setup.
+    service = await startService({ env, models: scriptedProvider(), log: () => {}, allowLegacyCatalog: true });
+    const restarted = consoleOf(service);
+    const afterRestart = await restarted.call("/api/bots");
+    assert.ok(afterRestart.body.bots.every((bot: object) => !Object.hasOwn(bot, "role")));
+    assert.deepEqual(
+      afterRestart.body.bots.map((bot: { botId: string; conversationId: string }) => [bot.botId, bot.conversationId]),
+      beforeRestart.body.bots.map((bot: { botId: string; conversationId: string }) => [bot.botId, bot.conversationId]),
+    );
+    const restoredScope = afterRestart.body.bots.find((bot: { botId: string }) => bot.botId === scoped.body.bot.botId);
+    assert.deepEqual(restoredScope.profile, DEFAULT_CATALOG_PROFILE);
+    assert.deepEqual(restoredScope.toolScope, { allow: ["bash"], deny: [] });
+    const restoredCustom = afterRestart.body.bots.find((bot: { botId: string }) => bot.botId === custom.body.bot.botId);
+    assert.deepEqual(restoredCustom.profile, updatedProfile);
+    assert.deepEqual(restoredCustom.toolScope, { allow: [], deny: ["write"] });
+    assert.ok(!restoredCustom.loadedTools.includes("codemode") && restoredCustom.loadedTools.includes("web_search"));
+    assert.ok(!restoredCustom.loadedTools.includes("bash") && !restoredCustom.loadedTools.includes("write"));
+    const restored = assistantTexts(await history(restarted, webBotId));
+    assert.ok(restored.includes("WROTE"), `history lost after restart: ${restored.join("|")}`);
+  } finally {
+    await service?.close().catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("WEB_AUTH=off serves every console route without a token", { timeout: 120_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "personal-agent-console-authoff-"));
+  // A stale WEB_TOKEN stays in the environment: it must neither be required nor silently re-enable auth.
+  const env = { ...environment(directory), WEB_AUTH: "off" };
+  let service: ServiceHandle | undefined;
+  try {
+    service = await startService({ env, models: scriptedProvider(), log: () => {}, allowLegacyCatalog: true });
+    const port = service.console?.port;
+    assert.ok(port !== undefined, "the console must be listening");
+    assert.equal(service.config.console?.token, null);
+    const base = `http://127.0.0.1:${port}`;
+    // No Authorization header anywhere: the loopback/tunnel boundary owns authentication.
+    assert.equal((await fetch(`${base}/`)).status, 200);
+    const bots = await fetch(`${base}/api/bots`);
+    assert.equal(bots.status, 200);
+    assert.deepEqual((await bots.json()).bots.map((bot: { botId: string }) => bot.botId), ["default"]);
+    for (const path of ["/api/platform", "/api/bots/default/history"]) {
+      assert.equal((await fetch(`${base}${path}`)).status, 200, path);
+    }
+  } finally {
+    await service?.close().catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
+  }
+});

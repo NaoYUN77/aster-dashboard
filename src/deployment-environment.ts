@@ -23,12 +23,6 @@ export const EnvironmentSchema = Type.Object({
   volumes: Type.Object({
     app: VolumeName,
   }, { additionalProperties: false }),
-  // The numeric Telegram bot user ID is an identifier, not a credential. Declaring it lets the
-  // offline check reject two environments that consume the same bot; the live check (Stage A2)
-  // confirms the deployed token actually resolves to this ID.
-  identity: Type.Object({
-    botId: Type.String({ minLength: 1, maxLength: 20, pattern: "^[1-9]\\d*$" }),
-  }, { additionalProperties: false }),
 }, { additionalProperties: false });
 
 export type DeploymentEnvironment = Static<typeof EnvironmentSchema>;
@@ -76,13 +70,10 @@ export async function readEnvironment(path: string): Promise<DeploymentEnvironme
 
 /**
  * Reject descriptions that would collide on one host. Environments are separate Compose projects,
- * so the same service names are expected; identity comes from projects, volumes and the bot the
- * environment consumes.
+ * so the same service names are expected; identity comes from projects and volumes only.
  */
 export function assertDistinctEnvironments(first: DeploymentEnvironment, second: DeploymentEnvironment): void {
   if (first.environment === second.environment) fail("ENVIRONMENT_RESOURCE_OVERLAP");
   if (first.composeProject === second.composeProject) fail("ENVIRONMENT_RESOURCE_OVERLAP");
   if (first.volumes.app === second.volumes.app) fail("ENVIRONMENT_RESOURCE_OVERLAP");
-  // The same bot cannot serve two environments: long polling would split updates between them.
-  if (first.identity.botId === second.identity.botId) fail("ENVIRONMENT_RESOURCE_OVERLAP");
 }

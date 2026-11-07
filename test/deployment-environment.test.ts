@@ -27,7 +27,6 @@ function environment(overrides: Partial<DeploymentEnvironment> = {}): Deployment
     environment: "test",
     composeProject: "aster-test",
     volumes: { app: "aster-test-app-data" },
-    identity: { botId: "111111" },
     ...overrides,
   };
 }
@@ -35,7 +34,6 @@ const production = () => environment({
   environment: "production",
   composeProject: "aster-production",
   volumes: { app: "personal-agent-data" },
-  identity: { botId: "222222" },
 });
 const parse = (value: unknown) => parseEnvironment(Buffer.from(JSON.stringify(value)));
 const environmentCode = (code: string) => (error: unknown) => error instanceof EnvironmentError && error.code === code;
@@ -68,8 +66,7 @@ test("a description is accepted only with canonical, self-consistent resources",
     { ...environment(), broker: { managementPort: 15321 } },
     { ...environment(), privateDirectory: "/srv/aster/test/private" },
     { ...environment(), privateFiles: { ca: "ca.pem" } },
-    { ...environment(), identity: { botId: "0" } }, { ...environment(), identity: { botId: "-1" } },
-    { ...environment(), identity: { botId: "bot" } }, { ...environment(), identity: {} },
+    { ...environment(), identity: { botId: "0" } }, { ...environment(), identity: {} },
   ];
   for (const value of bad) assert.throws(() => parse(value), environmentCode("ENVIRONMENT_INVALID_SCHEMA"), JSON.stringify(value));
 });
@@ -98,7 +95,7 @@ test("two environments are distinct only when no host resource is shared", () =>
   const changes: Array<(value: DeploymentEnvironment) => void> = [
     (value) => { value.composeProject = "aster-test"; },
     (value) => { value.volumes.app = "aster-test-app-data"; },
-    (value) => { value.identity.botId = "111111"; },
+    (value) => { value.environment = "test"; },
   ];
   for (const change of changes) {
     const other = structuredClone(production());
@@ -173,7 +170,7 @@ test("CLI reports fixed codes without echoing paths, values or environment conte
   t.after(() => rm(directory, { recursive: true, force: true }));
   const marker = "DO_NOT_PRINT_SYNTHETIC_SECRET";
   const path = join(directory, "environment.json");
-  await writeFile(path, JSON.stringify({ ...environment(), identity: { botId: "333333" } }));
+  await writeFile(path, JSON.stringify(environment()));
   await writeFile(join(directory, "other.json"), JSON.stringify(production()));
   await writeFile(join(directory, "broken.json"), `{ ${marker}`);
   const run = (argv: string[]) => spawnSync(process.execPath, ["--import", "tsx", cli, ...argv], {

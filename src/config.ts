@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
 import { setGlobalProxyFromEnv } from "node:http";
+import { isIP } from "node:net";
 import { join, resolve } from "node:path";
 import { ConfigurationError } from "./errors.js";
 import { isAbsoluteRemotePath } from "./execution/protocol.js";
 import { readRpcClientConfig, type RpcClientConfig } from "./execution/rpc-config.js";
 import { isProviderId, PROVIDER_IDS, PROVIDERS } from "./providers.js";
+import type { PlatformDependencies } from "./platform-capabilities.js";
 import {
   assertSchema,
   eventDate,
@@ -96,7 +98,7 @@ function validateProxyEnv(env: NodeJS.ProcessEnv): void {
  * Enable Node's global HTTP(S) proxy dispatcher from the environment when a proxy variable is set.
  * Needed when HTTPS_PROXY is loaded from --env-file=.env after Node startup; safe alongside NODE_USE_ENV_PROXY=1.
  * With ASTER_MITM_TOKEN_FILE set, the effective URLs carry the proxy credentials and are written back
- * so clients that build their own agent from process.env (TelegramClient, MCP children) use them too.
+ * so clients that build their own agent from process.env (MCP children) use them too.
  */
 export function configureEnvProxy(env: NodeJS.ProcessEnv = process.env): boolean {
   validateProxyEnv(env);
@@ -128,13 +130,11 @@ export function resolveMcpConfigPaths(env: NodeJS.ProcessEnv = process.env) {
 export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   validateProxyEnv(env);
   const paths = resolveMcpConfigPaths(env);
-  const telegramApiRoot = readTelegramApiRoot(env);
   const required = (key: string) => {
     const value = env[key]?.trim();
     if (!value) throw new ConfigurationError(`Missing configuration: ${key}`);
     return value;
   };
-  const ownerId = readOwnerId(env);
   const provider = required("MODEL_PROVIDER");
   if (!isProviderId(provider)) {
     throw new ConfigurationError(`MODEL_PROVIDER must be one of: ${PROVIDER_IDS.join(", ")}`);
@@ -142,65 +142,86 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   const providerKeyEnv = PROVIDERS[provider].apiKeyEnv;
   const providerKey = required(providerKeyEnv);
   assertValidCredentialShape(providerKeyEnv, providerKey);
-  const token = required("TELEGRAM_BOT_TOKEN");
-  assertValidCredentialShape("TELEGRAM_BOT_TOKEN", token);
-  const webApiKey = env.DEEPSEEK_WEB_API_KEY?.trim();
-  if (webApiKey) assertValidCredentialShape("DEEPSEEK_WEB_API_KEY", webApiKey);
+  const ccrProfile = env.CCR_PROFILE?.trim();
+  if (ccrProfile && (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,127}$/.test(ccrProfile))) {
+    throw new ConfigurationError("CCR_PROFILE must be a configured profile name or id");
+  }
+  const ccrCommand = env.CCR_COMMAND?.trim() || "ccr";
+  if (ccrCommand.length > 512 || !/^[A-Za-z0-9_./:\\ -]+$/.test(ccrCommand)) {
+    throw new ConfigurationError("CCR_COMMAND must be an executable path without shell metacharacters");
+  }
   const execution = readExecutionConfig(env);
-  const codemode = readCodemodeConfig(env);
-  // Remote code mode runs its VM on the execution agent, so the gateway must be configured and
-  // reachable. A local deployment keeps the previous codemode shape unchanged.
-  const codemodeConfig: CodemodeConfig | undefined = codemode.enabled
-    ? {
-        ...codemode,
-        ...(execution === undefined ? {} : {
-          ptc: {
-            rpc: readRpcClientConfig(env),
-            defaultTimeoutSeconds: execution.defaultTimeoutSeconds,
-            maxTimeoutSeconds: execution.maxTimeoutSeconds,
-          },
-        }),
-      }
-    : undefined;
-  const reminders = readReminderConfig(env);
+  const consoleConfig = readConsoleConfig(env);
   return {
-    token,
-    ownerId,
+    // The dashboard console is the only ingress; its optional config is resolved by the host.
+    console: consoleConfig,
     provider,
     model: required("MODEL_ID"),
-    telegramApiRoot,
-    ...(webApiKey ? { webApiKey } : {}),
+    ...(ccrProfile === undefined || ccrProfile === "" ? {} : { ccrProfile, ccrCommand }),
     ...(execution === undefined ? {} : { execution }),
-    ...(codemodeConfig === undefined ? {} : { codemode: codemodeConfig }),
     ...paths,
-    ...(reminders.enabled ? { reminders } : {}),
     trace: readTraceConfig(env),
+    platform: readPlatformConfig(env),
   };
 }
 
-/** One-time reminders (REMINDERS_*). Enabled by default; limits bound each owner's stored rows. */
-export type ReminderConfig = {
-  readonly enabled: boolean;
-  readonly maxPending: number;
-  readonly maxPerHour: number;
-  readonly horizonDays: number;
+/**
+ * Host-verified deployment facts for the zero-setup runtime. Nothing here comes from a bot row, a
+ * request body or a model parameter. A credential is read once and kept in host configuration: it
+ * is never written into a bot row, a tool declaration, a log line or a prompt.
+ *
+ * Phase 1's Computer capability comes from a configured RPC execution face: one shared CVM
+ * Computer / Execution Host for all bots (single-user MVP, no OS-level isolation). No OS-isolation
+ * declaration is needed; the startup RPC `health.check` and each bot's workspace probe stay
+ * fail-closed, so an unreachable or incomplete execution face never produces a Ready bot.
+ */
+export type PlatformConfig = {
+  readonly facts: PlatformDependencies;
+  /** Host-owned Web Search/Fetch credential. Never exposed to the model, a bot row or a log. */
+  readonly webApiKey?: string;
+};
+
+export function readPlatformConfig(env: NodeJS.ProcessEnv = process.env): PlatformConfig {
+  const webApiKey = env.PLATFORM_WEB_SEARCH_API_KEY?.trim() || undefined;
+  if (webApiKey !== undefined) assertValidCredentialShape("PLATFORM_WEB_SEARCH_API_KEY", webApiKey);
+  const ccrProfile = env.CCR_PROFILE?.trim();
+  // Both providers install the same tool names; choosing one silently would hide a config error.
+  if (webApiKey !== undefined && ccrProfile) {
+    throw new ConfigurationError("Configure either PLATFORM_WEB_SEARCH_API_KEY or CCR_PROFILE, not both");
+  }
+  const execution = readExecutionConfig(env);
+  const facts: PlatformDependencies = Object.freeze({
+    memoryEnabled: readMemoryConfig(env).enabled,
+    webConfigured: webApiKey !== undefined || Boolean(ccrProfile),
+    webViaPlatformCredential: webApiKey !== undefined,
+    // A rpc transport owns Bash and the file primitives; ssh only carries shell commands.
+    computerHost: execution?.transport === "rpc",
+    // No OAuth integration is connected in this phase; the platform never claims one.
+    mcpConnected: false,
+  });
+  return Object.freeze({ facts, ...(webApiKey === undefined ? {} : { webApiKey }) });
+}
+
+/**
+ * The structural config the agent and protocol adapters need. `platform` is optional here: those
+ * modules predate zero-setup and do not need deployment facts, and tests hand-build this shape.
+ * `readConfig()` always supplies it, so a real deployment still gets a frozen, host-verified value.
+ */
+export type RuntimeConfig = Omit<ReturnType<typeof readConfig>, "platform"> & {
+  readonly platform?: PlatformConfig;
 };
 
 /**
- * Every reminder bound is validated even when reminders are disabled, so a malformed value cannot
- * silently take effect after the switch is flipped. Time itself is always resolved by the host.
+ * Host-only compatibility switch for the pre-zero-setup dashboard acceptance harness. It is read
+ * once by the process owner, defaults to off, and is never a browser field or a user capability
+ * setting. An invalid value is a configuration error, not a silent fallback.
  */
-export function readReminderConfig(env: NodeJS.ProcessEnv = process.env): ReminderConfig {
-  const enabledRaw = env.REMINDERS_ENABLED?.trim();
-  if (enabledRaw !== undefined && enabledRaw !== "" && enabledRaw !== "0" && enabledRaw !== "1") {
-    throw new ConfigurationError("REMINDERS_ENABLED must be 0 or 1");
+export function readLegacyCatalogEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.ALLOW_LEGACY_CATALOG?.trim();
+  if (raw !== undefined && raw !== "" && raw !== "0" && raw !== "1") {
+    throw new ConfigurationError("ALLOW_LEGACY_CATALOG must be 0 or 1");
   }
-  return {
-    enabled: enabledRaw !== "0",
-    maxPending: boundedInteger(env, "REMINDERS_MAX_PENDING", 100, 1, 1_000),
-    maxPerHour: boundedInteger(env, "REMINDERS_MAX_PER_HOUR", 20, 1, 1_000),
-    horizonDays: boundedInteger(env, "REMINDERS_MAX_HORIZON_DAYS", 366, 1, 3_650),
-  };
+  return raw === "1";
 }
 
 /**
@@ -214,8 +235,8 @@ export type TraceConfig = {
   readonly secretKey?: string;
   readonly baseUrl?: string;
   /**
-   * Upload model-visible content (script, nested tool arguments and results) as observation
-   * input/output. Off by default: traces then keep only sizes, counts and error codes.
+   * Upload model-visible content (tool arguments and results) as observation input/output.
+   * Off by default: traces then keep only sizes, counts and error codes.
    */
   readonly captureContent?: boolean;
 };
@@ -266,18 +287,22 @@ export type ExecutionConfig = {
     }
   | {
       readonly transport: "rpc";
-      /** Validated execution agent connection; the agent also runs the direct sandbox. */
+      /** Validated execution agent connection; the agent runs the shared Phase 1 execution host. */
       readonly rpc: RpcClientConfig;
     }
 );
 
-/** `/shared` itself or a path below it; the direct sandbox exposes nothing else to commands. */
-function isSharedRemotePath(value: string): boolean {
-  return value === "/shared"
-    || (value.startsWith("/shared/")
-      && !value.includes("\\")
-      && !value.split("/").includes(".."));
+/**
+ * The workspace roots the Phase 1 shared execution host exposes to commands: the legacy
+ * `/shared` workspace and the per-bot `/workspaces` tree. A per-bot directory is derived
+ * inside one of them, never elsewhere.
+ */
+function isSandboxRootPath(value: string): boolean {
+  if (value.includes("\\") || value.split("/").includes("..")) return false;
+  return SANDBOX_ROOTS.some((root) => value === root || value.startsWith(`${root}/`));
 }
+
+export const SANDBOX_ROOTS = ["/shared", "/workspaces"] as const;
 
 function boundedInteger(env: NodeJS.ProcessEnv, key: string, fallback: number, min: number, max: number): number {
   const raw = env[key]?.trim();
@@ -295,7 +320,7 @@ function boundedInteger(env: NodeJS.ProcessEnv, key: string, fallback: number, m
  * (default `ssh`, the legacy broker). Every setting of the selected transport is validated before the
  * process can reach the agent, and settings of the other transport are ignored rather than silently
  * taking effect after a later switch. Ownership of `EXECUTION_REMOTE_CWD` follows the transport: the
- * direct sandbox only exposes `/shared`, so the RPC path confines it there.
+ * shared execution host only exposes `/shared`, so the RPC path confines it there.
  */
 export function readExecutionConfig(env: NodeJS.ProcessEnv = process.env): ExecutionConfig | undefined {
   const mode = env.EXECUTION_MODE?.trim() || "local";
@@ -317,8 +342,10 @@ export function readExecutionConfig(env: NodeJS.ProcessEnv = process.env): Execu
   if (Buffer.byteLength(remoteCwd, "utf8") > 4096) {
     throw new ConfigurationError("EXECUTION_REMOTE_CWD must be at most 4096 bytes");
   }
-  if (transport === "rpc" && !isSharedRemotePath(remoteCwd)) {
-    throw new ConfigurationError("EXECUTION_REMOTE_CWD must be /shared or a path below it for the rpc transport");
+  if (transport === "rpc" && !isSandboxRootPath(remoteCwd)) {
+    throw new ConfigurationError(
+      "EXECUTION_REMOTE_CWD must be under /shared or /workspaces for the rpc transport",
+    );
   }
   const defaultTimeoutSeconds = boundedInteger(env, "EXECUTION_DEFAULT_TIMEOUT_SECONDS", 300, 1, 86_400);
   const maxTimeoutSeconds = boundedInteger(env, "EXECUTION_MAX_TIMEOUT_SECONDS", 3600, 1, 86_400);
@@ -346,87 +373,6 @@ export function readExecutionConfig(env: NodeJS.ProcessEnv = process.env): Execu
     defaultTimeoutSeconds,
     maxTimeoutSeconds,
   };
-}
-
-/** PTC / code mode (ADR-0019). Disabled unless explicitly enabled. */
-export type CodemodeConfig = {
-  readonly enabled: boolean;
-  /** When enabled, model-visible file and command tools are hidden behind codemode. */
-  readonly scriptFirst: boolean;
-  /** Per-script deadline, including time spent in nested tool calls. */
-  readonly timeoutMs: number;
-  /** Maximum heap the QuickJS instance may allocate. */
-  readonly memoryLimitBytes: number;
-  /** Present only when execution is remote: the agent that runs the script's VM. */
-  readonly ptc?: CodemodePtcConfig;
-};
-
-/** The execution agent connection and timeout bounds a remote code mode run needs. */
-export type CodemodePtcConfig = {
-  readonly rpc: RpcClientConfig;
-  readonly defaultTimeoutSeconds: number;
-  readonly maxTimeoutSeconds: number;
-};
-
-/**
- * Code mode runs model-written JavaScript in the base's QuickJS sandbox. It is opt-in because the
- * tool adds a prompt section and a write-capable execution path. Both bounds are validated even
- * when disabled so a malformed value cannot silently take effect after the switch is flipped.
- */
-export function readCodemodeConfig(env: NodeJS.ProcessEnv = process.env): CodemodeConfig {
-  const enabledRaw = env.CODEMODE_ENABLED?.trim();
-  if (enabledRaw !== undefined && enabledRaw !== "" && enabledRaw !== "0" && enabledRaw !== "1") {
-    throw new ConfigurationError("CODEMODE_ENABLED must be 0 or 1");
-  }
-  const enabled = enabledRaw === "1";
-  const scriptFirstRaw = env.CODEMODE_SCRIPT_FIRST?.trim().toLowerCase();
-  if (
-    scriptFirstRaw !== undefined &&
-    scriptFirstRaw !== "" &&
-    scriptFirstRaw !== "0" &&
-    scriptFirstRaw !== "1" &&
-    scriptFirstRaw !== "false" &&
-    scriptFirstRaw !== "true"
-  ) {
-    throw new ConfigurationError("CODEMODE_SCRIPT_FIRST must be 0, 1, false, or true");
-  }
-  return {
-    enabled,
-    // Code mode replaces the model-visible file and command tools by default; an explicit
-    // 0/false keeps the previous exposure and remains a one-switch rollback.
-    scriptFirst: scriptFirstRaw === undefined || scriptFirstRaw === ""
-      ? enabled
-      : scriptFirstRaw === "1" || scriptFirstRaw === "true",
-    // Keep headroom under the 300 s request wait so the script reports its own timeout first.
-    timeoutMs: boundedInteger(env, "CODEMODE_TIMEOUT_MS", 240_000, 1_000, 300_000),
-    memoryLimitBytes: boundedInteger(
-      env,
-      "CODEMODE_MEMORY_LIMIT_BYTES",
-      128 * 1024 * 1024,
-      16 * 1024 * 1024,
-      512 * 1024 * 1024,
-    ),
-  };
-}
-
-/**
- * Optional Telegram Bot API root override (a reverse proxy, e.g. a Cloudflare Worker) for hosts
- * that cannot reach api.telegram.org directly. The value is a URL prefix: the client appends
- * /bot<token>/<method> to it. It must be an https URL without query or fragment; trailing
- * slashes are dropped so the join is exact. Unset means the default api.telegram.org root.
- */
-function readTelegramApiRoot(env: NodeJS.ProcessEnv): string | undefined {
-  const raw = env.TELEGRAM_API_ROOT?.trim();
-  if (!raw) return undefined;
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new ConfigurationError("TELEGRAM_API_ROOT must be a valid URL");
-  }
-  if (url.protocol !== "https:") throw new ConfigurationError("TELEGRAM_API_ROOT must be an https URL");
-  if (url.search || url.hash) throw new ConfigurationError("TELEGRAM_API_ROOT must not contain a query or fragment");
-  return url.href.replace(/\/+$/, "");
 }
 
 /** Memory wiring (MEM-07): budgets, the compaction reserve, the archive timezone and timeout. */
@@ -496,9 +442,47 @@ export function readMemoryConfig(env: NodeJS.ProcessEnv = process.env): MemoryCo
   };
 }
 
-function readOwnerId(env: NodeJS.ProcessEnv): string {
-  const ownerId = env.TELEGRAM_OWNER_ID?.trim();
-  if (!ownerId) throw new ConfigurationError("Missing configuration: TELEGRAM_OWNER_ID");
-  if (!/^[1-9]\d*$/.test(ownerId)) throw new ConfigurationError("TELEGRAM_OWNER_ID must be a positive numeric user ID");
-  return ownerId;
+/**
+ * The local console: an in-process HTTP surface for the owner's browser. It is off unless enabled.
+ * Authentication is the fail-closed default (`WEB_AUTH=token`); `WEB_AUTH=off` is an explicit host
+ * decision for a deployment whose only reachable ingress is already a loopback or tunnel boundary.
+ * The static page is always served so the browser can ask for a token when one is required.
+ */
+export type ConsoleConfig = {
+  readonly host: string;
+  readonly port: number;
+  /** `null` only when the host explicitly disabled authentication with `WEB_AUTH=off`. */
+  readonly token: string | null;
+  /** Directory holding the static page; the image copies `dashboard/web` there. */
+  readonly webDir: string;
+  readonly maxBots: number;
+};
+
+export function readConsoleConfig(env: NodeJS.ProcessEnv = process.env): ConsoleConfig | undefined {
+  const enabledRaw = env.CONSOLE_ENABLED?.trim();
+  if (enabledRaw !== undefined && enabledRaw !== "" && enabledRaw !== "0" && enabledRaw !== "1") {
+    throw new ConfigurationError("CONSOLE_ENABLED must be 0 or 1");
+  }
+  if (enabledRaw !== "1") return undefined;
+  // The browser is still a listener client. Token authentication stays the default; turning it off
+  // must be an explicit host decision and is only appropriate behind a loopback/tunnel boundary.
+  const auth = env.WEB_AUTH?.trim() || "token";
+  if (auth !== "token" && auth !== "off") {
+    throw new ConfigurationError("WEB_AUTH must be token or off");
+  }
+  const token = auth === "off" ? null : (env.WEB_TOKEN?.trim() ?? "");
+  if (token !== null && !/^[\x21-\x7e]{16,256}$/.test(token)) {
+    throw new ConfigurationError("WEB_TOKEN must be 16-256 printable characters without spaces");
+  }
+  const host = env.CONSOLE_HOST?.trim() || "0.0.0.0";
+  if (!isIP(host)) throw new ConfigurationError("CONSOLE_HOST must be an IP literal");
+  const webDir = resolve(env.CONSOLE_WEB_DIR?.trim() || "dashboard/web");
+  return {
+    host,
+    // 0 asks the OS for an ephemeral port, which the acceptance tests use; a deployment pins one.
+    port: boundedInteger(env, "CONSOLE_PORT", 8787, 0, 65_535),
+    token,
+    webDir,
+    maxBots: boundedInteger(env, "CONSOLE_MAX_BOTS", 8, 1, 64),
+  };
 }

@@ -5,8 +5,5 @@
   "composeProject": "aster-test",
   "volumes": {
     "app": "aster-test-app-data"
-  },
-  "identity": {
-    "botId": "1000000001"
   }
 }

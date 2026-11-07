@@ -58,7 +58,7 @@ MCP server 通过 `DATA_DIR/mcp.json`（或 `MCP_CONFIG`）接入，无需改代
 
 运行中改配置不会立即生效，需重启。空闲重启时 pin 集合变化会结束当前上下文周期并增加一次声明 epoch。历史记录、记忆、已完成请求和已有加载序号保留。若有未完成工作（包括已写入记忆快照但尚未提交输入的请求），保留上次结算的 pin（即使新预算更小），待恢复完成后再次空闲重启才应用新配置。取消 pin 设为 `false` 或删除该项。此前已由搜索加载的工具仍按原生已加载集保留。彻底禁用连接需删除 server。详细契约见 [契约与生命周期](contracts-and-lifecycle.md)。
 
-MCP 工具默认定级 `write`，不采信远端 annotations 的只读声明。所有者确认工具用途后，可按精确注册名配置 `authz: "read"`。此选项可单独使用，也可与 `pin` 合用，重启后生效。pin 只决定是否常驻，不授予权限。当前 Telegram 入口只接收所有者请求，拥有 read／write 全权。宿主 API 预留 `toolAuthority: "restricted"`，该实例及其恢复和嵌套调用只允许 read 工具。每次实际执行前复核注册、可用状态和授权。拒绝调用不发送外部请求。复核决定及原因码以 `tool_review` JSON 行写入 stderr，不含工具参数或结果。
+MCP 工具默认定级 `write`，不采信远端 annotations 的只读声明。所有者确认工具用途后，可按精确注册名配置 `authz: "read"`。此选项可单独使用，也可与 `pin` 合用，重启后生效。pin 只决定是否常驻，不授予权限。当前 dashboard 控制台入口默认要求 `WEB_TOKEN`（`WEB_AUTH=token`）；仅当宿主显式设置 `WEB_AUTH=off` 且控制台只经回环／隧道边界可达时才免除令牌校验。请求来自单一所有者，宿主默认授予 read／write 全权。宿主 API 预留 `toolAuthority: "restricted"`，该实例及其恢复和嵌套调用只允许 read 工具。每次实际执行前复核注册、可用状态和授权。拒绝调用不发送外部请求。复核决定及原因码以 `tool_review` JSON 行写入 stderr，不含工具参数或结果。
 
 MCP 调用一律按不可重放处理（`replay: "unsafe"`，见 [ADR-0008](adr/0008-unsafe-tool-replay.md)）。进程中断后不自动重跑，避免重复外部副作用。启动时连不上的 server 只记录错误码并跳过。连接关闭时已发送的调用仍可能返回 `MCP_CLOSED`。当前 SDK 只公开最终关闭事件，关闭后需重启建立新连接。HTTP SSE 的内部重连不提供健康事件。本应用不增加探活或自动重连策略，具体边界见 [契约与生命周期](contracts-and-lifecycle.md)。
 
@@ -76,7 +76,7 @@ GitHub 使用官方托管 HTTP MCP、OpenBao 占位 PAT 与宿主四层只读策
 npm run build && node dist/src/check-config.js
 ```
 
-连接冒烟测试（逐个连接、列出工具名后关闭，不启动 Telegram 与模型）：
+连接冒烟测试（逐个连接、列出工具名后关闭，不启动控制台与模型）：
 
 ```sh
 npm run build && npm run mcp:check

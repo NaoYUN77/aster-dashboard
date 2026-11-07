@@ -8,6 +8,11 @@ import { ConfigurationError } from "../errors.js";
 export const PTC_JOB_ID_PATTERN = /^ptc-[a-f0-9]{32}$/;
 
 export type PtcConfig = {
+  /**
+   * `bwrap` derives isolation per command on the host; `container` means the whole agent already
+   * runs inside the deployment's sandbox container, which supplies the namespaces and limits.
+   */
+  readonly isolation: "bwrap" | "container";
   readonly workspaceRoot: string;
   readonly sharedWorkspace: string | undefined;
   readonly sharedWorkspaceMode: "none" | "ro" | "rw";
@@ -116,6 +121,10 @@ export function readPtcConfig(env: NodeJS.ProcessEnv = process.env): PtcConfig |
   const directTmpRoot = env.PTC_DIRECT_TMP_ROOT === undefined || env.PTC_DIRECT_TMP_ROOT === ""
     ? tmpdir()
     : absolutePath(env, "PTC_DIRECT_TMP_ROOT", "");
+  const isolation = env.PTC_ISOLATION ?? "bwrap";
+  if (isolation !== "bwrap" && isolation !== "container") {
+    throw new ConfigurationError("PTC_ISOLATION must be bwrap or container");
+  }
   const allowDegraded = env.PTC_ALLOW_DEGRADED === "1";
   if (env.PTC_ALLOW_DEGRADED !== undefined && env.PTC_ALLOW_DEGRADED !== "0" && !allowDegraded) {
     throw new ConfigurationError("PTC_ALLOW_DEGRADED must be 0 or 1");
@@ -133,14 +142,18 @@ export function readPtcConfig(env: NodeJS.ProcessEnv = process.env): PtcConfig |
   const appRoot = env.PTC_APP_ROOT ?? findAppRoot(runnerEntry);
 
   return {
+    isolation,
     workspaceRoot: absolutePath(env, "PTC_WORKSPACE_ROOT", "/home/aster/jobs"),
     sharedWorkspace,
     sharedWorkspaceMode: mode,
     directEnabled,
     directTmpRoot,
-    cgroupRoot: env.PTC_CGROUP_ROOT === undefined || env.PTC_CGROUP_ROOT === ""
-      ? defaultCgroupRoot()
-      : absolutePath(env, "PTC_CGROUP_ROOT", ""),
+    // Container mode never creates a cgroup: the container's own limits are the only ones.
+    cgroupRoot: isolation === "container"
+      ? env.PTC_CGROUP_ROOT === undefined || env.PTC_CGROUP_ROOT === "" ? "" : absolutePath(env, "PTC_CGROUP_ROOT", "")
+      : env.PTC_CGROUP_ROOT === undefined || env.PTC_CGROUP_ROOT === ""
+        ? defaultCgroupRoot()
+        : absolutePath(env, "PTC_CGROUP_ROOT", ""),
     cgroupMemoryMaxBytes: integer(env, "PTC_CGROUP_MEMORY_MAX_BYTES", 512 * 1024 * 1024, 16 * 1024 * 1024, 8 * 1024 * 1024 * 1024),
     cgroupPidsMax: integer(env, "PTC_CGROUP_PIDS_MAX", 128, 8, 4_096),
     cgroupCpuMax: `${cpuParts[0]} ${cpuParts[1]}`,

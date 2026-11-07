@@ -5,8 +5,5 @@
   "composeProject": "aster-production",
   "volumes": {
     "app": "personal-agent-data"
-  },
-  "identity": {
-    "botId": "1000000002"
   }
 }

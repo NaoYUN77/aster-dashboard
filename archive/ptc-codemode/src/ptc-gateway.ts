@@ -343,6 +343,11 @@ export type PtcGatewayOptions = {
    * one. The owner closes it; the gateway must not close a connection it does not own.
    */
   readonly client?: RpcExecutionClient;
+  /**
+   * The virtual directory the calling conversation works in. A same-host sandbox roots the PTC
+   * session there (`/workspaces/<bot>`); the legacy agent ignores it and derives the job workspace.
+   */
+  readonly cwd?: (conversationId: ConversationId) => string | undefined;
   /** Test seam; production connects with mutual TLS or the host socket. */
   readonly connect?: (config: RpcClientConfig) => Promise<RpcExecutionClient>;
   readonly now?: () => number;
@@ -422,11 +427,13 @@ export class PtcGateway {
       context,
     );
     const sessionId = randomBytes(8).toString("hex");
+    const cwd = this.#options.cwd?.(api.conversationId);
     let opened = false;
     try {
       const openedSession = await client.openSession(sessionId, {
         jobId,
         workspaceReady: job.workspaceReady,
+        ...(cwd === undefined ? {} : { cwd }),
         ...(context.abortSignal === undefined ? {} : { signal: context.abortSignal }),
       });
       opened = true;

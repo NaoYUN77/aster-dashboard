@@ -1,10 +1,10 @@
+import { mkdir, stat } from "node:fs/promises";
 import { createSecureContext } from "node:tls";
 import { ConfigurationError } from "../errors.js";
 import { describeRpcAgentConfig, readRpcAgentConfig, readTlsMaterial } from "./rpc-config.js";
-import { probePtcRuntime, type PtcRuntimeProbe } from "./ptc-cgroup.js";
-import { readPtcConfig } from "./ptc-config.js";
-import { DirectExecutor } from "./direct-executor.js";
-import { PtcExecutor } from "./ptc-executor.js";
+import {
+  assertNotRoot, describeSharedHostConfig, readSharedHostConfig, SharedHostDirectHost,
+} from "./shared-host.js";
 import { startRpcAgent } from "./rpc-server.js";
 import { listenTlsRpc, listenUnixRpc, type RpcServer } from "./rpc-transport.js";
 
@@ -13,6 +13,13 @@ const USAGE = `Usage: node dist/src/execution/rpc-main.js [--check]
 Reads EXECUTION_AGENT_* from the environment. --check validates the bind address, limits, and
 TLS material without listening or executing anything. TCP mode requires a private or loopback IP
 and mutual TLS; Unix mode is intended for local tests or same-host deployments.
+
+Phase 1 shared host (single-user MVP): EXECUTION_AGENT_SHARED_HOST=1 serves Bash / Read / Write /
+Edit on one shared Computer / Execution Host with no OS-level isolation. It is the only supported
+execution surface; PTC / code mode was retired (see archive/ptc-codemode/README.md). The agent must
+run as a dedicated non-root user and does not start bwrap, cgroups or a QuickJS VM.
+EXECUTION_AGENT_WORKSPACES (required), EXECUTION_AGENT_TMP_ROOT, EXECUTION_AGENT_SHELL and
+EXECUTION_AGENT_PATH configure it.
 `;
 
 async function main(): Promise<void> {
@@ -21,32 +28,33 @@ async function main(): Promise<void> {
     return;
   }
   const config = readRpcAgentConfig();
-  const ptcConfig = readPtcConfig();
-  let ptc: PtcExecutor | undefined;
-  let direct: DirectExecutor | undefined;
-  let ptcChecks: Record<string, boolean | null> | undefined;
-  let directChecks: Record<string, boolean | null> | undefined;
-  let probe: PtcRuntimeProbe | undefined;
-  if (ptcConfig !== undefined) {
-    probe = await probePtcRuntime(ptcConfig);
-    ptc = new PtcExecutor({ config: ptcConfig, probe });
-    ptcChecks = await ptc.preflight();
-    // Direct sessions share the PTC runtime probe; they are only advertised when isolation,
-    // `/shared` and the per-session tmp root are all usable.
-    direct = new DirectExecutor({ config: ptcConfig, probe });
-    directChecks = await direct.preflight();
+  const shared = readSharedHostConfig();
+  if (shared === undefined) {
+    throw new ConfigurationError(
+      "EXECUTION_AGENT_SHARED_HOST=1 is required; the retired PTC / bwrap execution agent is no longer supported",
+    );
   }
+  assertNotRoot();
+  const ptcRaw = process.env.PTC_ENABLED?.trim();
+  if (ptcRaw !== undefined && ptcRaw !== "" && ptcRaw !== "0") {
+    throw new ConfigurationError(
+      "shared host mode is Phase 1 (Bash / Read / Write / Edit only); set PTC_ENABLED=0",
+    );
+  }
+  const info = await stat(shared.workspacesRoot).catch(() => undefined);
+  if (info === undefined || !info.isDirectory()) {
+    throw new ConfigurationError(`${shared.workspacesRoot} must be an existing directory owned by the execution user`);
+  }
+  await mkdir(shared.tmpRoot, { recursive: true, mode: 0o700 });
+  const direct = new SharedHostDirectHost(shared);
+  const directChecks = await direct.preflight();
   const checkReport = (): string => `${JSON.stringify({
     ...describeRpcAgentConfig(config),
-    // The cgroup reason is the operator's only clue when the unit's delegation is wrong; the
-    // booleans alone cannot say whether the root, the controllers or the migration was refused.
-    ...(ptcChecks === undefined ? {} : {
-      ptc: probe?.cgroupReason === undefined ? ptcChecks : { ...ptcChecks, cgroupReason: probe.cgroupReason },
-    }),
-    ...(directChecks === undefined ? {} : { direct: directChecks }),
+    sharedHost: describeSharedHostConfig(shared),
+    direct: directChecks,
   }, null, 2)}\n`;
   let server: RpcServer;
-  let transport: "unix" | "tls" = config.transport;
+  const transport: "unix" | "tls" = config.transport;
   if (config.transport === "unix") {
     if (config.socketPath === undefined) throw new ConfigurationError("EXECUTION_AGENT_UNIX_SOCKET is required");
     if (process.argv.includes("--check")) {
@@ -85,22 +93,6 @@ async function main(): Promise<void> {
       maxFrameBytes: config.maxFrameBytes,
       maxBufferedBytes: config.maxBufferedBytes,
     });
-    transport = "tls";
-  }
-  if (ptc !== undefined && !ptc.enabled) {
-    // Refusing to listen is the only fail-closed answer: a host that cannot isolate must not
-    // advertise the Phase 1 surface at all.
-    throw new ConfigurationError(
-      "PTC is enabled but this host cannot provide bwrap, user namespaces and cgroup v2 (or an explicitly allowed degraded fallback)"
-        + (probe?.cgroupReason === undefined ? "" : `: ${probe.cgroupReason}`),
-    );
-  }
-  if (direct !== undefined && ptcConfig?.directEnabled === true && !direct.enabled) {
-    // A gateway would otherwise open direct sessions that fail per request; refuse to advertise it.
-    throw new ConfigurationError(
-      "PTC_DIRECT_ENABLED is set but this host cannot provide bwrap, user namespaces, cgroup v2, a readable shared workspace and a writable tmp root"
-        + (probe?.cgroupReason === undefined ? "" : `: ${probe.cgroupReason}`),
-    );
   }
   const agent = startRpcAgent({
     server,
@@ -110,9 +102,9 @@ async function main(): Promise<void> {
     maxConcurrent: config.maxConcurrent,
     sessionTtlMs: config.sessionTtlMs,
     heartbeatMs: config.heartbeatMs,
-    testExecutorEnabled: config.testExecutorEnabled,
-    ...(ptc === undefined ? {} : { ptc }),
-    ...(direct === undefined ? {} : { direct }),
+    // The shared host is a Phase 1 production surface: no Phase 0 test executor is advertised.
+    testExecutorEnabled: false,
+    direct,
   });
   const address = server.address();
   const target = "path" in address ? address.path : `${address.host}:${address.port}`;
@@ -122,7 +114,7 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     agent.close()
-      .then(() => direct?.closeAll())
+      .then(() => direct.closeAll())
       .then(() => process.exit(0), () => process.exit(1));
   };
   process.once("SIGINT", stop);

@@ -9,6 +9,7 @@ import {
 import { CODEMODE_TOOL_NAME, createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { CodemodeSandbox, type CodemodeSandboxBase } from "@earendil-works/pi-codemode";
 import { CODEMODE_OPTIONS_PREFIX } from "@earendil-works/pi-codemode/source";
+import type { ConversationId } from "@earendil-works/pi-durable";
 import type { CodemodeConfig } from "./config.js";
 import type { RpcExecutionClient } from "./execution/rpc-client.js";
 import { loopSignature } from "./loop-guard.js";
@@ -284,7 +285,16 @@ export function serializeNestedCalls(
  * nested tool call is bridged back to the host through one PTC session per code mode call. `client`
  * lets the agent share its already connected RPC client; the gateway then never closes it.
  */
-export function createCodemodeHost(config: CodemodeConfig, client?: RpcExecutionClient): CodemodeHost {
+export type CodemodeHostOptions = {
+  /** The conversation's directory, so a same-host sandbox roots a PTC session in the bot workspace. */
+  readonly cwd?: (conversationId: ConversationId) => string | undefined;
+};
+
+export function createCodemodeHost(
+  config: CodemodeConfig,
+  client?: RpcExecutionClient,
+  options: CodemodeHostOptions = {},
+): CodemodeHost {
   let sandbox: CodemodeSandboxBase;
   let gateway: PtcGateway | undefined;
   if (config.ptc === undefined) {
@@ -304,6 +314,7 @@ export function createCodemodeHost(config: CodemodeConfig, client?: RpcExecution
       defaultTimeoutSeconds: config.ptc.defaultTimeoutSeconds,
       maxTimeoutSeconds: config.ptc.maxTimeoutSeconds,
       ...(client === undefined ? {} : { client }),
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     });
   }
   const base = createCodemodeExtension({ sandbox, models: false });

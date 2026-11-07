@@ -1,10 +1,10 @@
 // Bounded file primitives for remote execution.
 //
 // Interface
-//   PtcFileService.info/exists/canonical          metadata without opening the file
-//   PtcFileService.open/read/scanLines/close      one contiguous byte scan over an open handle
-//   PtcFileService.readText/write                 bounded whole-file reads and atomic writes
-//   PtcFileService.closeSession/closeAll          release handles with their owner
+//   FileService.info/exists/canonical          metadata without opening the file
+//   FileService.open/read/scanLines/close      one contiguous byte scan over an open handle
+//   FileService.readText/write                 bounded whole-file reads and atomic writes
+//   FileService.closeSession/closeAll          release handles with their owner
 //
 // Inputs: virtual roots mapped to host directories (`/workspace`, `/shared`, `/tmp`) and a session
 // key that owns every opened handle. Paths are POSIX-shaped virtual paths; the service maps them to
@@ -56,7 +56,7 @@ export class FileServiceError extends Error {
   }
 }
 
-export type PtcFileRoot = {
+export type FileRoot = {
   /** Absolute virtual path; `/` itself is refused because it would expose the host root. */
   readonly virtual: string;
   /** Absolute host directory the virtual root maps to. */
@@ -64,15 +64,15 @@ export type PtcFileRoot = {
   readonly writable: boolean;
 };
 
-export type PtcFileServiceOptions = {
-  readonly roots: readonly PtcFileRoot[];
+export type FileServiceOptions = {
+  readonly roots: readonly FileRoot[];
   readonly maxHandles?: number;
   readonly readChunkBytes?: number;
   readonly maxWriteBytes?: number;
   readonly maxReadTextBytes?: number;
 };
 
-type ResolvedRoot = PtcFileRoot & {
+type ResolvedRoot = FileRoot & {
   readonly realHost: string;
   readonly realPrefix: string;
 };
@@ -194,11 +194,11 @@ function safeBase64(value: string): Buffer {
 }
 
 /**
- * One service instance owns one virtual namespace. The agent uses one for direct sessions and each
- * PTC runner uses one for its own sandbox; handles never cross a service or a session.
+ * One service instance owns one virtual namespace. The shared execution host creates one per
+ * direct session; handles never cross a service or a session.
  */
-export class PtcFileService {
-  readonly #roots: readonly PtcFileRoot[];
+export class FileService {
+  readonly #roots: readonly FileRoot[];
   readonly #maxHandles: number;
   readonly #readChunkBytes: number;
   readonly #maxWriteBytes: number;
@@ -206,7 +206,7 @@ export class PtcFileService {
   readonly #handles = new Map<string, Handle>();
   #rootCache: Promise<readonly ResolvedRoot[]> | undefined;
 
-  constructor(options: PtcFileServiceOptions) {
+  constructor(options: FileServiceOptions) {
     if (options.roots.length === 0) {
       throw new Error("a file service needs at least one root");
     }

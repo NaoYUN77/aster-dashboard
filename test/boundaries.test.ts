@@ -1,276 +1,314 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { SessionFailed } from "@earendil-works/pi-durable";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import { GrammyError } from "grammy";
-import type { Update } from "grammy/types";
-import { Inbox } from "../src/inbox.js";
+import { Inbox, consoleRequestBot, consoleRequestPrefix, isBotId, parseBotTools } from "../src/inbox.js";
+import { parseCatalogProfile } from "../src/tool-catalog.js";
 import { StateError } from "../src/errors.js";
 import { readConfig } from "../src/config.js";
 import { createProviderModels, PROVIDERS, requireModel } from "../src/providers.js";
 import { splitReply } from "../src/messages.js";
-import { serveTelegram, toRequest } from "../src/telegram.js";
+import type { TextRequest } from "../src/messages.js";
 
-const update: Update = {
-  update_id: 12,
-  message: {
-    message_id: 7, date: 1, text: "hello",
-    chat: { id: 42, type: "private", first_name: "Owner" },
-    from: { id: 42, is_bot: false, first_name: "Owner" },
-  },
+// Frozen historical expectations, independent of current bootstrap defaults and migration code.
+// Retired PTC/reminders keys stay present but off: the migration always writes them as false.
+const migratedBase = {
+  core: true, shell: true, files: true, web: false, ptc: false,
+  memory: true, reminders: false, mcp: true,
 };
-const request = toRequest(update, "42", "99")!;
 
-test("Telegram boundary admits only owner private text and namespaces identifiers", () => {
-  assert.deepEqual(request, {
-    requestId: "telegram:99:12", conversationId: "42", senderId: "42", text: "hello",
-  });
-  assert.equal(toRequest(update, "43", "99"), undefined);
-  assert.equal(toRequest({ ...update, message: { ...update.message!, chat: { id: -1, type: "group", title: "Group" } } }, "42", "99"), undefined);
-  assert.notEqual(toRequest(update, "42", "100")!.requestId, request.requestId);
-});
+/** A well-formed console request. The id suffix must be 8-64 URL-safe characters. */
+function consoleRequest(botId: string, id: string, text = "hello"): TextRequest {
+  return { requestId: `console:${botId}:${id}`, conversationId: botId, senderId: "console", text };
+}
 
-test("reply chunking preserves text including Unicode surrogate pairs", () => {
-  const text = "你".repeat(3999) + "😀" + "a".repeat(8000);
-  const chunks = splitReply(text);
-  assert.equal(chunks.join(""), text);
-  assert.ok(chunks.every((chunk) => chunk.length <= 4000 && chunk.isWellFormed()));
-});
-
-test("inbox rejects identity and request-content conflicts without advancing offset", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-inbox-"));
-  const inbox = new Inbox(join(directory, "inbox.sqlite"));
+function assertNoLegacyColumn(path: string): void {
+  const raw = new DatabaseSync(path);
   try {
-    inbox.bindIdentity("99", "42");
-    // Operator-facing: the startup log prints this message instead of a generic failure code.
-    assert.throws(() => inbox.bindIdentity("100", "42"), StateError);
-    assert.throws(() => inbox.bindIdentity("99", "43"), StateError);
-    inbox.accept(13, request);
-    inbox.accept(13, request);
-    assert.throws(() => inbox.accept(14, { ...request, text: "different" }));
-    assert.equal(inbox.offset, 13);
-    // Telegram may reset the update sequence after a week without updates.
-    inbox.accept(2);
-    assert.equal(inbox.offset, 2);
-  } finally {
-    inbox.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
+    assert.ok(raw.prepare("PRAGMA table_info(bots)").all().every((column) => (column as { name: string }).name !== "role"));
+  } finally { raw.close(); }
+}
 
-test("restart preserves confirmed segments and quarantines only the interrupted send", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-inbox-"));
+test("legacy bot rows convert to switches and physically drop the old column", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-bot-profile-migration-"));
   const path = join(directory, "inbox.sqlite");
-  let inbox = new Inbox(path);
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE bots (
+    botId TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, conversationId TEXT NOT NULL UNIQUE,
+    systemPrompt TEXT NOT NULL, tools TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', createdAt TEXT NOT NULL
+  );`);
+  const insert = legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, 'active', ?)");
+  for (const role of ["assistant", "researcher", "programmer"]) {
+    insert.run(role, role, role, role, "kept prompt", "bash,files", "2026-11-06T00:00:00.000Z");
+  }
+  legacy.close();
+  let inbox: Inbox | undefined;
   try {
-    inbox.accept(13, request);
-    inbox.saveReply(request.requestId, "a".repeat(8001));
-    inbox.beginPart(request.requestId, 0);
-    inbox.confirmPart(request.requestId, 0, "101");
-    inbox.beginPart(request.requestId, 1);
-    inbox.close();
     inbox = new Inbox(path);
-    inbox.recover();
-    assert.equal(inbox.offset, 13);
-    assert.equal(inbox.next(), undefined);
-    assert.equal(inbox.blocked()[0]?.part, 1);
-    assert.equal(inbox.nextPart(request.requestId)?.part, 2);
-    inbox.resolvePart(request.requestId, 1, "retry");
-    assert.equal(inbox.nextPart(request.requestId)?.part, 1);
-    inbox.beginPart(request.requestId, 1);
-    inbox.confirmPart(request.requestId, 1, "102");
-    inbox.beginPart(request.requestId, 2);
-    inbox.confirmPart(request.requestId, 2, "103");
-    assert.equal(inbox.next(), undefined);
-    assert.equal(inbox.blocked().length, 0);
+    assert.deepEqual(inbox.bot("assistant")?.profile, migratedBase);
+    assert.deepEqual(inbox.bot("researcher")?.profile, { ...migratedBase, web: true });
+    // "programmer" no longer grants the retired PTC group; it maps to the base profile.
+    assert.deepEqual(inbox.bot("programmer")?.profile, migratedBase);
+    for (const bot of inbox.bots()) {
+      assert.equal(Object.hasOwn(bot, "role"), false);
+      assert.equal(bot.toolScope, '{"allow":[],"deny":[]}');
+    }
+    assertNoLegacyColumn(path);
   } finally {
-    inbox.close();
+    inbox?.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("reconciling partial delivery sends stored remainder without rerunning agent", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-delivery-"));
-  const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
-  let executions = 0;
-  const firstShutdown = new AbortController();
-  const sent: string[] = [];
+test("stored profiles take precedence and survive reopening after the old column is removed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-bot-switch-migration-"));
+  const path = join(directory, "inbox.sqlite");
+  const custom = parseCatalogProfile({ ...migratedBase, shell: false, web: true, ptc: true, mcp: false });
+  const scope = { allow: ["web_search"], deny: ["web_fetch"] };
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE bots (
+    botId TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, conversationId TEXT NOT NULL UNIQUE,
+    systemPrompt TEXT NOT NULL, tools TEXT NOT NULL, profile TEXT, toolScope TEXT,
+    status TEXT NOT NULL DEFAULT 'active', createdAt TEXT NOT NULL
+  );`);
+  const insert = legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)");
+  for (const [id, profile] of [["chief", "chief"], ["research", "research"], ["programmer", "programmer"], ["custom", JSON.stringify(custom)]]) {
+    // A valid stored profile must not depend on the obsolete column, even if it is invalid.
+    insert.run(id!, id!, id === "custom" ? "obsolete-invalid" : "assistant", id!, "kept prompt", "bash,files", profile!, JSON.stringify(scope), "2026-11-06T00:00:00.000Z");
+  }
+  legacy.close();
+  let inbox: Inbox | undefined;
   try {
-    inbox.accept(13, request);
-    await serveTelegram(config, "99", inbox, async () => { executions++; return "a".repeat(4000) + "remaining"; }, firstShutdown.signal, {
-      send: async (_chat, text) => {
-        if (sent.length === 1) throw new Error("lost response");
-        sent.push(text);
-        return "101";
-      },
-      updates: async () => { firstShutdown.abort(); return []; },
-    });
-    assert.equal(executions, 1);
-    assert.equal(inbox.blocked()[0]?.part, 1);
-    inbox.resolvePart(request.requestId, 1, "retry");
-    const secondShutdown = new AbortController();
-    await serveTelegram(config, "99", inbox, async () => { throw new Error("must not rerun"); }, secondShutdown.signal, {
-      send: async (_chat, text) => { sent.push(text); return "102"; },
-      updates: async () => { secondShutdown.abort(); return []; },
-    });
-    assert.deepEqual(sent, ["a".repeat(4000), "remaining"]);
-    assert.equal(executions, 1);
-    assert.equal(inbox.blocked().length, 0);
+    for (let reopen = 0; reopen < 2; reopen++) {
+      inbox = new Inbox(path);
+      assert.deepEqual(inbox.bot("chief")?.profile, migratedBase);
+      assert.deepEqual(inbox.bot("research")?.profile, { ...migratedBase, web: true });
+      assert.deepEqual(inbox.bot("programmer")?.profile, migratedBase);
+      assert.deepEqual(inbox.bot("custom")?.profile, custom);
+      for (const bot of inbox.bots()) {
+        assert.equal(Object.hasOwn(bot, "role"), false);
+        assert.equal(bot.tools, "bash,files");
+        assert.equal(bot.systemPrompt, "kept prompt");
+        assert.equal(bot.conversationId, bot.botId);
+        assert.deepEqual(JSON.parse(bot.toolScope), scope);
+        assert.equal(bot.createdAt, "2026-11-06T00:00:00.000Z");
+      }
+      assertNoLegacyColumn(path);
+      inbox.close(); inbox = undefined;
+    }
+    const raw = new DatabaseSync(path);
+    assert.equal((raw.prepare("SELECT profile FROM bots WHERE botId = 'custom'").get() as { profile: string }).profile, JSON.stringify(custom));
+    raw.prepare("UPDATE bots SET profile = ? WHERE botId = 'custom'").run('{"shell":"yes"}');
+    raw.close();
+    inbox = new Inbox(path);
+    assert.throws(() => inbox!.bot("custom"), /must be a boolean/);
   } finally {
-    inbox.close();
+    inbox?.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("inbox keeps identical text under different request IDs as separate requests", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-duplicate-"));
-  const inbox = new Inbox(join(directory, "inbox.sqlite"));
+test("invalid legacy data rolls back earlier conversions and retains the old column for repair", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-bot-migration-rollback-"));
   try {
-    inbox.accept(1, { ...request, requestId: "telegram:99:1" });
-    inbox.accept(2, { ...request, requestId: "telegram:99:2" });
-    const first = inbox.next();
-    inbox.saveReply(first!.requestId, "first");
-    inbox.beginPart(first!.requestId, 0);
-    inbox.confirmPart(first!.requestId, 0, "1");
-    assert.equal(inbox.next()?.requestId, "telegram:99:2");
-  } finally {
-    inbox.close();
-    await rm(directory, { recursive: true, force: true });
-  }
+    for (const [index, bad] of [
+      { role: "unknown", profile: null, scope: null },
+      { role: "assistant", profile: '{"shell":"yes"}', scope: null },
+      { role: "assistant", profile: "chief", scope: '{"allow":42}' },
+    ].entries()) {
+      const path = join(directory, `${index}.sqlite`);
+      const legacy = new DatabaseSync(path);
+      legacy.exec(`CREATE TABLE bots (
+        botId TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, conversationId TEXT NOT NULL UNIQUE,
+        systemPrompt TEXT NOT NULL, tools TEXT NOT NULL, profile TEXT, toolScope TEXT,
+        status TEXT NOT NULL DEFAULT 'active', createdAt TEXT NOT NULL
+      );`);
+      const insert = legacy.prepare("INSERT INTO bots VALUES (?, ?, ?, ?, '', 'bash,files', ?, ?, 'active', '2026-11-06T00:00:00.000Z')");
+      insert.run("first", "First", "researcher", "1", null, null);
+      insert.run("bad", "Bad", bad.role, "2", bad.profile, bad.scope);
+      const before = legacy.prepare("SELECT * FROM bots").all();
+      legacy.close();
+      assert.throws(() => new Inbox(path), /catalog profile|tool scope/);
+      const raw = new DatabaseSync(path);
+      try {
+        assert.ok(raw.prepare("PRAGMA table_info(bots)").all().some((column) => (column as { name: string }).name === "role"));
+        assert.deepEqual(raw.prepare("SELECT * FROM bots").all(), before);
+        raw.prepare("UPDATE bots SET profile = ?, toolScope = ? WHERE botId = 'bad'").run(JSON.stringify(migratedBase), '{"allow":[],"deny":[]}');
+      } finally { raw.close(); }
+      const repaired = new Inbox(path);
+      try {
+        assert.deepEqual(repaired.bot("first")?.profile, { ...migratedBase, web: true });
+        assertNoLegacyColumn(path);
+      } finally { repaired.close(); }
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("configuration failures name the missing or invalid setting", () => {
-  assert.throws(() => readConfig({}), /Missing configuration: TELEGRAM_OWNER_ID/);
-  assert.throws(() => readConfig({ TELEGRAM_OWNER_ID: "not-a-number" }), /positive numeric user ID/);
-  assert.throws(() => readConfig({ TELEGRAM_OWNER_ID: "42" }), /Missing configuration: MODEL_PROVIDER/);
-  assert.throws(() => readConfig({ TELEGRAM_OWNER_ID: "42", MODEL_PROVIDER: "other" }), /MODEL_PROVIDER must be one of: anthropic, openai/);
-  assert.throws(() => readConfig({ TELEGRAM_OWNER_ID: "42", MODEL_PROVIDER: "openai" }), /Missing configuration: OPENAI_API_KEY/);
-  assert.throws(() => readConfig({
-    TELEGRAM_OWNER_ID: "42", MODEL_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "key",
-  }), /Missing configuration: TELEGRAM_BOT_TOKEN/);
-});
-
-test("the provider registry only names providers shipped with pi-ai", () => {
-  const builtin = new Set(builtinProviders().map((provider) => provider.id));
-  for (const [id, entry] of Object.entries(PROVIDERS)) {
-    assert.ok(builtin.has(id), `registered provider ${id} is not built into pi-ai`);
-    assert.match(entry.apiKeyEnv, /^[A-Z0-9_]+_API_KEY$/, `${id} must name an API-key variable`);
-  }
-});
-
-test("a registered provider requires only its own API key", () => {
-  const config = readConfig({
-    TELEGRAM_BOT_TOKEN: "token",
-    TELEGRAM_OWNER_ID: "42",
-    MODEL_PROVIDER: "deepseek",
-    MODEL_ID: "deepseek-flash",
-    DEEPSEEK_API_KEY: "secret",
-  });
-  assert.equal(config.provider, "deepseek");
-  assert.equal(config.webApiKey, undefined);
-  assert.equal(readConfig({
-    TELEGRAM_BOT_TOKEN: "token", TELEGRAM_OWNER_ID: "42", MODEL_PROVIDER: "deepseek",
-    MODEL_ID: "deepseek-flash", DEEPSEEK_API_KEY: "secret", DEEPSEEK_WEB_API_KEY: " web-secret ",
-  }).webApiKey, "web-secret");
-  assert.throws(() => readConfig({
-    TELEGRAM_BOT_TOKEN: "token", TELEGRAM_OWNER_ID: "42", MODEL_PROVIDER: "deepseek", MODEL_ID: "deepseek-flash",
-  }), /Missing configuration: DEEPSEEK_API_KEY/);
-});
-
-test("an unknown model id is rejected with provider examples", () => {
-  assert.throws(
-    () => requireModel(createProviderModels("deepseek"), "deepseek", "not-a-model"),
-    /Unknown MODEL_ID "not-a-model" for MODEL_PROVIDER=deepseek; examples: /,
-  );
-});
-
-test("oversized input is refused explicitly instead of being silently dropped", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-input-limit-"));
-  const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
+test("new databases register bots with required switches and reject obsolete fields", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-bot-new-schema-"));
+  const path = join(directory, "inbox.sqlite");
+  const inbox = new Inbox(path);
+  const registration = { botId: "new", name: "New", conversationId: "1", systemPrompt: "", tools: "bash,files", profile: migratedBase };
   try {
-    inbox.accept(1, { ...request, text: "x".repeat(16_001) });
-    const shutdown = new AbortController();
-    const sent: string[] = [];
-    let executions = 0;
-    await serveTelegram(config, "99", inbox, async () => { executions++; return "must not run"; }, shutdown.signal, {
-      send: async (_chat, text) => { sent.push(text); return "1"; },
-      updates: async () => { shutdown.abort(); return []; },
-    });
-    assert.equal(executions, 0);
-    assert.equal(sent.length, 1);
-    assert.match(sent[0]!, /消息过长/);
+    assertNoLegacyColumn(path);
+    const { profile: _profile, ...missing } = registration;
+    assert.throws(() => inbox.createBot(missing as Parameters<Inbox["createBot"]>[0]), /catalog profile/);
+    assert.throws(() => inbox.ensureBot({ ...registration, role: "assistant" } as Parameters<Inbox["ensureBot"]>[0]), /unknown fields/);
+    assert.throws(() => inbox.createBot({ ...registration, role: "assistant" } as Parameters<Inbox["createBot"]>[0]), /unknown fields/);
+    const bot = inbox.createBot(registration);
+    assert.equal(Object.hasOwn(bot, "role"), false);
+    inbox.setBotCatalog(bot.botId, { ...migratedBase, web: true }, { allow: ["web_search"], deny: [] });
+    assert.deepEqual(inbox.bot(bot.botId)?.profile, { ...migratedBase, web: true });
   } finally {
     inbox.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("manual confirmation marks only the named segment sent and continues with later parts", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-confirm-"));
-  const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  try {
-    inbox.accept(13, request);
-    inbox.saveReply(request.requestId, "a".repeat(4001) + "b".repeat(4001) + "tail");
-    inbox.beginPart(request.requestId, 0);
-    inbox.confirmPart(request.requestId, 0, "101");
-    inbox.beginPart(request.requestId, 1);
-    inbox.failPart(request.requestId, 1, "uncertain", "TIMEOUT");
-    inbox.resolvePart(request.requestId, 1, "sent");
-    assert.equal(inbox.nextPart(request.requestId)?.part, 2);
-    assert.equal(inbox.next()?.status, "ready", "the request stays ready for the remaining part, not pending");
-    assert.equal(inbox.blocked().length, 0);
-  } finally {
-    inbox.close();
-    await rm(directory, { recursive: true, force: true });
-  }
+test("console request ids name their bot and are validated at the boundary", () => {
+  assert.equal(consoleRequestPrefix("bot-one"), "console:bot-one:");
+  assert.throws(() => consoleRequestPrefix("Bad_Id"), StateError);
+  assert.equal(consoleRequestBot("console:bot-one:req-00000001"), "bot-one");
+  assert.equal(consoleRequestBot("telegram:99:12"), undefined, "a legacy Telegram id is not a console request");
+  assert.equal(consoleRequestBot("console:bot-one:short"), undefined, "an id shorter than 8 chars is refused");
+  assert.equal(consoleRequestBot("console:BAD:req-00000001"), undefined, "bot ids are lowercase");
 });
 
-test("inbox timestamps record when a request arrived, was answered, and was last attempted", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-timestamps-"));
+test("bot tool lists are validated, normalized and keep the retired ptc compatibility value", () => {
+  assert.equal(parseBotTools("web,bash,bash"), "bash,web");
+  assert.equal(parseBotTools("files, ptc"), "files,ptc");
+  assert.throws(() => parseBotTools("bash,unknown"), /Unknown bot tool/);
+  assert.throws(() => parseBotTools(42), StateError);
+  assert.equal(isBotId("bot-one"), true);
+  assert.equal(isBotId("Bad"), false);
+  assert.equal(isBotId(""), false);
+});
+
+test("the console ingress accepts only console-addressed requests and rejects content conflicts", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-console-accept-"));
   const inbox = new Inbox(join(directory, "inbox.sqlite"));
   try {
-    inbox.accept(1, request);
-    const received = inbox.next();
-    assert.ok(received?.receivedAt, "receivedAt is set when the request is accepted");
-    assert.equal(received.repliedAt, null);
-    assert.ok(!Number.isNaN(Date.parse(received.receivedAt!)));
+    const request = consoleRequest("alpha", "req-00000001");
+    inbox.acceptConsole(request);
+    inbox.acceptConsole(request); // A duplicate accept is idempotent (INSERT OR IGNORE).
+    assert.equal(inbox.pendingForBot("alpha"), 1, "a retry never creates a second request");
 
-    inbox.saveReply(request.requestId, "hello back");
-    const replied = inbox.next();
-    assert.equal(replied?.repliedAt?.startsWith(received.receivedAt!.slice(0, 10)), true);
-    assert.ok(Date.parse(replied.repliedAt!) >= Date.parse(received.receivedAt!));
-
-    const part = inbox.nextPart(request.requestId);
-    assert.ok(part?.createdAt, "delivery parts carry their creation time");
-    assert.ok(part.updatedAt);
-    inbox.beginPart(request.requestId, 0);
-    const sending = inbox.nextPart(request.requestId);
-    assert.equal(sending, undefined, "beginPart moved the part out of pending");
-    inbox.failPart(request.requestId, 0, "failed", "TELEGRAM_400");
-    const [blocked] = inbox.blocked() as { receivedAt: string; updatedAt: string }[];
-    assert.ok(blocked?.updatedAt, "the attempt time survives on a blocked delivery");
-    assert.ok(Date.parse(blocked.updatedAt) >= Date.parse(part.updatedAt!));
+    assert.throws(() => inbox.acceptConsole({ ...request, senderId: "telegram" }), StateError);
+    assert.throws(() => inbox.acceptConsole({ ...request, requestId: "telegram:99:12" }), StateError);
+    assert.throws(() => inbox.acceptConsole({ ...request, text: "different" }), /Request ID reused with different content/);
+    assert.throws(() => inbox.acceptConsole({ ...request, conversationId: "other" }), /Request ID reused with different content/);
+    assert.equal(inbox.pendingForBot("alpha"), 1, "rejected inputs never add a row");
   } finally {
     inbox.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("opening a database written before timestamps keeps the old rows unknown", async () => {
+test("each bot has its own ordered console queue and identical text stays separate", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-console-queue-"));
+  const inbox = new Inbox(join(directory, "inbox.sqlite"));
+  try {
+    inbox.acceptConsole(consoleRequest("alpha", "req-00000001", "same"));
+    inbox.acceptConsole(consoleRequest("beta", "req-00000001", "b1"));
+    inbox.acceptConsole(consoleRequest("alpha", "req-00000002", "same"));
+    assert.equal(inbox.pendingForBot("alpha"), 2, "identical text under distinct ids stays two requests");
+    assert.equal(inbox.pendingForBot("beta"), 1);
+    assert.equal(inbox.pendingForBot("gamma"), 0);
+
+    const first = inbox.nextForBot("alpha");
+    assert.equal(first?.requestId, "console:alpha:req-00000001");
+    assert.equal(first?.text, "same");
+    assert.equal(first?.status, "pending");
+    assert.ok(first?.receivedAt, "a console request records its arrival time");
+    assert.equal(first?.repliedAt, null);
+    assert.equal(inbox.nextForBot("beta")?.text, "b1", "another bot's queue is independent");
+
+    inbox.saveConsoleReply(first!.requestId, "answer a1");
+    assert.equal(inbox.nextForBot("alpha")?.text, "same", "the next request in arrival order follows");
+    assert.equal(inbox.pendingForBot("alpha"), 1, "pendingForBot counts the remaining work only");
+  } finally {
+    inbox.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a console reply is terminal, creates no delivery row and records a failure code", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-console-reply-"));
+  const path = join(directory, "inbox.sqlite");
+  const inbox = new Inbox(path);
+  const ok = consoleRequest("alpha", "req-00000001");
+  const failed = consoleRequest("alpha", "req-00000002");
+  const blank = consoleRequest("alpha", "req-00000003");
+  try {
+    inbox.acceptConsole(ok);
+    inbox.acceptConsole(failed);
+    inbox.acceptConsole(blank);
+    inbox.saveConsoleReply(ok.requestId, "the answer");
+    inbox.saveConsoleReply(failed.requestId, "(no reply)", "AGENT_UNANSWERED");
+    inbox.saveConsoleReply(blank.requestId, "   ");
+
+    assert.throws(() => inbox.saveConsoleReply(ok.requestId, "again"), /Reply already saved or request missing/);
+    assert.throws(() => inbox.saveConsoleReply("console:alpha:req-99999999", "x"), /Reply already saved or request missing/);
+    assert.equal(inbox.nextForBot("alpha"), undefined, "sent requests never return to the queue");
+    assert.equal(inbox.pendingForBot("alpha"), 0);
+
+    const db = new DatabaseSync(path);
+    try {
+      const rows = db.prepare("SELECT requestId, status, reply, receivedAt, repliedAt FROM inbox ORDER BY requestId").all() as
+        { requestId: string; status: string; reply: string; receivedAt: string | null; repliedAt: string | null }[];
+      assert.equal(rows.length, 3);
+      assert.ok(rows.every((row) => row.status === "sent" && row.receivedAt && row.repliedAt));
+      assert.equal(rows.find((row) => row.requestId === ok.requestId)?.reply, "the answer");
+      assert.equal(rows.find((row) => row.requestId === blank.requestId)?.reply, "(no reply)", "an empty reply is explicit");
+      assert.equal((db.prepare("SELECT COUNT(*) AS count FROM deliveries").get() as { count: number }).count, 0,
+        "a console reply is terminal; no external delivery is created");
+      const failures = db.prepare("SELECT requestId, code FROM failures").all() as
+        { requestId: string; code: string }[];
+      assert.deepEqual(failures.map(({ requestId, code }) => ({ requestId, code })), [
+        { requestId: failed.requestId, code: "AGENT_UNANSWERED" },
+      ]);
+    } finally { db.close(); }
+  } finally {
+    inbox.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a withdrawn console request is terminal and never executed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pa-console-cancel-"));
+  const path = join(directory, "inbox.sqlite");
+  const inbox = new Inbox(path);
+  const request = consoleRequest("alpha", "req-00000001");
+  try {
+    inbox.acceptConsole(request);
+    assert.equal(inbox.cancelConsole(request.requestId), true);
+    assert.equal(inbox.cancelConsole(request.requestId), false, "cancelling twice is a no-op");
+    assert.equal(inbox.nextForBot("alpha"), undefined);
+    assert.equal(inbox.pendingForBot("alpha"), 0);
+    assert.throws(() => inbox.saveConsoleReply(request.requestId, "too late"), /Reply already saved or request missing/);
+    const db = new DatabaseSync(path);
+    try {
+      assert.equal((db.prepare("SELECT status FROM inbox WHERE requestId = ?").get(request.requestId) as { status: string }).status, "failed");
+    } finally { db.close(); }
+  } finally {
+    inbox.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("opening a pre-console database preserves legacy rows, tables and unknown timestamps", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-migrate-"));
   const path = join(directory, "inbox.sqlite");
-  // The schema as shipped before timestamps existed, including one already-delivered request.
+  // The schema as shipped before the console existed, including one already-delivered request.
   const legacy = new DatabaseSync(path);
   legacy.exec(`
     CREATE TABLE checkpoint (id INTEGER PRIMARY KEY CHECK (id = 1), offset INTEGER NOT NULL);
     INSERT INTO checkpoint VALUES (1, 5);
     CREATE TABLE identity (id INTEGER PRIMARY KEY CHECK (id = 1), botId TEXT NOT NULL, ownerId TEXT NOT NULL);
+    INSERT INTO identity VALUES (1, '99', '42');
     CREATE TABLE inbox (requestId TEXT PRIMARY KEY, conversationId TEXT NOT NULL, senderId TEXT NOT NULL,
       text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', reply TEXT);
     CREATE TABLE deliveries (requestId TEXT NOT NULL REFERENCES inbox(requestId) ON DELETE CASCADE,
@@ -283,288 +321,109 @@ test("opening a database written before timestamps keeps the old rows unknown", 
   legacy.close();
 
   const inbox = new Inbox(path);
-  let current: Inbox | undefined = inbox;
   try {
-    // Migration must not invent a time for a row the process never saw arrive.
-    assert.equal(inbox.offset, 5);
-    inbox.accept(6, { ...request, requestId: "telegram:99:5" });
-    const rows = new DatabaseSync(path);
-    try {
-      assert.equal(rows.prepare("SELECT receivedAt FROM inbox WHERE requestId = ?").get("telegram:99:4")?.["receivedAt"], null);
-      assert.equal(rows.prepare("SELECT createdAt FROM deliveries WHERE requestId = ?").get("telegram:99:4")?.["createdAt"], null);
-      assert.ok(rows.prepare("SELECT receivedAt FROM inbox WHERE requestId = ?").get("telegram:99:5")?.["receivedAt"]);
-    } finally {
-      rows.close();
-    }
-    // Reopening an already-migrated database must stay a no-op.
-    inbox.close();
-    current = new Inbox(path);
-    assert.equal(current.offset, 6);
-  } finally {
-    current?.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("prune retains the newest 100 sent requests and every unfinished request", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-prune-"));
-  const path = join(directory, "inbox.sqlite");
-  const inbox = new Inbox(path);
-  try {
-    // 120 completed requests: the oldest 20 must be pruned, including their deliveries and diagnostics.
-    for (let index = 0; index < 120; index++) {
-      const id = `telegram:99:${1000 + index}`;
-      inbox.accept(1000 + index, { ...request, requestId: id });
-      inbox.saveReply(id, `reply ${index}`, index === 0 ? "TEST_FAILURE" : undefined);
-      inbox.beginPart(id, 0);
-      inbox.confirmPart(id, 0, String(index));
-    }
-    const unfinished = ["telegram:99:5000", "telegram:99:5001", "telegram:99:5002", "telegram:99:5003"];
-    inbox.accept(5000, { ...request, requestId: unfinished[0]! }); // pending
-    inbox.accept(5001, { ...request, requestId: unfinished[1]! });
-    inbox.saveReply(unfinished[1]!, "ready"); // ready, not yet sent
-    inbox.accept(5002, { ...request, requestId: unfinished[2]! });
-    inbox.saveReply(unfinished[2]!, "failed"); // explicit failure
-    inbox.beginPart(unfinished[2]!, 0);
-    inbox.failPart(unfinished[2]!, 0, "failed", "TELEGRAM_403");
-    inbox.accept(5003, { ...request, requestId: unfinished[3]! });
-    inbox.saveReply(unfinished[3]!, "uncertain"); // unknown outcome
-    inbox.beginPart(unfinished[3]!, 0);
-    inbox.failPart(unfinished[3]!, 0, "uncertain", "TIMEOUT");
-
-    inbox.prune();
-
     const db = new DatabaseSync(path);
     try {
-      assert.equal((db.prepare("SELECT COUNT(*) AS count FROM inbox WHERE status = 'sent'").get() as { count: number }).count, 100);
-      assert.equal(db.prepare("SELECT requestId FROM inbox WHERE requestId = ?").get("telegram:99:1000"), undefined);
-      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM deliveries WHERE requestId = ?").get("telegram:99:1000")?.["count"], 0);
-      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM failures WHERE requestId = ?").get("telegram:99:1000")?.["count"], 0);
-      assert.ok(db.prepare("SELECT requestId FROM inbox WHERE requestId = ?").get("telegram:99:1020"));
-      for (const id of ["telegram:99:5000", "telegram:99:5001", "telegram:99:5002", "telegram:99:5003"])
-        assert.ok(db.prepare("SELECT requestId FROM inbox WHERE requestId = ?").get(id), `unfinished request ${id} must survive`);
-    } finally {
-      db.close();
-    }
+      const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map((row) => row.name);
+      for (const name of ["checkpoint", "identity", "inbox", "deliveries", "failures", "bots", "bot_provisioning", "integrations"]) {
+        assert.ok(tables.includes(name), `compatibility table ${name} is preserved`);
+      }
+      // Migration does not invent a time for a row the process never saw arrive, nor rewrite its state.
+      const old = db.prepare("SELECT status, reply, receivedAt, repliedAt FROM inbox WHERE requestId = 'telegram:99:4'").get() as
+        { status: string; reply: string; receivedAt: string | null; repliedAt: string | null };
+      assert.equal(old.status, "sent");
+      assert.equal(old.reply, "old answer");
+      assert.equal(old.receivedAt, null);
+      assert.equal(old.repliedAt, null);
+      assert.equal((db.prepare("SELECT createdAt FROM deliveries WHERE requestId = 'telegram:99:4'").get() as { createdAt: string | null }).createdAt, null);
+      assert.equal((db.prepare("SELECT offset FROM checkpoint").get() as { offset: number }).offset, 5);
+      assert.equal((db.prepare("SELECT ownerId FROM identity").get() as { ownerId: string }).ownerId, "42");
+      assert.equal((db.prepare("SELECT COUNT(*) AS count FROM deliveries").get() as { count: number }).count, 1);
+    } finally { db.close(); }
 
-    assert.equal(inbox.diagnostics().some((row) => row.code === "TEST_FAILURE"), false);
-    assert.deepEqual(inbox.blocked().map((row) => row.requestId), [unfinished[2], unfinished[3]]);
-    assert.equal(inbox.next()?.requestId, unfinished[0]);
-    inbox.saveReply(unfinished[0]!, "pending done");
-    inbox.beginPart(unfinished[0]!, 0);
-    inbox.confirmPart(unfinished[0]!, 0, "5000");
-    assert.equal(inbox.next()?.requestId, unfinished[1]);
-  } finally {
-    inbox.close();
-  }
-  await rm(directory, { recursive: true, force: true });
-});
-
-test("Telegram rejection is failed while a transport failure is uncertain, and neither resends", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-send-errors-"));
-  const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
-  try {
-    inbox.accept(1, { ...request, requestId: "telegram:99:1" });
-    inbox.accept(2, { ...request, requestId: "telegram:99:2" });
-    inbox.accept(3, { ...request, requestId: "telegram:99:3" });
-    const shutdown = new AbortController();
-    let executions = 0;
-    let sends = 0;
-    await serveTelegram(config, "99", inbox, async (job) => {
-      executions++;
-      return `reply ${job.requestId}`;
-    }, shutdown.signal, {
-      send: async () => {
-        sends++;
-        if (sends === 1) throw new GrammyError("rejected", { ok: false, error_code: 403, description: "bot was blocked" }, "sendMessage", {});
-        if (sends === 2) throw new Error("socket hang up");
-        return "103";
-      },
-      updates: async () => { shutdown.abort(); return []; },
-    });
-    assert.equal(executions, 3, "a blocked delivery must not stop later independent requests");
-    const rows = inbox.blocked();
-    assert.deepEqual(rows.map((row) => [row.requestId, row.status, row.error]), [
-      ["telegram:99:1", "failed", "TELEGRAM_403"],
-      ["telegram:99:2", "uncertain", "EXECUTION_ERROR"],
-    ]);
-    assert.equal(sends, 3, "blocked parts are not retried automatically");
+    assert.equal(inbox.nextForBot("99"), undefined, "a legacy Telegram row is never replayed through a console queue");
+    const fresh = consoleRequest("alpha", "req-00000001");
+    inbox.acceptConsole(fresh);
+    const job = inbox.nextForBot("alpha");
+    assert.equal(job?.requestId, fresh.requestId);
+    assert.ok(job?.receivedAt, "new console rows get a receivedAt");
   } finally {
     inbox.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("a truncated agent answer is delivered with an explicit incompleteness notice", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-truncated-"));
-  const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
-  try {
-    inbox.accept(1, { ...request, requestId: "telegram:99:1" });
-    const sent: string[] = [];
-    const shutdown = new AbortController();
-    await serveTelegram(config, "99", inbox, async () => {
-      throw Object.assign(new Error("Agent reply was truncated"), { code: "AGENT_TRUNCATED", partialReply: "partial answer" });
-    }, shutdown.signal, {
-      updates: async () => { shutdown.abort(); return []; },
-      send: async (_chat, text) => { sent.push(text); return "1"; },
-    });
-    assert.equal(sent.length, 1);
-    assert.match(sent[0]!, /partial answer/);
-    assert.match(sent[0]!, /截断/);
-    assert.deepEqual(inbox.diagnostics().map((row) => [row.requestId, row.code]), [["telegram:99:1", "AGENT_TRUNCATED"]]);
-    const db = new DatabaseSync(join(directory, "inbox.sqlite"));
-    try {
-      assert.match(String(db.prepare("SELECT reply FROM inbox WHERE requestId = ?").get("telegram:99:1")?.["reply"]), /截断/);
-    } finally {
-      db.close();
-    }
-  } finally {
-    inbox.close();
-    await rm(directory, { recursive: true, force: true });
+test("reply chunking preserves text including Unicode surrogate pairs", () => {
+  const text = "你".repeat(3999) + "😀" + "a".repeat(8000);
+  const chunks = splitReply(text);
+  assert.equal(chunks.join(""), text);
+  assert.ok(chunks.every((chunk) => chunk.length <= 4000 && chunk.isWellFormed()));
+});
+
+test("configuration failures name the missing or invalid setting", () => {
+  assert.throws(() => readConfig({}), /Missing configuration: MODEL_PROVIDER/);
+  assert.throws(() => readConfig({ MODEL_PROVIDER: "other" }), /MODEL_PROVIDER must be one of: anthropic, openai/);
+  assert.throws(() => readConfig({ MODEL_PROVIDER: "openai" }), /Missing configuration: OPENAI_API_KEY/);
+  assert.throws(() => readConfig({ MODEL_PROVIDER: "openai", OPENAI_API_KEY: "key" }), /Missing configuration: MODEL_ID/);
+  assert.throws(() => readConfig({ MODEL_PROVIDER: "openai", OPENAI_API_KEY: "__vault_bad__", MODEL_ID: "m" }), /malformed vault placeholder/);
+  assert.throws(() => readConfig({ NODE_TLS_REJECT_UNAUTHORIZED: "0" }), /NODE_TLS_REJECT_UNAUTHORIZED=0 is not allowed/);
+});
+
+test("the provider registry only names providers shipped with pi-ai", () => {
+  const builtin = new Set(builtinProviders().map((provider) => provider.id));
+  for (const [id, entry] of Object.entries(PROVIDERS)) {
+    assert.ok(builtin.has(id), `registered provider ${id} is not built into pi-ai`);
+    assert.match(entry.apiKeyEnv, /^[A-Z0-9_]+_API_KEY$/, `${id} must name an API-key variable`);
   }
 });
 
-test("malformed Telegram updates are rejected at the boundary", () => {
-  const message = update.message!;
-  const malformed = (candidate: unknown) => toRequest(candidate as Update, "42", "99");
-  assert.equal(malformed({ message }), undefined, "a missing update_id cannot form a request id");
-  assert.equal(malformed({ ...update, update_id: "12" }), undefined);
-  assert.equal(malformed({ ...update, message: { ...message, chat: { type: "private" } } }), undefined);
-  assert.equal(malformed({ ...update, message: { ...message, from: undefined } }), undefined);
-  assert.equal(malformed({ ...update, message: { ...message, text: { toString: () => "hello" } } }), undefined);
-  assert.equal(malformed({ ...update, message: { ...message, text: "" } }), undefined);
-  const stringIds = { ...update, message: { ...message, chat: { ...message.chat, id: "42" }, from: { ...message.from!, id: "42" } } };
-  assert.equal(malformed(stringIds)?.conversationId, "42", "numeric strings are normalized");
-  assert.equal(malformed(stringIds)?.senderId, "42");
+test("a registered provider requires only its own API key and a model id", () => {
+  const config = readConfig({
+    MODEL_PROVIDER: "deepseek",
+    MODEL_ID: "deepseek-flash",
+    DEEPSEEK_API_KEY: "secret",
+  });
+  assert.equal(config.provider, "deepseek");
+  assert.equal(config.model, "deepseek-flash");
+  assert.equal(config.ccrProfile, undefined);
+  assert.equal(config.console, undefined, "the console is off unless explicitly enabled");
+  assert.equal(readConfig({
+    MODEL_PROVIDER: "deepseek", MODEL_ID: "deepseek-flash", DEEPSEEK_API_KEY: "secret",
+    DEEPSEEK_WEB_API_KEY: " web-secret ",
+  }).ccrProfile, undefined);
+  assert.throws(() => readConfig({
+    MODEL_PROVIDER: "deepseek", MODEL_ID: "deepseek-flash",
+  }), /Missing configuration: DEEPSEEK_API_KEY/);
 });
 
-test("invalid updates are skipped without writing an unusable checkpoint", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-invalid-update-"));
-  const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
-  try {
-    const sent: string[] = [];
-    const shutdown = new AbortController();
-    let polls = 0;
-    await serveTelegram(config, "99", inbox, async () => "answer", shutdown.signal, {
-      updates: async () => {
-        polls++;
-        if (polls > 1) {
-          shutdown.abort();
-          return [];
-        }
-        return [
-          { message: update.message } as unknown as Update,
-          { ...update, update_id: 19 },
-          { ...update, update_id: 20, message: { ...update.message!, text: { bad: true } } } as unknown as Update,
-          // A well-formed update from someone other than the owner: skipped, but its id still advances the offset.
-          { ...update, update_id: 21, message: { ...update.message!, from: { ...update.message!.from!, id: 7 } } } as unknown as Update,
-        ];
-      },
-      send: async (_chat, text) => { sent.push(text); return "1"; },
-    });
-    assert.equal(inbox.offset, 22, "only valid update ids advance the checkpoint");
-    assert.deepEqual(sent, ["answer"], "the well-formed owner message is still processed");
+test("the console stays off by default and token auth is the fail-closed default", () => {
+  const base = { MODEL_PROVIDER: "openai", OPENAI_API_KEY: "key", MODEL_ID: "m" };
+  assert.equal(readConfig(base).console, undefined);
+  assert.throws(() => readConfig({ ...base, CONSOLE_ENABLED: "1" }), /WEB_TOKEN must be 16-256/);
+  const enabled = readConfig({ ...base, CONSOLE_ENABLED: "1", WEB_TOKEN: "0123456789abcdef" });
+  assert.equal(enabled.console?.host, "0.0.0.0");
+  assert.equal(enabled.console?.maxBots, 8);
+  assert.equal(enabled.console?.token, "0123456789abcdef", "no WEB_AUTH means token auth");
+  assert.equal(readConfig({
+    ...base, CONSOLE_ENABLED: "1", WEB_AUTH: " token ", WEB_TOKEN: "0123456789abcdef",
+  }).console?.token, "0123456789abcdef");
+  assert.throws(() => readConfig({ ...base, CONSOLE_ENABLED: "1", WEB_AUTH: "yes" }),
+    /WEB_AUTH must be token or off/);
+});
 
-    const empty = new Inbox(join(directory, "empty.sqlite"));
-    try {
-      let polls = 0;
-      const stop = new AbortController();
-      await serveTelegram(config, "99", empty, async () => "unused", stop.signal, {
-        updates: async () => {
-          polls++;
-          if (polls === 1) return [{ message: update.message } as unknown as Update];
-          stop.abort();
-          return [];
-        },
-        send: async () => "1",
-      });
-      assert.equal(polls, 2, "an invalid update must not stall the poll loop");
-      assert.equal(empty.offset, 0, "the checkpoint never receives an invalid id");
-      assert.equal(empty.next(), undefined);
-    } finally {
-      empty.close();
-    }
-  } finally {
-    inbox.close();
-    await rm(directory, { recursive: true, force: true });
+test("WEB_AUTH=off is an explicit host opt-in that ignores WEB_TOKEN", () => {
+  const base = { MODEL_PROVIDER: "openai", OPENAI_API_KEY: "key", MODEL_ID: "m", CONSOLE_ENABLED: "1" };
+  assert.equal(readConfig({ ...base, WEB_AUTH: "off" }).console?.token, null);
+  // A stale/invalid token in the environment must neither be validated nor silently re-enable auth.
+  for (const token of ["short", "0123456789abcdef"]) {
+    assert.equal(readConfig({ ...base, WEB_AUTH: "off", WEB_TOKEN: token }).console?.token, null);
   }
+  assert.equal(readConfig({ ...base, WEB_AUTH: " off " }).console?.token, null);
 });
 
-test("a failed agent session stops polling and leaves the request pending", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-session-failure-"));
-  const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
-  try {
-    inbox.accept(1, { ...request, requestId: "telegram:99:1" });
-    const fatal = Object.assign(
-      new Error("Agent session failed; restart the process to recover"),
-      { code: "AGENT_SESSION_FAILED", cause: new SessionFailed(new Error("simulated storage failure")) },
-    );
-    let sends = 0;
-    await assert.rejects(
-      serveTelegram(config, "99", inbox, async () => { throw fatal; }, new AbortController().signal, {
-        updates: async () => { throw new Error("must not keep polling after a fatal error"); },
-        send: async () => { sends++; return "1"; },
-      }),
-      (error: unknown) => error === fatal,
-    );
-    assert.equal(sends, 0, "a fatal error must not produce a delivery");
-    assert.equal(inbox.next()?.status, "pending", "the request stays available for recovery");
-    assert.equal(inbox.blocked().length, 0);
-    const db = new DatabaseSync(join(directory, "inbox.sqlite"));
-    try {
-      assert.equal(db.prepare("SELECT COUNT(*) AS count FROM deliveries").get()?.["count"], 0);
-    } finally {
-      db.close();
-    }
-  } finally {
-    inbox.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("a local storage failure while saving a reply is fatal", async () => {
-  const inbox = {
-    blocked: () => [],
-    next: () => ({ ...request, requestId: "telegram:99:1", status: "pending", reply: null }),
-    saveReply: () => { throw new Error("database is locked"); },
-  } as unknown as Inbox;
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: "unused", mcpConfigPath: "unused/mcp.json", mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
-  await assert.rejects(
-    serveTelegram(config, "99", inbox, async () => "reply", new AbortController().signal, {
-      updates: async () => [],
-      send: async () => "1",
-    }),
-    /database is locked/,
+test("an unknown model id is rejected with provider examples", () => {
+  assert.throws(
+    () => requireModel(createProviderModels("deepseek"), "deepseek", "not-a-model"),
+    /Unknown MODEL_ID "not-a-model" for MODEL_PROVIDER=deepseek; examples: /,
   );
-});
-
-test("a model failure is delivered as a notice and later requests still run", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pa-model-failure-"));
-  const inbox = new Inbox(join(directory, "inbox.sqlite"));
-  const config: ReturnType<typeof readConfig> = { token: "fake", ownerId: "42", provider: "openai", model: "fake", dataDir: directory, mcpConfigPath: join(directory, "mcp.json"), mcpConfigExplicit: false, telegramApiRoot: undefined, trace: { enabled: false } };
-  try {
-    inbox.accept(1, { ...request, requestId: "telegram:99:1" });
-    inbox.accept(2, { ...request, requestId: "telegram:99:2" });
-    const sent: string[] = [];
-    const shutdown = new AbortController();
-    await serveTelegram(config, "99", inbox, async (job) => {
-      if (job.requestId === "telegram:99:1") throw Object.assign(new Error("model failed"), { code: "AGENT_UNANSWERED" });
-      return "second answer";
-    }, shutdown.signal, {
-      updates: async () => { shutdown.abort(); return []; },
-      send: async (_chat, text) => { sent.push(text); return String(sent.length); },
-    });
-    assert.equal(sent.length, 2);
-    assert.match(sent[0]!, /未能完成/);
-    assert.equal(sent[1], "second answer");
-    assert.deepEqual(inbox.diagnostics().map((row) => [row.requestId, row.code]), [["telegram:99:1", "AGENT_UNANSWERED"]]);
-    assert.equal(inbox.next(), undefined);
-  } finally {
-    inbox.close();
-    await rm(directory, { recursive: true, force: true });
-  }
 });

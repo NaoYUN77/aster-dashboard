@@ -13,6 +13,7 @@ import { openAgent } from "../src/agent.js";
 import { readConfig, readMemoryConfig } from "../src/config.js";
 import { connectMcp, type McpConnection, type McpToolInfo } from "../src/mcp.js";
 import { validateMcpConfig } from "../src/mcp-config.js";
+import { DEFAULT_CATALOG_PROFILE } from "../src/tool-catalog.js";
 import { createToolRegistry, type GovernedTool, type ToolAuthority } from "../src/tools.js";
 
 const context = BACKGROUND_CONTEXT;
@@ -135,6 +136,43 @@ test("builtin and nested calls use the same authority while native schema valida
     assert.equal((await (await root.submit({ type: "input", content: "nested" }, context)).wait(context)).status, "done");
     assert.equal(writes, 0);
     assert.deepEqual(audit.events.map(({ tool, code }) => [tool, code]), [["nested", "TOOL_ALLOWED"], ["mutat", "TOOL_NOT_FOUND"], ["mutate", "TOOL_AUTHZ_DENIED"]]);
+  } finally {
+    await harness.close(context);
+  }
+});
+
+test("disabled shell, file and MCP groups stay closed for direct and nested execution", async () => {
+  const audit = logs();
+  let effects = 0;
+  const target = (name: string) => defineTool({ name, description: name, parameters: Type.Object({}),
+    execute: async () => { effects++; return { output: [] }; } });
+  const mcp = Object.assign(target("mcp__s__action"), {
+    governance: { source: { kind: "mcp" as const, server: "s" }, trust: "untrusted" as const, authz: "read" as const },
+  });
+  // memory_search is in an open group, so it can host nested calls without widening the catalog.
+  const nested = defineTool({ name: "memory_search", description: "nested probe", parameters: Type.Object({}),
+    execute: async (_args, api, context) => {
+      for (const name of ["bash", "read", "mcp__s__action"]) {
+        const denied = await api.executeTool(name, {}, context);
+        assert.equal(code(denied.details), "TOOL_SCOPE_DENIED");
+      }
+      return { output: [{ type: "text" as const, text: "nested blocked" }] };
+    } });
+  const registry = createToolRegistry([{ name: "tools", tools: [target("bash"), target("read"), mcp, nested] }], { log: audit.log });
+  const fixture = models();
+  fixture.faux.setResponses([call("bash"), call("read"), call("mcp__s__action"), call("memory_search"), () => fauxAssistantMessage("done")]);
+  const harness = await Harness.open(new MemoryStorage(), { registry, models: fixture.models }, context);
+  try {
+    const root = await harness.root(context);
+    await root.configure({ model: { provider: "faux", modelId: "faux-1" } }, context);
+    // Include all names to simulate an old admitted registration. The current group switches must
+    // still reject execution, including nested calls, even when an old exact-name set contains it.
+    registry.setConversationCatalog(root.id, { ...DEFAULT_CATALOG_PROFILE, shell: false, files: false, mcp: false },
+      { allow: [], deny: [] }, new Set(["bash", "read", "mcp__s__action", "memory_search"]));
+    assert.equal((await (await root.submit({ type: "input", content: "try the disabled groups" }, context)).wait(context)).status, "done");
+    assert.equal(effects, 0);
+    assert.equal(audit.events.filter(({ code }) => code === "TOOL_SCOPE_DENIED").length, 6);
+    assert.deepEqual(audit.events.filter(({ code }) => code === "TOOL_ALLOWED").map(({ tool }) => tool), ["memory_search"]);
   } finally {
     await harness.close(context);
   }

@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 import { Type } from "@earendil-works/pi-ai";
 import { createRegistry, defineExtension, defineTool, GenerationTask, hook, type Extension, type Registry, type ToolExecutionApi, type ToolExecutionResult, type ToolRegistration } from "@earendil-works/pi-durable";
-import { CODEMODE_TOOL_NAME } from "@earendil-works/pi-durable/codemode";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { TOOL_SEARCH_TOOL_NAME } from "@earendil-works/pi-durable/tool-search";
-import { argumentBytes, beginTrace, recordGeneration, recordRegistryDecision } from "./trace.js";
+import { recordGeneration, recordRegistryDecision } from "./trace.js";
+import { parseCatalogProfile, parseToolScope, scopeAllows, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
 
 export const currentTime = defineTool({
   name: "current_time",
@@ -59,11 +59,20 @@ export interface ToolRegistry extends Registry {
   lookup(name: string): ToolRecord | undefined;
   records(): readonly ToolRecord[];
   setMcpAvailability(server: string, state: ToolAvailability): void;
+  /** Bind the profile-resolved catalog to one durable conversation. */
+  setConversationCatalog(
+    conversationId: number,
+    profile: CatalogProfile,
+    scope: ToolScope,
+    names: ReadonlySet<string>,
+    /** Exact-name reasons for tools closed by an unavailable platform capability. */
+    reasons?: ReadonlyMap<string, string>,
+  ): void;
   /** Host-only switch; disabling does not remove declarations or alter replay policy. */
   setDisabled(name: string, disabled: boolean): void;
 }
 
-const READ_TOOLS = new Set(["read", "current_time", "working_read", "memory_search", "memory_read", "tool_search", "reminder_list"]);
+const READ_TOOLS = new Set(["read", "current_time", "working_read", "memory_search", "memory_read", "tool_search"]);
 
 function registration(extension: Extension, tool: GovernedTool): ToolRecord {
   const governance = tool.governance ?? {
@@ -103,9 +112,15 @@ export function createToolRegistry(
   const log = options.log ?? console.error;
   let records = new Map<string, ToolRecord>();
   let registrations = new Map<string, object>();
-  // Whether the model surface currently declares the tool; a hidden tool stays registered for scripts.
+  // Whether the model surface currently declares the tool; registration is tracked independently.
   let modelCallable = new Map<string, boolean>();
   const availability = new Map<string, ToolAvailability>();
+  const conversationCatalogs = new Map<number, {
+    readonly profile: CatalogProfile;
+    readonly scope: ToolScope;
+    readonly names: ReadonlySet<string>;
+    readonly reasons: ReadonlyMap<string, string>;
+  }>();
   const disabled = new Set<string>();
   const listeners = new Set<() => void>();
   const notify = () => { for (const listener of [...listeners]) listener(); };
@@ -126,6 +141,7 @@ export function createToolRegistry(
   }
   function review(name: string, call: CallIdentity, registration?: object): ToolExecutionResult | undefined {
     const record = records.get(name);
+    const catalog = conversationCatalogs.get(call.conversationId);
     let code: string;
     let message: string;
     if (record === undefined) {
@@ -134,6 +150,10 @@ export function createToolRegistry(
     } else if (registration !== undefined && registrations.get(name) !== registration) {
       code = "TOOL_REGISTRATION_CHANGED";
       message = `Tool ${name} changed after this call was admitted; the old implementation was not executed. Retry the request.`;
+    } else if (catalog !== undefined && (!catalog.names.has(name) || !scopeAllows(catalog.scope, catalog.profile, name, record))) {
+      const reason = catalog.reasons.get(name);
+      code = reason === undefined ? "TOOL_SCOPE_DENIED" : "TOOL_CAPABILITY_UNAVAILABLE";
+      message = reason ?? `Tool ${name} is outside this bot's catalog profile and tool scope; this call was not executed.`;
     } else if (record.state === "disabled") {
       code = "TOOL_DISABLED";
       message = `Tool ${name} is disabled; this call was not sent. Ask the owner to enable it.`;
@@ -184,22 +204,6 @@ export function createToolRegistry(
       ...tool,
       execute: async (args, api, context) => {
         context.abortSignal?.throwIfAborted();
-        // The root trace starts before authorization so a denied codemode call is still observable.
-        // The model's raw `code` argument is captured only when content capture is enabled; the script
-        // actually handed to QuickJS is recorded separately under `codemode.prepared`.
-        const script = args !== null && typeof args === "object"
-          ? (args as { code?: unknown }).code
-          : undefined;
-        const root = tool.name === CODEMODE_TOOL_NAME
-          ? beginTrace({
-              conversationId: api.conversationId,
-              taskId: api.taskId,
-              callId: api.callId,
-              name: "codemode",
-              fields: { scriptBytes: argumentBytes(args) },
-              ...(typeof script === "string" ? { input: { code: script } } : {}),
-            })
-          : undefined;
         const run = async () => {
           const rejected = review(tool.name, { conversationId: api.conversationId, taskId: api.taskId, callId: api.callId }, registration);
           if (rejected !== undefined) return rejected;
@@ -213,12 +217,14 @@ export function createToolRegistry(
             ...(tool.name === TOOL_SEARCH_TOOL_NAME ? {
               agent: async (context: Parameters<ToolExecutionApi["agent"]>[0]) => {
                 const agent = await api.agent(context);
-                return { ...agent, deferred: agent.deferred.filter(({ name }) => records.get(name)?.state === "available") };
+                const policy = conversationCatalogs.get(api.conversationId);
+                return { ...agent, deferred: agent.deferred.filter(({ name }) =>
+                  records.get(name)?.state === "available" && (policy === undefined || policy.names.has(name))) };
               },
             } : {}),
           }, context);
         };
-        return root === undefined ? run() : root.run(run);
+        return run();
       },
     };
   }
@@ -272,6 +278,14 @@ export function createToolRegistry(
         modelCallable.delete(tool.name);
       }
       notify();
+    },
+    setConversationCatalog(conversationId, profile, scope, names, reasons) {
+      conversationCatalogs.set(conversationId, {
+        profile: parseCatalogProfile(profile),
+        scope: parseToolScope(scope),
+        names: new Set(names),
+        reasons: new Map(reasons ?? []),
+      });
     },
     setMcpAvailability(server, state) {
       availability.set(server, state);

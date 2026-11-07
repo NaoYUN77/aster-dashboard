@@ -38,7 +38,7 @@ services:
   execution-broker:
     image: ${ASTER_IMAGE:-aster:local}
     # Same image, different entrypoint: the broker is a separate process and receives no app
-    # environment, Telegram token or model key.
+    # environment, console token or model key.
     entrypoint: ["node", "dist/src/execution/broker-main.js"]
     restart: unless-stopped
     # SSH originates from the host namespace (the Aster host's private address), never from the

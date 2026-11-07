@@ -1,0 +1,36 @@
+# Combines the dashboard with the MITM overlay (docker-compose.mitm.yml).
+#
+# Usage (from the repository root):
+#   docker compose -f docker-compose.yml -f docker-compose.mitm.yml \
+#     -f dashboard/docker-compose.dashboard.yml -f dashboard/docker-compose.mitm.yml \
+#     --env-file dashboard/.env up -d --no-build
+#
+# Docker silently drops host port bindings for a container whose networks are all `internal: true`,
+# and the MITM overlay attaches the app to exactly one internal network so it cannot bypass the
+# proxy. The app therefore cannot publish the console port itself; this overlay removes that
+# binding and adds a loopback ingress on the host network that forwards to the app's fixed address
+# on the MITM network (the address assigned by docker-compose.mitm.yml).
+services:
+  personal-agent:
+    # Publishing cannot work on an internal-only network; console-ingress owns the host port.
+    ports: !reset []
+
+  console-ingress:
+    image: ${ASTER_IMAGE:-aster-dashboard:local}
+    entrypoint: ["node", "/app/dashboard/console-ingress.mjs"]
+    # Host networking gives the loopback bind the SSH tunnel expects without joining any bridge.
+    network_mode: host
+    read_only: true
+    user: "1000:1000"
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      CONSOLE_INGRESS_LISTEN: 127.0.0.1:${CONSOLE_PORT:-8787}
+      CONSOLE_INGRESS_TARGET: ${CONSOLE_INGRESS_TARGET:-10.89.143.3:8787}
+    mem_limit: 64m
+    pids_limit: 64
+    restart: unless-stopped
+    depends_on:
+      personal-agent:
+        condition: service_started

@@ -128,6 +128,42 @@ export function parseAddress(value: string): { readonly host: string; readonly p
   return { host, port };
 }
 
+/** A client host token: the name is resolved by the connection itself, so no path or space slips in. */
+const CLIENT_HOST = /^[A-Za-z0-9._-]{1,253}$/;
+
+/**
+ * A client endpoint may name the agent by DNS; only the agent's own bind address has to be an IP
+ * literal, because that is the value an operator can audit. Certificate identity is still checked
+ * against the CA and the expected server name, so a name here never widens trust.
+ */
+export function parseClientAddress(value: string): { readonly host: string; readonly port: number } {
+  const trimmed = value.trim();
+  let host: string;
+  let portText: string;
+  if (trimmed.startsWith("[")) {
+    const end = trimmed.indexOf("]");
+    if (end === -1 || trimmed[end + 1] !== ":") {
+      throw new ConfigurationError("address must be [ipv6]:port");
+    }
+    host = trimmed.slice(1, end);
+    portText = trimmed.slice(end + 2);
+  } else {
+    const colon = trimmed.lastIndexOf(":");
+    if (colon <= 0) throw new ConfigurationError("address must be host:port");
+    host = trimmed.slice(0, colon);
+    portText = trimmed.slice(colon + 1);
+  }
+  if (isIP(host) === 0 && !CLIENT_HOST.test(host)) {
+    throw new ConfigurationError("address host must be an IP literal or a hostname");
+  }
+  if (!/^\d+$/.test(portText)) throw new ConfigurationError("address port must be an integer");
+  const port = Number(portText);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new ConfigurationError("address port must be in 1..65535");
+  }
+  return { host, port };
+}
+
 function isPrivateOrLoopback(host: string): boolean {
   const family = isIP(host);
   if (family === 4) {
@@ -174,7 +210,7 @@ export function readRpcClientConfig(env: NodeJS.ProcessEnv = process.env): RpcCl
   if (transport === "unix") {
     return { transport, socketPath: pathValue(env, "EXECUTION_RPC_SOCKET"), ...common };
   }
-  const address = parseAddress(required(env, "EXECUTION_RPC_ADDRESS"));
+  const address = parseClientAddress(required(env, "EXECUTION_RPC_ADDRESS"));
   const servername = optional(env, "EXECUTION_RPC_SERVER_NAME");
   return {
     transport,

@@ -37,7 +37,7 @@ function appConfig(dataDir: string) {
 function webAppConfig(dataDir: string) {
   return readConfig({
     TELEGRAM_BOT_TOKEN: "offline-test", TELEGRAM_OWNER_ID: "1", MODEL_PROVIDER: "openai",
-    MODEL_ID: "faux-1", OPENAI_API_KEY: "offline-test", DEEPSEEK_WEB_API_KEY: "web-test", DATA_DIR: dataDir,
+    MODEL_ID: "faux-1", OPENAI_API_KEY: "offline-test", CCR_PROFILE: "test-profile", DATA_DIR: dataDir,
   });
 }
 
@@ -81,7 +81,7 @@ test("web tools are absent unless the host configures their credential", async (
   }
 });
 
-test("configured built-in web tools are declared through the production composition root", async () => {
+test("configured CCR web tools are declared through the production composition root", async () => {
   const directory = await mkdtemp(join(tmpdir(), "personal-agent-web-tools-"));
   let app: Awaited<ReturnType<typeof openAgent>> | undefined;
   try {

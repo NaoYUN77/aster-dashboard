@@ -1,0 +1,699 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Aster Console</title>
+<style nonce="{{NONCE}}">
+  :root {
+    --bg: #0f1216;
+    --panel: #171c22;
+    --panel-2: #1e252d;
+    --line: #2a323c;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #4c9aff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --user: #23405e;
+    --assistant: #1b2229;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #f0f2f5;
+      --line: #dcdfe4;
+      --text: #1b1f24;
+      --muted: #5c6773;
+      --accent: #1868d6;
+      --user: #dbe8fb;
+      --assistant: #f0f2f5;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .status { color: var(--muted); font-size: 12px; margin-left: auto; }
+  main { display: grid; grid-template-columns: 260px 1fr; min-height: 0; }
+  aside {
+    border-right: 1px solid var(--line);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .aside-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
+  #bots { list-style: none; margin: 0; padding: 6px; overflow: auto; flex: 1; }
+  #bots li { margin-bottom: 4px; }
+  .bot {
+    width: 100%;
+    text-align: left;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: transparent;
+    color: inherit;
+    padding: 8px 10px;
+    cursor: pointer;
+    display: grid;
+    gap: 2px;
+  }
+  .bot:hover { background: var(--panel-2); }
+  .bot[aria-current="true"] { background: var(--panel-2); border-color: var(--line); }
+  .bot strong { font-weight: 600; font-size: 13px; }
+  .bot small { color: var(--muted); font-size: 11px; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+  .dot.ready { background: var(--ok); }
+  .dot.degraded { background: var(--warn); }
+  .dot.failed { background: var(--err); }
+  .dot.running { background: var(--ok); }
+  .dot.pending { background: var(--warn); }
+  section.chat { display: grid; grid-template-rows: auto 1fr auto; min-height: 0; }
+  .chat-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  .chat-head .meta { color: var(--muted); font-size: 12px; }
+  .chat-head .spacer { flex: 1; }
+  #readyNote { font-size: 12px; color: var(--ok); }
+  #readyNote.warn { color: var(--warn); }
+  #readyNote.bad { color: var(--err); }
+  #messages { overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 780px; padding: 9px 12px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.user { background: var(--user); align-self: flex-end; }
+  .msg.assistant { background: var(--assistant); align-self: flex-start; }
+  .msg.note { color: var(--muted); font-size: 12px; background: transparent; border: 1px dashed var(--line); }
+  .empty { color: var(--muted); margin: auto; text-align: center; }
+  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 16px; }
+  footer .row { display: flex; gap: 8px; align-items: flex-end; }
+  textarea, input {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+  }
+  textarea { width: 100%; resize: vertical; min-height: 44px; max-height: 200px; }
+  button {
+    font: inherit; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text); padding: 8px 12px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--err); }
+  button:disabled { opacity: .5; cursor: default; }
+  dialog {
+    border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text);
+    width: min(560px, calc(100vw - 32px)); max-height: min(80vh, 720px); padding: 0;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.5); }
+  dialog .body { display: grid; gap: 12px; padding: 16px; overflow: auto; }
+  dialog form { display: grid; gap: 10px; padding: 16px; }
+  dialog h2 { font-size: 15px; margin: 0; }
+  dialog h3 { font-size: 13px; margin: 4px 0 0; color: var(--muted); }
+  dialog label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  dialog .actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .hint { font-size: 12px; color: var(--muted); margin: 0; }
+  .row-card {
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+    display: grid; gap: 4px; background: var(--panel-2);
+  }
+  .row-card .line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .row-card .reason { font-size: 12px; color: var(--muted); }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); }
+  .badge.available { color: var(--ok); border-color: var(--ok); }
+  .badge.unavailable { color: var(--warn); border-color: var(--warn); }
+  .badge.failed { color: var(--err); border-color: var(--err); }
+  .banner { padding: 6px 16px; font-size: 12px; border-bottom: 1px solid var(--line); display: none; }
+  .banner.show { display: block; }
+  .banner.error { background: rgba(248,81,73,.12); color: var(--err); }
+  #platformList, #provisioningList, #integrationList { display: grid; gap: 6px; }
+  @media (max-width: 720px) {
+    main { grid-template-columns: 1fr; }
+    aside { display: none; }
+    aside.open { display: flex; position: absolute; inset: 48px 0 0; z-index: 5; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Aster Console</h1>
+  <span class="status" id="status">未连接</span>
+  <button id="platformBtn">平台状态</button>
+  <button id="menu">Bots</button>
+  <button id="signOut" title="清除本地令牌">登出</button>
+</header>
+<div class="banner" id="banner"></div>
+<main>
+  <aside id="sidebar">
+    <div class="aside-head">
+      <span>Bots</span>
+      <button id="newBot" class="primary">新建</button>
+    </div>
+    <ul id="bots"></ul>
+  </aside>
+  <section class="chat">
+    <div class="chat-head">
+      <strong id="chatTitle">选择一个 bot</strong>
+      <span class="meta" id="chatMeta"></span>
+      <span id="readyNote"></span>
+      <span class="spacer"></span>
+      <button id="retryInit" hidden>重试初始化</button>
+      <button id="cancel" class="danger" disabled>停止</button>
+    </div>
+    <div id="messages"><p class="empty">先在上方输入访问令牌，再选择一个 bot。</p></div>
+    <footer>
+      <div class="row">
+        <textarea id="text" rows="2" placeholder="直接交代任务（Ctrl+Enter 发送）" disabled></textarea>
+        <button id="send" class="primary" disabled>发送</button>
+      </div>
+    </footer>
+  </section>
+</main>
+
+<dialog id="createDialog">
+  <form method="dialog" id="createForm">
+    <h2>新建 bot</h2>
+    <p class="hint">只需一个名称。工作环境、记忆、会话与可用能力由平台自动初始化，无需配置工具、MCP 或 API Key。</p>
+    <label>名称<input id="botName" required maxlength="80" autocomplete="off"></label>
+    <label>系统提示词（可选）<textarea id="botPrompt" rows="4" maxlength="8000"></textarea></label>
+    <div class="actions">
+      <button value="cancel" type="submit" formnovalidate>取消</button>
+      <button id="saveBot" value="create" type="submit" class="primary">创建</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="platformDialog">
+  <div class="body">
+    <h2>平台状态</h2>
+    <p class="hint">这些状态由部署环境决定，用户不需要也不能在这里配置工具、能力或凭据。未部署的服务明确标为不可用，不会伪装成就绪。</p>
+    <h3>基础能力</h3>
+    <div id="platformList"></div>
+    <h3>初始化</h3>
+    <div id="provisioningList"></div>
+    <h3>外部集成</h3>
+    <p class="hint">本阶段只登记授权请求，OAuth 连接尚未实现，任何状态都不会显示「已连接」。</p>
+    <div id="integrationList"></div>
+    <div class="actions"><button id="closePlatform" type="button">关闭</button></div>
+  </div>
+</dialog>
+
+<script nonce="{{NONCE}}">
+"use strict";
+const state = { token: "", bots: [], selected: null, source: null, live: null };
+
+const $ = (id) => document.getElementById(id);
+const statusLine = $("status");
+const banner = $("banner");
+
+function showError(message) {
+  banner.textContent = message;
+  banner.className = "banner show error";
+}
+function clearError() { banner.className = "banner"; banner.textContent = ""; }
+
+function readToken() {
+  try {
+    const stored = sessionStorage.getItem("aster.web.token");
+    if (stored) return stored;
+  } catch {}
+  // A link that carries ?token= is a convenience for an authenticated deployment. Store it and
+  // drop it from the address bar so it does not linger in history or a shared screenshot.
+  try {
+    const url = new URL(location.href);
+    const fromUrl = url.searchParams.get("token") || "";
+    if (fromUrl) {
+      try { sessionStorage.setItem("aster.web.token", fromUrl); } catch {}
+      url.searchParams.delete("token");
+      history.replaceState(null, "", url.pathname + url.search + url.hash);
+      return fromUrl;
+    }
+  } catch {}
+  return "";
+}
+function writeToken(value) {
+  try { value ? sessionStorage.setItem("aster.web.token", value) : sessionStorage.removeItem("aster.web.token"); } catch {}
+}
+
+function setConnected(ok) {
+  statusLine.textContent = ok ? "已连接" : "未连接";
+  statusLine.style.color = ok ? "var(--ok)" : "var(--muted)";
+}
+
+async function api(path, options = {}) {
+  const headers = Object.assign({ "content-type": "application/json" }, options.headers || {});
+  if (state.token) headers.authorization = "Bearer " + state.token;
+  const response = await fetch(path, Object.assign({}, options, { headers }));
+  if (response.status === 401) {
+    state.token = "";
+    writeToken("");
+    setConnected(false);
+    throw new Error("访问令牌无效，请重新输入");
+  }
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || ("请求失败：" + response.status));
+  return body;
+}
+
+function askToken() {
+  const value = window.prompt("输入 WEB_TOKEN", readToken());
+  if (value === null) return false;
+  const token = value.trim();
+  if (!token) return false;
+  state.token = token;
+  writeToken(token);
+  return true;
+}
+
+const PROVISION_LABEL = {
+  ready: "就绪", degraded: "部分可用（降级）", failed: "初始化失败",
+  provisioning: "初始化中", not_provisioned: "尚未初始化",
+};
+
+function provisioningText(bot) {
+  const label = PROVISION_LABEL[bot.provisioning.state] || bot.provisioning.state;
+  return "初始化：" + label + "（第 " + bot.provisioning.attempt + " 次）"
+    + (bot.provisioning.unavailable.length ? " · 未启用 " + bot.provisioning.unavailable.join(", ") : "");
+}
+
+function renderBots() {
+  const list = $("bots");
+  list.replaceChildren();
+  for (const bot of state.bots) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.className = "bot";
+    button.type = "button";
+    button.setAttribute("aria-current", String(bot.botId === state.selected));
+    const dot = document.createElement("span");
+    const runState = bot.running ? " running" : bot.pending > 0 ? " pending" : "";
+    dot.className = "dot " + (runState === "" ? bot.provisioning.state : runState.trim());
+    const title = document.createElement("strong");
+    title.append(dot, document.createTextNode(bot.name));
+    const meta = document.createElement("small");
+    meta.textContent = bot.botId + " · " + (PROVISION_LABEL[bot.provisioning.state] || bot.provisioning.state)
+      + (bot.running ? " · 运行中" : bot.pending > 0 ? " · 排队 " + bot.pending : "");
+    button.append(title, meta);
+    button.addEventListener("click", () => selectBot(bot.botId));
+    item.append(button);
+    list.append(item);
+  }
+}
+
+function currentBot() {
+  return state.bots.find((bot) => bot.botId === state.selected) || null;
+}
+
+function chatAllowed(bot) {
+  return Boolean(bot) && bot.status === "active" && Boolean(bot.greeting);
+}
+
+function renderChatMeta() {
+  const bot = currentBot();
+  $("chatTitle").textContent = bot ? bot.name : "选择一个 bot";
+  $("chatMeta").textContent = bot ? provisioningText(bot) : "";
+  const note = $("readyNote");
+  if (!bot) { note.textContent = ""; note.className = ""; }
+  else if (bot.greeting) {
+    note.textContent = bot.provisioning.state === "degraded" ? "已就绪（部分能力不可用）" : "已就绪";
+    note.className = bot.provisioning.state === "degraded" ? "warn" : "";
+  } else {
+    note.textContent = "初始化未完成，暂时不能对话";
+    note.className = "bad";
+  }
+  $("retryInit").hidden = !(bot && (bot.provisioning.state === "failed" || bot.provisioning.state === "not_provisioned"));
+  const usable = chatAllowed(bot);
+  $("text").disabled = !usable;
+  $("send").disabled = !usable;
+  $("cancel").disabled = !usable;
+}
+
+function appendMessage(role, text, parent = $("messages")) {
+  const node = document.createElement("div");
+  node.className = "msg " + role;
+  node.textContent = text;
+  parent.append(node);
+  return node;
+}
+
+function note(text) {
+  const node = appendMessage("note", text);
+  $("messages").scrollTop = $("messages").scrollHeight;
+  return node;
+}
+
+function clearLive() {
+  if (state.live && state.live.isConnected) state.live.remove();
+  state.live = null;
+}
+
+// Rendering the transcript is a read-modify-write of #messages, and `run_end` plus `message_end`
+// each start one without waiting for the other. A render that is superseded while its history is
+// still in flight must not commit, or every overlapping call appends another full copy.
+let historyRender = 0;
+
+async function loadHistory() {
+  const bot = currentBot();
+  const box = $("messages");
+  const render = ++historyRender;
+  box.replaceChildren();
+  if (!bot) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "选择一个 bot 查看对话。";
+    box.append(empty);
+    return;
+  }
+  let body;
+  try {
+    body = await api("/api/bots/" + encodeURIComponent(bot.botId) + "/history?limit=200");
+  } catch (error) {
+    if (render === historyRender) showError(error.message);
+    return;
+  }
+  if (render !== historyRender) return;
+  // Build the transcript off-screen and commit it in one step, so a superseded render cannot
+  // leave a partial copy of the conversation behind.
+  const fragment = document.createDocumentFragment();
+  // A platform status line, explicitly not a generated assistant turn and never saved as one.
+  if (bot.greeting) {
+    appendMessage("note", "系统状态 · " + bot.greeting + "（平台就绪提示，不是模型生成的回复）"
+      + (bot.provisioning.state === "degraded" ? "；部分能力当前不可用，见「平台状态」。" : ""), fragment);
+  }
+  if (bot.provisioning.error) appendMessage("note", "初始化失败原因：" + bot.provisioning.error, fragment);
+  if (body.messages.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "还没有对话，直接交代任务即可。";
+    fragment.append(empty);
+  }
+  for (const message of body.messages) appendMessage(message.role, message.text, fragment);
+  box.replaceChildren(fragment);
+  box.scrollTop = box.scrollHeight;
+}
+
+async function refreshBots() {
+  const body = await api("/api/bots");
+  state.bots = body.bots;
+  if (state.selected && !state.bots.some((bot) => bot.botId === state.selected)) state.selected = null;
+  renderBots();
+  renderChatMeta();
+  setConnected(true);
+}
+
+function handleEvent(event) {
+  if (event.type === "delta") {
+    if (!state.live) {
+      state.live = appendMessage("assistant", "");
+      const box = $("messages");
+      const empty = box.querySelector(".empty");
+      if (empty) empty.remove();
+    }
+    state.live.textContent += event.text;
+    const box = $("messages");
+    box.scrollTop = box.scrollHeight;
+    return;
+  }
+  if (event.type === "tool") { note("调用工具 " + event.name); return; }
+  if (event.type === "error") { note("出错：" + event.message); return; }
+  if (event.type === "run_start") { clearLive(); return; }
+  if (event.type === "run_end" || event.type === "message_end") {
+    clearLive();
+    void loadHistory().catch(() => undefined);
+    void refreshBots().catch(() => undefined);
+  }
+}
+
+function openStream() {
+  if (state.source) { state.source.close(); state.source = null; }
+  if (!state.selected) return;
+  const source = new EventSource("/api/bots/" + encodeURIComponent(state.selected) + "/events?token=" + encodeURIComponent(state.token));
+  state.source = source;
+  source.onmessage = (message) => {
+    let payload;
+    try { payload = JSON.parse(message.data); } catch { return; }
+    if (payload.type === "snapshot") { setConnected(true); return; }
+    if (payload.type === "error") { showError(payload.message); return; }
+    if (payload.type === "events") for (const event of payload.events) handleEvent(event);
+  };
+  source.onerror = () => {
+    setConnected(false);
+    if (source.readyState === EventSource.CLOSED) return;
+    statusLine.textContent = "重连中…";
+  };
+}
+
+async function selectBot(botId) {
+  state.selected = botId;
+  clearLive();
+  renderBots();
+  renderChatMeta();
+  $("sidebar").classList.remove("open");
+  await loadHistory();
+  openStream();
+}
+
+async function send() {
+  const bot = currentBot();
+  const field = $("text");
+  const text = field.value.trim();
+  if (!bot || text === "" || !chatAllowed(bot)) return;
+  $("send").disabled = true;
+  try {
+    await api("/api/bots/" + encodeURIComponent(bot.botId) + "/messages", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    field.value = "";
+    appendMessage("user", text);
+    $("messages").scrollTop = $("messages").scrollHeight;
+    await refreshBots();
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    $("send").disabled = false;
+    renderChatMeta();
+  }
+}
+
+async function cancel() {
+  const bot = currentBot();
+  if (!bot) return;
+  try {
+    const result = await api("/api/bots/" + encodeURIComponent(bot.botId) + "/cancel", { method: "POST" });
+    note(result.cancelled ? "已撤回并停止本次请求。" : "已请求停止。");
+    await refreshBots();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+async function retryInit() {
+  const bot = currentBot();
+  if (!bot) return;
+  try {
+    await api("/api/bots/" + encodeURIComponent(bot.botId) + "/retry", { method: "POST" });
+    await refreshBots();
+    await loadHistory();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+/** A name is the only input. The platform owns capabilities, tools, paths and credentials. */
+async function createBot() {
+  const dialog = $("createDialog");
+  $("botName").value = "";
+  $("botPrompt").value = "";
+  dialog.returnValue = "cancel";
+  dialog.showModal();
+  await new Promise((resolve) => dialog.addEventListener("close", resolve, { once: true }));
+  if (dialog.returnValue !== "create") return;
+  try {
+    const body = await api("/api/bots", {
+      method: "POST",
+      body: JSON.stringify({ name: $("botName").value.trim(), systemPrompt: $("botPrompt").value }),
+    });
+    await refreshBots();
+    await selectBot(body.bot.botId);
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+function card(parts) {
+  const node = document.createElement("div");
+  node.className = "row-card";
+  const line = document.createElement("div");
+  line.className = "line";
+  for (const part of parts) {
+    if (typeof part === "string") {
+      const text = document.createElement("span");
+      text.textContent = part;
+      line.append(text);
+    } else {
+      line.append(part);
+    }
+  }
+  node.append(line);
+  return node;
+}
+
+function badge(text, kind) {
+  const node = document.createElement("span");
+  node.className = "badge " + kind;
+  node.textContent = text;
+  return node;
+}
+
+function addReason(node, text) {
+  if (!text) return;
+  const reason = document.createElement("div");
+  reason.className = "reason";
+  reason.textContent = text;
+  node.append(reason);
+}
+
+function renderCapabilities(platform) {
+  const list = $("platformList");
+  list.replaceChildren();
+  for (const capability of platform.capabilities) {
+    const node = card([
+      capability.id,
+      badge(capability.state === "available" ? "可用" : "不可用", capability.state),
+      "依据：" + capability.verification,
+    ]);
+    addReason(node, capability.reason);
+    list.append(node);
+  }
+}
+
+function renderProvisioning(platform) {
+  const list = $("provisioningList");
+  list.replaceChildren();
+  for (const record of platform.provisioning) {
+    const kind = record.state === "ready" ? "available" : record.state === "failed" ? "failed" : "unavailable";
+    const node = card([
+      record.botId,
+      badge(PROVISION_LABEL[record.state] || record.state, kind),
+      "第 " + record.attempt + " 次",
+    ]);
+    addReason(node, record.error);
+    addReason(node, record.unavailable.length ? "未启用：" + record.unavailable.join(", ") : "");
+    list.append(node);
+  }
+  if (platform.provisioning.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "尚无初始化记录。";
+    list.append(empty);
+  }
+}
+
+async function renderIntegrations() {
+  const body = await api("/api/integrations");
+  const list = $("integrationList");
+  list.replaceChildren();
+  for (const integration of body.integrations) {
+    const node = card([
+      integration.service,
+      badge(integration.state === "connected" ? "已连接" : integration.state === "authorization_pending" ? "等待授权" : "未连接",
+        integration.state === "connected" ? "available" : "unavailable"),
+    ]);
+    addReason(node, integration.reason);
+    addReason(node, integration.authorization.note);
+    const request = document.createElement("button");
+    request.type = "button";
+    request.textContent = integration.state === "authorization_pending" ? "重新登记授权请求" : "请求授权";
+    request.addEventListener("click", async () => {
+      request.disabled = true;
+      try {
+        const result = await api("/api/integrations/" + encodeURIComponent(integration.service) + "/authorization-requests", { method: "POST", body: "{}" });
+        note("已登记 " + integration.service + " 授权请求（" + result.requestId + "）；本阶段不会建立连接。" + result.message);
+        await renderIntegrations();
+        await refreshBots();
+      } catch (error) {
+        showError(error.message);
+        request.disabled = false;
+      }
+    });
+    node.append(request);
+    list.append(node);
+  }
+}
+
+async function openPlatform() {
+  try {
+    const platform = await api("/api/platform");
+    renderCapabilities(platform);
+    renderProvisioning(platform);
+    await renderIntegrations();
+    $("platformDialog").showModal();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+async function boot() {
+  $("send").addEventListener("click", () => void send());
+  $("cancel").addEventListener("click", () => void cancel());
+  $("newBot").addEventListener("click", () => void createBot());
+  $("retryInit").addEventListener("click", () => void retryInit());
+  $("platformBtn").addEventListener("click", () => void openPlatform());
+  $("closePlatform").addEventListener("click", () => $("platformDialog").close());
+  $("menu").addEventListener("click", () => $("sidebar").classList.toggle("open"));
+  $("signOut").addEventListener("click", () => {
+    state.token = ""; writeToken(""); setConnected(false);
+    state.bots = []; state.selected = null; clearLive();
+    if (state.source) { state.source.close(); state.source = null; }
+    renderBots(); renderChatMeta();
+    void boot();
+  });
+  $("text").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); void send(); }
+  });
+
+  if (!state.token) state.token = readToken();
+  clearError();
+  try {
+    // Try the data route first. A deployment with WEB_AUTH=off answers without a token; an
+    // authenticated one answers 401 and only then does the browser ask for it.
+    await refreshBots();
+  } catch (error) {
+    if (error.message.indexOf("访问令牌无效") >= 0 && askToken()) {
+      try { await refreshBots(); } catch (again) { showError(again.message); return; }
+    } else { showError(error.message); return; }
+  }
+  // The first Bot already exists: the platform created and initialized it before this page loaded.
+  const first = state.bots.find((bot) => bot.botId === "default") || state.bots[0];
+  if (first) await selectBot(first.botId);
+}
+
+void boot();
+</script>
+</body>
+</html>

@@ -1,10 +1,10 @@
 # 远程工具执行（阶段 1）
 
-本文是阶段 1 的运行说明：把 `bash` 等命令工具放到第二台 VPS 上执行，控制面只保留会话、记忆、投递与工具调用记录。设计取舍见 [ADR-0021](adr/0021-control-execution-split.md)。
+当前唯一执行面是 Phase 1 共享 CVM Execution Host：控制面通过既有 mTLS RPC 调用 `bash` 与 `read`／`write`／`edit`，执行端必须设置 `EXECUTION_AGENT_SHARED_HOST=1` 并以专用非 root 用户运行，所有 Bot 共用软件与文件，以 `/workspaces/<botId>` 为默认工作目录，不提供 OS 级隔离。唯一入口为 dashboard 控制台（dash）。配置、启动守卫与待执行的部署验收见[共享执行主机 Runbook](runbook-shared-execution-host.md)。
 
-> 统一 RPC Execution Agent 的 Phase 1／2 已在仓库实现：控制面设置 `EXECUTION_REMOTE_TRANSPORT=rpc` 时，直接 `bash` 与 `read`／`write`／`edit` 走同一条 RPC direct session，详见 [远程 PTC spec](spec-20261102-remote-ptc-sandbox.md) 与 [Phase 2 验收记录](acceptance/20261103-remote-ptc-phase2.md)。本文所述的 one-shot SSH 路径仍可显式选择（默认 `EXECUTION_REMOTE_TRANSPORT=ssh`），作为迁移验收前的兼容路径。
->
-> 生产容器形态由 `docker-compose.rpc.yml` 提供：app 容器只连宿主 Unix socket，宿主网络里的 `rpc-gateway` 持有 mTLS 身份；部署步骤见 [Runbook 5.4](runbook-remote-ptc-phase1-2.md#54-全线-rpcapp-容器--宿主-gateway)。
+`docker-compose.rpc.yml` 中 app 容器只连宿主 Unix socket，宿主网络里的 `rpc-gateway` 持有 mTLS 身份，沿用原有传输和证书。控制面保留会话、记忆、接收状态与工具调用记录；断线不自动重放，结果未知不能当作未执行。PTC／codemode 已退役，旧材料见[归档说明](../archive/ptc-codemode/README.md)。
+
+> **以下仅为历史 SSH broker 运行说明，不是当前部署入口。** 保留这些命令用于理解 [ADR-0021](adr/0021-control-execution-split.md) 的演变；当前部署与回滚以共享执行主机 Runbook 为准。
 
 SSH 传输只实现 **shell**。`read`／`write`／`edit` 等文件工具在该模式下返回 `not_supported`，这是有意的失败关闭：避免模型在控制面读到与执行面不同的同名文件。文件工作请通过 `bash` 在执行主机上完成；需要远程文件工具时改用 rpc 传输。
 
@@ -134,6 +134,6 @@ docker compose -f docker-compose.yml -f docker-compose.execution.yml \
 
 - 不承诺跨主机恰好一次。恢复重放仍按 [ADR-0008](adr/0008-unsafe-tool-replay.md) 保守处理，声明可安全重放前必须确认重复执行没有副作用。
 - 切换 `EXECUTION_MODE` 或 `EXECUTION_REMOTE_TRANSPORT` 前先让未完成任务收敛。durable 恢复会把未完成的工具调用重放到当前配置的执行环境；在 ssh 传输下文件工具调用会显式失败并记录为错误，不会被当作成功。
-- 执行 VPS 上的工作目录与缓存是本地状态，不参与控制面的会话／记忆／投递恢复。
-- 本文的 SSH 传输不实现远程文件系统、文件监听或文件工具；rpc 传输的文件原语与其边界见 [远程 PTC spec](spec-20261102-remote-ptc-sandbox.md)。两种传输都不把执行 VPS 加入 MITM 网络，也不发布 broker 端口。
+- 执行 VPS 上的工作目录与缓存是本地状态，不参与控制面的会话／记忆／请求状态恢复。
+- 历史 SSH 传输不实现远程文件系统、文件监听或文件工具；当前 RPC 文件原语与其边界见[共享执行主机 Runbook](runbook-shared-execution-host.md)。两种拓扑都不把执行 VPS 加入 MITM 网络，也不发布 broker 端口。
 - 模型调用仍经 MITM，密钥仍由代理按占位符替换。阶段 2／3 的凭据签发与模型直连不在本文范围，见 [ADR-0021](adr/0021-control-execution-split.md#阶段顺序)。

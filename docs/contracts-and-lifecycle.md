@@ -50,7 +50,7 @@
 
 `createToolRegistry(extensions, { authority, log })` 在每个原生工具执行函数外统一复核 Register，顺序为精确名称存在、state 为 available、当前权限足够，然后才进入工具实现。取消信号先检查；参数修复和参数校验仍由底座执行，参数不合法时不会到达复核执行器。内置、MCP、后装工具和 `api.executeTool()` 嵌套调用共用此边界。安全重放进入执行函数时再次使用当前状态和权限；unsafe 工具仍按底座规则报告执行结果未知，不因权限变化重跑。
 
-权限由宿主固定为 `owner`（默认，可执行 read 和 write）或 `restricted`（仅 read）。生产 `openAgent()` 通过 `toolAuthority` 注入，作用于整个实例的所有会话、任务及恢复；模型参数、MCP 描述和 annotations 均不能提升权限。现有 Telegram 入口已认证为所有者，使用默认 owner。当前只预留受限实例入口，尚未实现请求间动态切换、多级身份系统或破坏性操作二次确认。authz 配置在启动时应用，包括未完成任务的后续执行；它不改变工具声明字节、加载编号、epoch、trust 或 replay。
+权限由宿主固定为 `owner`（默认，可执行 read 和 write）或 `restricted`（仅 read）。生产 `openAgent()` 通过 `toolAuthority` 注入，作用于整个实例的所有会话、任务及恢复；模型参数、MCP 描述和 annotations 均不能提升权限。现有 dashboard 控制台入口通过宿主 Web Token 认证，使用默认 owner。当前只预留受限实例入口，尚未实现请求间动态切换、多级身份系统或破坏性操作二次确认。authz 配置在启动时应用，包括未完成任务的后续执行；它不改变工具声明字节、加载编号、epoch、trust 或 replay。
 
 | 拒绝原因 | 结果与恢复提示 |
 | --- | --- |
@@ -91,7 +91,7 @@
 
 ### 工具凭证
 
-工具静态凭证由部署环境提供：Bot token、模型 API key 与 MCP 配置中的 `${ENV}` 引用都从应用进程环境解析，真实值只存在于部署的 env 文件中。应用不将秘密写入工具参数或 durable 状态。凭证的存放与权限（例如 env 文件 600 权限）由部署负责，应用只做存在性与形状校验。
+工具静态凭证由部署环境提供：控制台 Web Token、模型 API key 与 MCP 配置中的 `${ENV}` 引用都从应用进程环境解析，真实值只存在于部署的 env 文件中。应用不将秘密写入工具参数或 durable 状态。凭证的存放与权限（例如 env 文件 600 权限）由部署负责，应用只做存在性与形状校验。
 
 凭证错误不改变业务重放语义；刷新或轮换凭证不能成为重放未知写入的理由。MCP 外部 OAuth 继续使用下文的宿主 token 状态，属于本轮接入保留的独立认证流程。
 
@@ -125,17 +125,11 @@ OAuth token 归宿主，保存于 `DATA_DIR/mcp-oauth/<server>.json`（`0600`、
 
 边界：MCP server 与应用同 uid，不构成安全边界；模型可通过 bash 读取进程环境与数据目录。真正的隔离需要独立用户、容器或远端 server。
 
-### 代码调用工具（PTC／codemode）
+### 共享执行主机
 
-`CODEMODE_ENABLED=1` 时安装底座的 `codemode` 工具。模型写一段 JavaScript，由 QuickJS WASM sandbox 执行；只有脚本结果进入模型上下文，嵌套工具结果不进入 transcript。设计取舍见 [ADR-0019](adr/codemode-ptc/0019-codemode-ptc.md)，配置与运行说明见 [代码调用工具](codemode.md)。
+Computer 工具只经既有 mTLS RPC 调用 Phase 1 共享 CVM Execution Host，提供 `bash` 与 `read`／`write`／`edit`。执行端必须设置 `EXECUTION_AGENT_SHARED_HOST=1`，以专用非 root 用户运行；Bot 使用各自默认工作目录，但共享软件与文件，不提供 OS 级隔离。启动探针失败即拒绝，不回退到控制面执行。保留超时、取消、并发与输出限制，RPC 断线不自动重放，结果未知不能当作未执行。见[共享执行主机 Runbook](runbook-shared-execution-host.md)。
 
-- `codemode` 的 `callers` 为 `["model"]`，脚本不能再次调用 codemode；`replay` 为 `safe`。
-- 脚本工具面由 `callers` 白名单决定：本地为 `read`／`write`／`edit`／`bash`，远程执行阶段 1 只有 `bash`。模型仍能看到全部工具；每次嵌套调用仍经过 `createToolRegistry()` 的名称、state、authz、参数校验和恢复策略复核。
-- 模型可见结果上限为 32 KiB／1000 行、保留尾部。脚本首行的 `max_output_tokens`／`timeout_ms` 只能进一步收紧，仍受宿主上限和请求等待约束。
-- 嵌套调用在宿主侧串行执行（ADR-0009）；codemode 调用结束（完成、失败或超时）或被取消时，正在运行的嵌套调用被取消，尚未启动的排队调用不再启动。
-- 默认脚本期限 240 秒、QuickJS 内存上限 128 MiB；配置范围见 `src/config.ts`。应用关闭时 Harness 先取消工具上下文，再关闭 sandbox。
-- 远程模式下没有远程文件 API；codemode 的自动完整输出落盘不可用，大输出应由脚本用 `bash` 写到执行主机文件，再由后续 `bash` 读取。
-- QuickJS 只限制脚本运行时能力，不是 OS 沙箱；`bash` 与模型直接调用具有相同宿主权限。脚本源码和命令参数会进入 durable 会话记录，不得写入凭据。
+PTC／codemode 已退役，源码、测试与文档只作[历史归档](../archive/ptc-codemode/README.md)。RPC 仍识别旧的 `vm.start`／`vm.reply`／`vm.message`／`tool.call` 方法值，但明确返回 `not_implemented`，只维持帧格式兼容。
 
 ## 请求生命周期
 
@@ -159,33 +153,31 @@ OAuth token 归宿主，保存于 `DATA_DIR/mcp-oauth/<server>.json`（`0600`、
 
 ### 正常路径
 
-1. 接收 Telegram update，校验身份、私聊类型和输入限制。
-2. 将合法请求与消费位置在本地事务中保存，再进行下一次会确认消费位置的轮询。
-3. 按顺序向底座提交请求，持续使用同一个 requestId。
+1. dashboard 控制台验证 Web Token、目标 Bot 状态与输入限制。
+2. 宿主生成 `console:<botId>:<uuid>` 请求标识，在本地事务中保存请求后才返回 HTTP 202。
+3. 各 Bot 的 worker 按接收顺序向底座提交请求，持续使用同一个 requestId。
 4. 底座处理模型和工具循环，产生本次请求的终态。
-5. 将最终回复或明确失败提示保存到投递记录。
-6. 按 Telegram 限制拆分消息并发送，记录每段确认结果。
-7. 全部段落确认后标记投递完成。
+5. 将最终回复或明确失败提示保存到 inbox；控制台回复直接记为终态 `sent`，不创建分段投递记录。
+6. 控制台通过历史接口读取会话，通过 SSE 展示实时事件；浏览器连接不是执行状态的权威来源。
 
 ### 恢复窗口
 
 | 中断位置 | 恢复方式 |
 | --- | --- |
-| 本地保存请求之前 | Telegram 尚未被确认消费，可重新获取 |
-| 已保存、尚未提交底座 | 从本地记录提交 |
+| 本地保存请求之前 | 未确认接收；控制台调用方不能把未收到 202 当作执行成功 |
+| 已保存、尚未提交底座 | 从本地 pending 记录提交 |
 | 已提交、应用尚未保存底座关联 | 用同一 requestId 找回已有提交，依赖底座去重契约 |
 | agent 已完成、回复尚未保存 | 从底座已有结果构建回复，不重新执行任务 |
-| 回复已保存、尚未发送 | 从投递记录发送 |
-| 已发送、确认尚未保存 | 标记结果未知；不能保证自动重发不会重复 |
-| 部分分段已确认 | 保留每段状态，不重新发送已确认段落 |
+| 回复已保存、浏览器未看到 | 重新读取历史；不重新执行任务 |
+| SSE 连接中断 | 流事件不是持久化收据，通过历史与 Bot 状态核对 |
 
-Telegram sendMessage 没有可供本应用使用的幂等键，因此系统不承诺端到端恰好一次。对于结果未知的发送，当前实现保留记录并提供诊断，不自动重发整条回复。取舍见 [ADR-0007](adr/0007-delivery-not-exactly-once.md)。
+接收、执行与展示状态保持分离。浏览器是否收到响应不保证端到端恰好一次；重新发送文本会生成新的 requestId，不能以内容相同去重。旧 Telegram 的逐段投递状态机与管理 CLI 已移除，既有表和数据保留；结果未知不等于未发送的安全原则仍适用，历史取舍见 [ADR-0007](adr/0007-delivery-not-exactly-once.md)。
 
 ### 超时与关闭
 
 停止等待不等于终止 agent。用户取消或执行超时，需要调用底座的取消接口并确认终态；已经提交的外部副作用仍可能发生。
 
-进程正常退出与用户取消不同：退出时关闭底座并保留可恢复状态，不把所有未完成请求改成业务失败。重启后从已保存的请求、底座状态和投递记录继续。
+进程正常退出与用户取消不同：退出时关闭底座并保留可恢复状态，不把所有未完成请求改成业务失败。重启后从已保存的请求、底座状态和回复继续。
 
 ## pi durable 1.3.0 已核实行为
 
@@ -205,23 +197,22 @@ Telegram sendMessage 没有可供本应用使用的幂等键，因此系统不�
 - `StreamableHttpTransport` 把 401 交给 `adaptOAuthProvider`；无法用已存 token 或 refresh token 恢复时抛 `McpOAuthAuthorizationRequiredError`。
 - `toLlmContent()` 把文本、图片、嵌入资源和结构化结果转换为 pi-ai 的 text/image 内容，可直接作为工具 `output`。
 
-## 应用状态与投递实现
+## 应用状态与控制台展示
 
-- 本地请求使用 `telegram:<botId>:<updateId>`，数据目录绑定 bot ID 与 owner ID。单用户 Telegram 私聊映射到一个底座 root 会话；未来多会话需另行保存路由关系。
-- `inbox` 保存请求，`checkpoint` 保存消费位置，两者在同一 SQLite 事务中写入。重复 ID 的不同内容直接报错，不推进 offset。本地历史只清理已完成的 `sent` 请求，保留最新 100 条；`pending`、`ready`、`failed`、`uncertain` 请求永不自动清理，关联投递与诊断记录随请求级联删除。长期执行去重仍依赖底座。
-- `inbox.receivedAt`／`repliedAt` 与 `deliveries.createdAt`／`updatedAt` 记录 ISO 8601 UTC 时间，用于区分"已接收但未处理"和"已处理但投递失败"。升级前写入的行保持 `null`（未知），不以迁移时刻回填；迁移只追加可空列，可重复执行。
-- 应用请求状态为 `pending → ready → sent`；agent 执行属于底座，本地 pending 不复制 queued/placed。普通 agent 失败生成待投递的失败提示，错误码另存。若底座 Session 已永久失败（`SessionFailed`），应用不写失败提示、请求保持 `pending`，由 `serveTelegram` 向上抛出 `AGENT_SESSION_FAILED`；进程以退出码 1 结束，交给进程管理器重启。本地 SQLite 写入失败同样按致命错误处理。
-- 模型以 `stopReason: "length"` 结束时，可见文本不完整。应用保留已生成的部分文本，以 `AGENT_TRUNCATED` 记录并通过投递提示明确说明截断，不把该文本当作完整成功，也不自动续写或重试。完整会话记录仍由底座保存。
-- `deliveries` 按 `(requestId, part)` 保存文本，分段状态为 `pending → sending → sent`；失败分为 `failed` 与 `uncertain`。确认时记录 Telegram message ID。每段最多 4000 个 UTF-16 code units，不切开代理对，使用纯文本发送。
-- Telegram 明确 4xx 拒绝记录为 failed；网络失败和其他无法排除送达的情况记录为 uncertain。重启将遗留 sending 转为 uncertain。阻塞请求不自动重发，但允许处理后续独立请求。
-- 投递管理 CLI 支持列出、重试该段、人工确认该段已送达。操作前停止应用，核对实际 Telegram 消息；重试仅发送已有结果，不重新运行 agent。CLI 打开数据库后先执行恢复，因此进程发送中被强杀时遗留的 `sending` 段以 `uncertain` 出现在列表中，`sending` 本身不会直接暴露给操作者。先前版本没有逐段记录的 uncertain 请求保留原记录，需人工核对。
-- 轮询遇到网络故障或服务端错误采用有界退避，明确配置/认证错误退出交给进程管理器处理。每次最多接收 10 条，先处理本地待办再继续轮询；当前不保证长期离线或持续积压情况下的可靠收件。
-- 操作失败只记录安全错误码，不向日志输出 SDK 请求对象或凭据。工具的详细执行记录仍归底座管理。启动失败时，`ConfigurationError` 与 `StateError`（数据目录已绑定其他 bot／owner 等）打印应用自己写的 message；其余异常只打印错误码，避免 SDK 错误对象带出凭据或消息内容。
+- 本地请求使用 `console:<botId>:<uuid>`，来源命名空间与 Bot 路由由宿主生成；每个 Bot 绑定持久化底座会话。相同文本的独立发送仍是不同请求。
+- `acceptConsole()` 在事务中保存 inbox 请求后才确认接收。重复 ID 的不同文本或 conversationId 直接报错；长期执行去重仍依赖底座，不以浏览器事件代替持久化状态。
+- `inbox.receivedAt`／`repliedAt` 记录 ISO 8601 UTC 时间。既有未知时间保持 `null`，不能以升级时刻伪造历史时间。
+- 各 Bot worker 只处理自己命名空间内的 `pending` 请求，并将同一个 requestId 交给底座。`saveConsoleReply()` 将回复与 `sent` 状态在事务中保存；普通失败保存明确失败提示并另存错误码。这里的 `sent` 表示控制台回复已保存，不表示外部消息已送达或浏览器已阅读。
+- 控制台不创建 deliveries 行；历史接口读取 durable 会话，SSE 展示实时事件。刷新或断流只需重取状态与历史，不能因展示失败重新执行业务任务。
+- 取消先将仍为 pending 的请求标为 `failed`，再请求底座中止会话；迟到结果不能覆盖已取消记录。取消执行仍须确认终态，外部副作用不保证撤销。
+- 模型以 `stopReason: "length"` 结束时，可见文本不完整。应用保留已生成的部分文本，以 `AGENT_TRUNCATED` 记录并明确提示截断，不把该文本当作完整成功，也不自动续写或重试。完整会话记录仍由底座保存。
+- Telegram 接入、`reminder_*` 工具、提醒调度器与逐段投递状态机均已移除。既有 SQLite 表、行与历史状态原样保留，不迁移为已送达，不自动补发或重跑旧任务。
+- 操作失败只记录安全错误码，不向日志输出 SDK 请求对象或凭据。工具的详细执行记录仍归底座管理；配置错误以外的启动异常只打印错误码，避免带出凭据或消息内容。
 
-具体启动、投递管理及部署命令见 README.md。
+具体启动与部署命令见 README.md。
 
 ## 当前运行尺度
 
-当前为一个应用进程、一个用户会话、一个执行中的用户请求，SQLite 保存运行状态；现有负载不需要额外消息队列服务或逐工具独立框架。扩展会话、并发或后台任务时，按具体需求更新状态归属、资源限制及相关契约。
+当前为一个应用进程、单用户、多 Bot，每个 Bot 按顺序处理请求，SQLite 保存运行状态；Computer 工具共用一个执行主机。现有负载不需要额外消息队列服务或逐工具独立框架。扩展并发或后台任务时，按具体需求更新状态归属、资源限制及相关契约。
 
-验收重点是边界行为：非法参数不执行、相同请求不重复提交、完成结果可重取、中断工具按策略恢复、部分投递不整条重发，以及超时确实触发取消而非仅停止等待。
+验收重点是边界行为：非法参数不执行、相同请求不重复提交、完成结果可重取、中断工具按策略恢复、展示断流不重新执行，以及超时确实触发取消而非仅停止等待。

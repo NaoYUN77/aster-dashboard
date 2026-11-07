@@ -8,7 +8,12 @@
 #   - the app container holds no execution certificate and can only open the Unix socket;
 #   - rpc-gateway runs in the host network namespace with the `aster-gateway` client certificate,
 #     dials the agent over private TCP with mutual TLS, and relays frames byte for byte;
-#   - the execution agent still enforces the client CN, its own bind address and the sandbox limits.
+#   - the execution agent still enforces the client CN, its own bind address and execution limits.
+#
+# Phase 1 shared host: the CVM runs rpc-main.js with EXECUTION_AGENT_SHARED_HOST=1 as a dedicated
+# non-root user over /workspaces, reusing this gateway and its mTLS certificates unchanged.
+# That agent advertises Bash / Read / Write / Edit. See
+# docs/runbook-shared-execution-host.md. No CVM service, permission or firewall is changed here.
 #
 # Host paths (defaults mirror docker-compose.execution.yml):
 #   EXECUTION_SOCKET_DIR  shared with the app; must exist, uid/gid 1000, mode 0700
@@ -18,13 +23,14 @@ services:
     environment:
       EXECUTION_MODE: remote
       EXECUTION_REMOTE_TRANSPORT: rpc
-      EXECUTION_REMOTE_CWD: ${EXECUTION_REMOTE_CWD:-/shared/aster}
+      # The shared host confines every bot to /workspaces/<botId>; /shared belongs to the legacy PTC
+      # path and would be rejected by the shared host's workspace rule.
+      EXECUTION_REMOTE_CWD: ${EXECUTION_REMOTE_CWD:-/workspaces}
       EXECUTION_DEFAULT_TIMEOUT_SECONDS: ${EXECUTION_DEFAULT_TIMEOUT_SECONDS:-300}
       EXECUTION_MAX_TIMEOUT_SECONDS: ${EXECUTION_MAX_TIMEOUT_SECONDS:-3600}
       # The app only sees the host Unix socket; the gateway owns the mTLS identity.
       EXECUTION_RPC_TRANSPORT: unix
       EXECUTION_RPC_SOCKET: /run/aster/execution/rpc.sock
-      CODEMODE_ENABLED: ${CODEMODE_ENABLED:-1}
     volumes:
       - type: bind
         source: ${EXECUTION_SOCKET_DIR:-${HOME:-/root}/Aster/run/execution}
