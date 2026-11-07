@@ -179,6 +179,57 @@ PTC／codemode 已退役，源码、测试与文档只作[历史归档](../archi
 
 进程正常退出与用户取消不同：退出时关闭底座并保留可恢复状态，不把所有未完成请求改成业务失败。重启后从已保存的请求、底座状态和回复继续。
 
+## Bot 删除与重置
+
+契约为两段：**墓碑即时**，**物理回收在下一个进程边界**。删除是真实擦除——会话、记忆与执行账本的行从存储中消失——工作区文件保留。长期取舍与理由见 [ADR-0023](adr/zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md) 决策 9/11 及其实现记录；本节只写现行契约与限制。
+
+### 入口、授权与参数
+
+删除只经控制台 `DELETE /api/bots/:id`。它**不是模型工具**：模型参数、MCP 工具与投递路径都不能触发删除或自重启。范围由墓碑行上的 `conversationId` 决定，绝不接受调用方给出的范围；body 只接受三个字段——`force`（布尔）、`purge`（`"later"`（默认）或 `"now"`）、`reason`（可选字符串，≤500 字符，仅用于留痕，不是授权依据）。不接受路径、会话 id、表名或任何可影响删除范围的参数。凭据与身份由宿主提供，与删除无关。
+
+### 两段语义与措辞
+
+- **墓碑**：`bots.status = 'deleted'`，立即从 `GET /api/bots` 隐藏，其它路由（消息、取消、重试、历史、事件）返回 `410 { error: "bot_deleted" }`；`botId` 永久不复用，`POST /api/bots` 用同一 id 返回 `409 { error: "bot_id_retired" }`（保留 Bot 的重置不退役 id）。墓碑行长期保留，它同时是"该 id 已退役"的权威记录，并保留 `conversationId` 作为历史关联。
+- **回收**：进程启动时、`openAgent()` 打开 harness 与任何会话**之前**执行一遍回收；离线入口（`npm run bots:purge`）在服务停止时执行同一份实现。响应与留痕**不得声称物理擦除已完成**；用户视角的移除与物理回收分开表述，积压量由 `/api/platform` 的 `pendingPurge` 给出。墓碑生效期内 `inbox.text`（用户正文）与底座的行**仍在磁盘上**，这一点必须在文案上被承认，而不是被措辞掩盖。
+- 保留 Bot（`default`）的"删除"是**重置**：`bots` 行与会话行保留、`conversationId` 不变、id 不退役，只清空该会话的内容（`entries`/`documents`/`document_revisions`/`tasks`/`submissions`）。理由是 `Harness.root()` 的契约是"保留会话，不存在时创建"，真删 root 行只会换来一个新 id。
+
+### 拒绝与 `force`
+
+| 情况 | 结果 |
+| --- | --- |
+| 运行中（`view.running !== null`） | `409 bot_is_running`，`force` 不放行 |
+| 有待处理输入（`view.pending > 0`） | `409 bot_has_pending_input`，`force` 不放行 |
+| 底座里仍有非终态 task 或 `queued`/`placed` submission | `409 work_in_flight`（带 `tasks`/`submissions` 计数），`force` 不放行 |
+| 终态 task 的 `outcome.status <> 'completed'`，或 `unanswered` submission | `409 unknown_outcome`（带 `records` 计数），`force` 放行并记 `removalForced` |
+| 有其它会话继承该会话历史 | `409 fork_survivor`（带 `conversations` 计数），`force` 放行并连同继承者一并删除 |
+| 其它 Bot 有在途工作且 `purge: "now"` | `409 busy_bots`（列出受影响的 bot 与原因），`force` 不替代取消 |
+| 同一 Bot 重复 DELETE | `200`，返回第一次的 `removal`，`requestedAt` 不变，不重复留置 |
+
+前三类与 `busy_bots` 是**可行动**的拒绝（先取消、先答复、先停别的 Bot），`unknown_outcome` 与 `fork_survivor` 才是 `force` 覆盖的对象：没有进程再拥有那些行，谁也无法使其确定。`force` 与 `purge` 是两个独立字段，互不隐含；`force: true` 的重复 DELETE 可以升级一条**尚未成行**（`removalReport` 仍为 `null`）的 intent——这是操作者把卡住的墓碑推向下一次回收的方式，已完成的回收不会被重新留置。
+
+### 回收范围
+
+只删该会话及其**归属**的行：`conversations`（重置时保留）、`entries`、`tasks`、`submissions`，以及 `scope.kind = 'conversation'` 且属于该会话的 `documents` 与 `document_revisions`（含 `pi.agent`、记忆的 `personal.*` 与 Tool Ledger 的 `personal.tools.loads`）。按**作用域**过滤而不是按 kind：`scope.kind = 'session'` 的文档（含注册目录 `personal.tools.catalog`）一律保留。
+
+不动的面：`record_ids` 与 `durable_schema`（id 水位不回滚，`mintId()` 的"大于所有历史 id"承诺因此继续成立）、其它会话的每一行、工作区文件（全部保留，含共享主机模式下 `default` 的 `/workspaces` 父目录）、`DATA_DIR/memory/daily/*.md`（按归属模型清理，不按目录清空）。
+
+`inbox.sqlite` 侧：删 `requestId` 以 `console:<botId>:` 开头的行（`inbox.text` 是用户正文；留着则"删除"名不副实，且 `pendingForBot` 会永久非零）、其 `deliveries`/`failures` 引用行、该 Bot 的 `bot_provisioning` 行。`integrations`/`checkpoint`/`identity` 不动。
+
+### 幂等、资源边界与失败恢复
+
+- 幂等：重复 DELETE 不重复留置；同一会话第二次 purge 报 `absent` 而不是失败；pass 可重跑且结果收敛。
+- 一次回收最多处理 `MAX_REMOVALS_PER_PASS = 64` 个墓碑，余量记 `deferred` 并在日志与报告中明确数量，不静默丢弃；单个会话单次删除的行数上限 200000，超限**整会话拒绝**（不部分删除）并保留 intent 供下次重试。
+- `VACUUM` 在确有删除时执行一次，位于删除之后、`openAgent()` 之前（需独占且不能在事务内）；失败不阻塞启动但要报告。
+- `removalReport` 是唯一结束 intent 的字段，**最后写入**：删行与清理 `inbox` 成功后才写；失败写 `removalError` 并保持 pending，下次 pass 重试。因此"`agent.sqlite` 已删、`inbox.sqlite` 未删"的崩溃窗口由重跑收敛，且墓碑不会被重复留置。回收失败不阻塞启动——一个 Bot 清不掉不该让其它 Bot 起不来。
+- 单写者：回收期间不得有第二个写者。离线入口先取 `DATA_DIR/service.lock`，有活持有者时以 `SERVICE_RUNNING` 拒绝，且**没有 `--force`**（两个写者重叠是唯一不能由调用方"自己负责"的失败）。
+
+### 已知限制
+
+- **版本闸门按已安装底座的 schema 精确匹配**：`durable_schema` 版本与每张表的**列集合完全一致**（缺一列或多一列都算不匹配）才允许回收，不匹配即拒绝删除并保留 intent；不匹配不影响服务启动。升级底座必须先复核这道闸门，见 ADR-0013。宿主直接操作 SQLite 不经过底座的写入校验，这是有意的技术债，用这道闸门与契约测试兜住，并收在 `ConversationPurger` 接缝之后。
+- **失败删除没有控制台读出口**：失败的墓碑已从 `views()` 隐藏，只有部署日志的 `Bot removal failed: <botId> (<CODE>)` 与 `inbox.sqlite` 的 `removalError` 可查，`/api/platform` 只给 `pendingPurge` 数量。运维需要按 botId 查库才能看到原因。
+- **锁的同 pid 接管规则**（为测试内嵌两次启动而设）意味着在**同一进程内**调用 `purgeBots()` 时，服务正在运行不会被拒绝；发布形式是独立进程（`npm run bots:purge`），生产路径安全，但进程内调用不是受保护的用法。
+- 控制台与 BotManager 的日志走进程 stderr（`console.error`），不经过宿主可注入的 `log`；嵌入宿主无法从自己的 sink 拿到删除日志行。
+
 ## pi durable 1.3.0 已核实行为
 
 - 工具结果的 `output` 给模型读取，`structuredOutput` 给程序化调用方，`details` 给 UI 消费者；三者不能互相替代。业务失败可返回 `isError: true`，执行异常由底座转换成错误工具结果。
