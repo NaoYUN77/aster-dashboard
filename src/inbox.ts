@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { StateError } from "./errors.js";
+import { NotFoundError, StateError } from "./errors.js";
 import type { TextRequest } from "./messages.js";
 import { parseCatalogProfile, serializeCatalogProfile, parseToolScope, serializeToolScope, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
 import { migrateBotCatalog } from "./bot-catalog-migration.js";
@@ -19,7 +19,24 @@ export interface Job extends TextRequest {
   repliedAt: string | null;
 }
 
-export type BotStatus = "active" | "disabled";
+export type BotStatus = "active" | "disabled" | "deleted";
+
+export type BotRemovalKind = "delete" | "reset";
+
+/**
+ * One bot's accepted removal. The row is the durable intent, written when the operator asks and
+ * long before the rows it names are touched: `report` stays null until a purge pass has removed
+ * them, so a crash in between leaves retryable work instead of a forgotten delete. `error` keeps the
+ * last failed attempt until a later one succeeds.
+ */
+export interface BotRemoval {
+  readonly kind: BotRemovalKind;
+  readonly requestedAt: string;
+  readonly forced: boolean;
+  readonly reason: string | null;
+  readonly report: string | null;
+  readonly error: string | null;
+}
 
 /**
  * One bot and the conversation it owns. `tools` is a comma-separated capability list (`bash`,
@@ -38,6 +55,8 @@ export interface BotRecord {
   createdAt: string;
   /** Deployment-local tenant. Workspaces and credentials are never shared across this value. */
   userId: string;
+  /** Null while the bot is live; set for the whole life of an accepted removal. */
+  removal: BotRemoval | null;
 }
 
 export interface BotRegistration {
@@ -150,6 +169,15 @@ export class Inbox {
     // original table byte-for-byte recoverable. An existing single-owner installation keeps its
     // one tenant; new rows can name another.
     addColumn(this.db, "bots", "userId", "TEXT NOT NULL DEFAULT 'owner'");
+    // A removal is written here, on the bot row itself, so the intent survives a crash and a restart
+    // without a second table to keep in step. `removalReport` is the only field a purge pass writes,
+    // and its presence is what tells a later pass there is nothing left to do.
+    addColumn(this.db, "bots", "removalKind", "TEXT");
+    addColumn(this.db, "bots", "removalAt", "TEXT");
+    addColumn(this.db, "bots", "removalForced", "INTEGER");
+    addColumn(this.db, "bots", "removalReason", "TEXT");
+    addColumn(this.db, "bots", "removalReport", "TEXT");
+    addColumn(this.db, "bots", "removalError", "TEXT");
   }
 
   /**
@@ -351,6 +379,90 @@ export class Inbox {
     if (changed.changes !== 1) throw new StateError("Bot not found");
   }
 
+  // --- Removal: one durable intent per bot, written before anything is deleted. ---
+
+  /**
+   * Record the operator's decision to remove one bot. Repeating a request is idempotent: the first
+   * decision stands, and only an explicit `force` can be added to it later — an operator may need to
+   * override an outcome the first request did not know about.
+   */
+  requestRemoval(botId: string, request: { readonly kind: BotRemovalKind; readonly force: boolean; readonly reason: string | null }): BotRecord {
+    const bot = this.bot(botId);
+    if (bot === undefined) throw new NotFoundError("Bot not found");
+    const pending = bot.removal;
+    if (pending !== null) {
+      if (pending.report === null && request.force && !pending.forced) {
+        this.db.prepare("UPDATE bots SET removalForced = 1 WHERE botId = ?").run(botId);
+        return this.bot(botId) as BotRecord;
+      }
+      return bot;
+    }
+    this.db.prepare(`UPDATE bots SET status = ?, removalKind = ?, removalAt = ?, removalForced = ?,
+      removalReason = ?, removalReport = NULL, removalError = NULL WHERE botId = ?`).run(
+      request.kind === "delete" ? "deleted" : bot.status,
+      request.kind,
+      timestamp(),
+      request.force ? 1 : 0,
+      request.reason,
+      botId,
+    );
+    return this.bot(botId) as BotRecord;
+  }
+
+  /** Accepted removals whose rows are still in the store, oldest first. */
+  pendingRemovals(): readonly BotRecord[] {
+    return this.db.prepare("SELECT * FROM bots WHERE removalKind IS NOT NULL AND removalReport IS NULL ORDER BY rowid")
+      .all().map(decodeBot);
+  }
+
+  /** Mark one removal's rows as gone. Called only after the store reported them removed. */
+  finishRemoval(botId: string, report: string): void {
+    const changed = this.db.prepare("UPDATE bots SET removalReport = ?, removalError = NULL WHERE botId = ?").run(report, botId);
+    if (changed.changes !== 1) throw new StateError("Bot not found");
+  }
+
+  /** Keep a failed pass visible until a later one succeeds; the intent itself stays pending. */
+  failRemoval(botId: string, code: string): void {
+    const changed = this.db.prepare("UPDATE bots SET removalError = ? WHERE botId = ?").run(code, botId);
+    if (changed.changes !== 1) throw new StateError("Bot not found");
+  }
+
+  /** Drop a bot's provisioning row: a tombstone keeps the bot row, so no cascade ever runs for it. */
+  removeProvisioning(botId: string): void {
+    this.db.prepare("DELETE FROM bot_provisioning WHERE botId = ?").run(botId);
+  }
+
+  /**
+   * Delete one bot's console requests and their delivery rows. Called by the removal pass once the
+   * conversation's rows are gone, never at request time: the tombstone is immediate, but the user's
+   * own message is part of what the reclaim erases, and a surviving row would also keep
+   * `pendingForBot` permanently nonzero for an id that can never be used again.
+   */
+  deleteBotRequests(botId: string): { readonly requests: number; readonly deliveries: number; readonly failures: number } {
+    const prefix = `${consoleRequestPrefix(botId)}%`;
+    return this.transaction(() => {
+      const count = (sql: string): number => Number((this.db.prepare(sql).get(prefix) as { count: number }).count);
+      const requests = count("SELECT count(*) AS count FROM inbox WHERE requestId LIKE ?");
+      const deliveries = count("SELECT count(*) AS count FROM deliveries WHERE requestId IN (SELECT requestId FROM inbox WHERE requestId LIKE ?)");
+      const failures = count("SELECT count(*) AS count FROM failures WHERE requestId IN (SELECT requestId FROM inbox WHERE requestId LIKE ?)");
+      // deliveries and failures reference inbox rows with ON DELETE CASCADE and this connection
+      // enables foreign keys, so one delete removes the parts in the same transaction.
+      this.db.prepare("DELETE FROM inbox WHERE requestId LIKE ?").run(prefix);
+      return { requests, deliveries, failures };
+    });
+  }
+
+  /** Reclaim free pages after rows were deleted. Safe only while no other process writes this file. */
+  vacuum(): { readonly vacuumed: boolean; readonly error: string | null } {
+    try {
+      this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+      this.db.exec("VACUUM");
+      return { vacuumed: true, error: null };
+    } catch (error) {
+      return { vacuumed: false, error: error instanceof Error ? error.message : "unknown error" };
+    }
+  }
+
   close(): void {
     this.db.close();
   }
@@ -413,11 +525,44 @@ function validateBot(registration: BotRegistration): void {
   } catch (error) { throw new StateError(error instanceof Error ? error.message : "Bot catalog is invalid"); }
 }
 
+/** Durable rows are untrusted at the storage boundary: an invalid enum is a host error, not a default. */
 function decodeBot(row: object): BotRecord {
-  const stored = row as Omit<BotRecord, "profile"> & { profile: unknown };
-  return { ...stored, profile: parseCatalogProfile(stored.profile) };
+  const raw = row as Record<string, unknown>;
+  if (!BOT_STATUSES.includes(String(raw.status))) throw new StateError("Invalid bot status");
+  return Object.freeze({
+    botId: String(raw.botId),
+    name: String(raw.name),
+    conversationId: String(raw.conversationId),
+    systemPrompt: String(raw.systemPrompt),
+    tools: String(raw.tools),
+    profile: parseCatalogProfile(raw.profile),
+    toolScope: String(raw.toolScope),
+    status: raw.status as BotStatus,
+    createdAt: String(raw.createdAt),
+    userId: String(raw.userId),
+    removal: decodeRemoval(raw),
+  });
 }
 
+function decodeRemoval(raw: Record<string, unknown>): BotRemoval | null {
+  if (raw.removalKind == null) return null;
+  if (!REMOVAL_KINDS.includes(String(raw.removalKind))) throw new StateError("Invalid bot removal kind");
+  const requestedAt = raw.removalAt;
+  if (typeof requestedAt !== "string" || requestedAt === "") throw new StateError("Bot removal has no request time");
+  const forced = Number(raw.removalForced ?? 0);
+  if (forced !== 0 && forced !== 1) throw new StateError("Invalid bot removal flag");
+  return Object.freeze({
+    kind: raw.removalKind as BotRemovalKind,
+    requestedAt,
+    forced: forced === 1,
+    reason: typeof raw.removalReason === "string" ? raw.removalReason : null,
+    report: typeof raw.removalReport === "string" ? raw.removalReport : null,
+    error: typeof raw.removalError === "string" ? raw.removalError : null,
+  });
+}
+
+const BOT_STATUSES: readonly string[] = ["active", "disabled", "deleted"];
+const REMOVAL_KINDS: readonly string[] = ["delete", "reset"];
 const PROVISIONING_STATES: readonly string[] = ["provisioning", "ready", "degraded", "failed"];
 const INTEGRATION_STATES: readonly string[] = ["disconnected", "authorization_pending", "connected"];
 
