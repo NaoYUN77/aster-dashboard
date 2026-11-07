@@ -2,7 +2,8 @@
 
 面向运维在**单机部署**上执行。应用与本地 `execution-host`（共享 CVM Execution Host 的同机替代）
 都由 `dashboard/docker-compose.dashboard.yml` 定义；控制台只发布在宿主 `127.0.0.1:8787`，
-并强制 `WEB_TOKEN`。
+并强制 `WEB_TOKEN`（`WEB_AUTH=token`，也是应用默认值）。本套验收不覆盖 `WEB_AUTH=off`：
+该模式把认证完全交给回环／隧道边界，`run.sh` 的令牌前置检查不适用。
 
 > 本套验收针对**旧版显式 profile** 能力面：`run.sh` 会设置 `ALLOW_LEGACY_CATALOG=1`
 > （宿主级兼容开关，正常部署默认为 0）。Phase 1 只迁移 Bash / Read / Write / Edit；

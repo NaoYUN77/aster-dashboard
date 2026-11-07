@@ -396,13 +396,29 @@ test("a registered provider requires only its own API key and a model id", () =>
   }), /Missing configuration: DEEPSEEK_API_KEY/);
 });
 
-test("the console refuses an unauthenticated listener and stays off by default", () => {
+test("the console stays off by default and token auth is the fail-closed default", () => {
   const base = { MODEL_PROVIDER: "openai", OPENAI_API_KEY: "key", MODEL_ID: "m" };
   assert.equal(readConfig(base).console, undefined);
   assert.throws(() => readConfig({ ...base, CONSOLE_ENABLED: "1" }), /WEB_TOKEN must be 16-256/);
   const enabled = readConfig({ ...base, CONSOLE_ENABLED: "1", WEB_TOKEN: "0123456789abcdef" });
   assert.equal(enabled.console?.host, "0.0.0.0");
   assert.equal(enabled.console?.maxBots, 8);
+  assert.equal(enabled.console?.token, "0123456789abcdef", "no WEB_AUTH means token auth");
+  assert.equal(readConfig({
+    ...base, CONSOLE_ENABLED: "1", WEB_AUTH: " token ", WEB_TOKEN: "0123456789abcdef",
+  }).console?.token, "0123456789abcdef");
+  assert.throws(() => readConfig({ ...base, CONSOLE_ENABLED: "1", WEB_AUTH: "yes" }),
+    /WEB_AUTH must be token or off/);
+});
+
+test("WEB_AUTH=off is an explicit host opt-in that ignores WEB_TOKEN", () => {
+  const base = { MODEL_PROVIDER: "openai", OPENAI_API_KEY: "key", MODEL_ID: "m", CONSOLE_ENABLED: "1" };
+  assert.equal(readConfig({ ...base, WEB_AUTH: "off" }).console?.token, null);
+  // A stale/invalid token in the environment must neither be validated nor silently re-enable auth.
+  for (const token of ["short", "0123456789abcdef"]) {
+    assert.equal(readConfig({ ...base, WEB_AUTH: "off", WEB_TOKEN: token }).console?.token, null);
+  }
+  assert.equal(readConfig({ ...base, WEB_AUTH: " off " }).console?.token, null);
 });
 
 test("an unknown model id is rejected with provider examples", () => {

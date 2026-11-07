@@ -140,6 +140,11 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       workspaceRoot: join(config.dataDir, "workspaces"),
       ...(config.execution === undefined ? {} : { remoteWorkspaceRoot: config.execution.remoteCwd }),
       // The bootstrap bot keeps the single-bot installation's directory; new bots get their own.
+      // In shared-host mode that legacy path is `/workspaces` itself, i.e. the parent of every other
+      // bot's directory, so the default bot's file tools can reach sibling workspaces. This is the
+      // single-user MVP's known lack of per-bot isolation, not a per-bot sandbox. Moving it to
+      // `/workspaces/default` would strand existing files at the root, so it needs an explicit
+      // data-migration decision rather than a silent startup change.
       defaultWorkspace: config.execution?.remoteCwd ?? join(config.dataDir, "workspace"),
       web: config.ccrProfile !== undefined,
       manifest: platform.manifest,

@@ -49,14 +49,16 @@ chmod 600 .env
 - `MODEL_ID`：该提供商在 pi-ai 1.3.0 模型目录中的 id。
 - 当前提供商对应的 API key 变量（如 `ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`）；其他提供商的 key 留空。
 - `CONSOLE_ENABLED=1`：启用 dashboard 控制台，这是当前唯一入口。基础 `docker-compose.yml` 不发布端口；用 [`dashboard/docker-compose.dashboard.yml`](../dashboard/docker-compose.dashboard.yml) overlay 把控制台发布到宿主 `127.0.0.1:8787`，或通过 SSH 隧道／反向代理访问。
-- `WEB_TOKEN`：16–256 个可打印字符、不含空格的控制台令牌（`WEB_AUTH` 默认 `token`）。不要把它写进日志或聊天。
+- `WEB_AUTH` / `WEB_TOKEN`：`WEB_AUTH` 只接受 `token`（默认）或 `off`，其他取值启动即失败。默认 `token` 要求 `WEB_TOKEN` 为 16–256 个可打印字符、不含空格，所有 `/api/*` 与 SSE 都校验；静态页面保持公开，浏览器先加载再提示输入令牌。`off` 完全关闭令牌校验，只适用于控制台仅经 `127.0.0.1` 回环加 SSH 隧道／已认证反向代理可达、由该边界承担认证的场景，不要写进共享 `.env` 或当作默认值。令牌不要写进日志或聊天。
 - 可选：`CONSOLE_HOST`（IP 字面量，默认 `0.0.0.0`）、`CONSOLE_PORT`（默认 `8787`）、`CONSOLE_MAX_BOTS`。
 
 只检查键是否存在，不要在终端或日志中回显 `WEB_TOKEN` 或 API key 的值：
 
 ```sh
-grep -cE '^(MODEL_PROVIDER|MODEL_ID|CONSOLE_ENABLED|WEB_TOKEN)=.+' .env   # 预期 4
-grep -cE '^[A-Z0-9_]*_API_KEY=.+' .env                                  # 至少 1
+grep -cE '^(MODEL_PROVIDER|MODEL_ID|CONSOLE_ENABLED)=.+' .env   # 预期 3
+grep -cE '^[A-Z0-9_]*_API_KEY=.+' .env                        # 至少 1
+# WEB_AUTH=off 时不需要 WEB_TOKEN；默认 token 模式确认令牌键存在且形状合法，不回显值
+grep -qE '^WEB_AUTH=off$' .env || grep -qE '^WEB_TOKEN=.{16,256}$' .env
 ```
 
 `DATA_DIR` 由 Compose 固定为 `/data`，`.env` 中的值不生效。数据卷的显式名称是 `personal-agent-data`，不随项目目录名变化；升级 Aster 改名时也不改卷名。
@@ -105,9 +107,9 @@ docker compose up -d --no-build
 docker compose logs --tail 50 personal-agent
 ```
 
-预期日志出现 `Console listening on ...; open it with the WEB_TOKEN from the environment.`，且无持续报错。`docker compose ps` 显示 `running` 只表示进程存在，不代表控制台业务链已验收。
+预期日志出现 `Console listening on ...; open it with the WEB_TOKEN from the environment.`；`WEB_AUTH=off` 时为 `Console listening on ... with WEB_AUTH=off; the host has disabled token authentication.`。无持续报错。`docker compose ps` 显示 `running` 只表示进程存在，不代表控制台业务链已验收。
 
-在浏览器打开 `http://127.0.0.1:8787`，用 `WEB_TOKEN` 登录后选择 Bot 并发送“现在几点？”。预期历史中出现与服务器 UTC 时间一致的回复，日志中没有 `Agent request failed`。数据卷中应出现：
+在浏览器打开 `http://127.0.0.1:8787`，默认 `WEB_AUTH=token` 时用 `WEB_TOKEN` 登录（`off` 时不需令牌），选择 Bot 并发送“现在几点？”。预期历史中出现与服务器 UTC 时间一致的回复，日志中没有 `Agent request failed`。数据卷中应出现：
 
 ```sh
 docker compose exec personal-agent ls -la /data /data/workspace
@@ -278,10 +280,10 @@ docker compose logs --tail 50 personal-agent
 | --- | --- | --- |
 | `pull access denied` / 找不到镜像 | 镜像未构建、未 `load` 或引用写错 | 核对 `ASTER_IMAGE`；构建机分发或从仓库拉取 |
 | 启动即退出，`Missing configuration` | `.env` 缺项 | 补齐对应键 |
-| 启动即退出，`CONSOLE_ENABLED`／`WEB_TOKEN` 配置错误 | 取值不是 `0`/`1` 或令牌形状不合法 | 按第 2 节补齐或修正，不回显令牌值 |
+| 启动即退出，`CONSOLE_ENABLED`／`WEB_AUTH`／`WEB_TOKEN` 配置错误 | 取值不是 `0`/`1`、`token`/`off`，或令牌形状不合法 | 按第 2 节补齐或修正，不回显令牌值 |
 | 启动即退出，`flock` 无法加锁 | 同一数据卷已有实例 | 停掉旧容器；不要并行运行 |
 | `EACCES` / `Unable to open the database file` | 卷内文件属主不是 uid 1000 | `chown -R 1000:1000 /data` |
-| 容器 `running` 但控制台打不开 | overlay 未发布端口或令牌错误 | 核对 `dashboard/docker-compose.dashboard.yml` 与 `127.0.0.1:8787`；令牌来自 `.env` |
+| 容器 `running` 但控制台打不开 | overlay 未发布端口或令牌错误 | 核对 `dashboard/docker-compose.dashboard.yml` 与 `127.0.0.1:8787`；默认 `WEB_AUTH=token` 时令牌来自 `.env`，`off` 时确认边界本身已承担认证 |
 | 容器 `running` 但无回复 | 模型网络失败或 provider key 错误 | 看日志错误码；核对服务器出网与模型端点可达性 |
 | 备份归档为空 | 卷名错误 | `docker volume ls` 核对 `personal-agent-data` |
 | 收到截断提示 | 模型输出达到长度上限 | 让用户拆分问题；不会自动续写 |

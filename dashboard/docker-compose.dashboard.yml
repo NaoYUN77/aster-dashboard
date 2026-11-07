@@ -2,6 +2,7 @@
 #
 # Usage (from the repository root):
 #   cp dashboard/.env.example dashboard/.env    # then fill in the model key and WEB_TOKEN
+#                                              # (WEB_AUTH=token is the default; see the env file)
 #   docker compose -f docker-compose.yml -f dashboard/docker-compose.dashboard.yml \
 #     --env-file dashboard/.env up -d --build
 #
@@ -29,14 +30,16 @@ services:
       # so its explicit-profile assertions keep running; normal deployments leave it at 0.
       ALLOW_LEGACY_CATALOG: "${ALLOW_LEGACY_CATALOG:-0}"
       # Both containers are on this host: the app talks to the Execution Host over a Unix socket.
-      # Every bot's default directory is /workspaces/<botId> on the shared workspace volume.
+      # New bots get /workspaces/<botId> on the shared workspace volume; the legacy bootstrap bot
+      # keeps /workspaces itself and can therefore reach sibling bot directories. No OS-level isolation.
       EXECUTION_MODE: remote
       EXECUTION_REMOTE_TRANSPORT: rpc
       EXECUTION_REMOTE_CWD: /workspaces
       EXECUTION_RPC_TRANSPORT: unix
       EXECUTION_RPC_SOCKET: /run/aster/rpc.sock
     ports:
-      # Loopback only: the token is the second gate, never the only one.
+      # Loopback only: with WEB_AUTH=token (default) the token is the second gate, never the only
+      # one. WEB_AUTH=off removes that second gate; the boundary must then own authentication.
       - "127.0.0.1:8787:8787"
     volumes:
       - personal-agent-data:/data

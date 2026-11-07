@@ -194,8 +194,10 @@ export class RemoteRpcExecutionEnv implements ExecutionEnv {
   async #open(): Promise<void> {
     if (this.#closed) throw new RpcClientError("unavailable", "the direct session is closed");
     this.#opening ??= (async () => {
-      // The working directory, not the configured root: a same-host sandbox roots the session in
-      // the bot's own directory, and must not grant it the whole `/workspaces` parent.
+      // The working directory, not the configured root: a named bot is rooted in its own directory
+      // and must not be granted the whole `/workspaces` parent. The legacy bootstrap bot is the
+      // documented exception: its cwd is the parent itself, so its file tools can reach sibling bot
+      // directories. The shared host offers no OS-level isolation; see src/main.ts.
       const result = await this.#client.openSession(this.#sessionId, { cwd: this.cwd });
       if (result.direct === undefined) {
         await this.#client.closeSession(this.#sessionId).catch(() => undefined);

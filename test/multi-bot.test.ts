@@ -386,3 +386,28 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("WEB_AUTH=off serves every console route without a token", { timeout: 120_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "personal-agent-console-authoff-"));
+  // A stale WEB_TOKEN stays in the environment: it must neither be required nor silently re-enable auth.
+  const env = { ...environment(directory), WEB_AUTH: "off" };
+  let service: ServiceHandle | undefined;
+  try {
+    service = await startService({ env, models: scriptedProvider(), log: () => {}, allowLegacyCatalog: true });
+    const port = service.console?.port;
+    assert.ok(port !== undefined, "the console must be listening");
+    assert.equal(service.config.console?.token, null);
+    const base = `http://127.0.0.1:${port}`;
+    // No Authorization header anywhere: the loopback/tunnel boundary owns authentication.
+    assert.equal((await fetch(`${base}/`)).status, 200);
+    const bots = await fetch(`${base}/api/bots`);
+    assert.equal(bots.status, 200);
+    assert.deepEqual((await bots.json()).bots.map((bot: { botId: string }) => bot.botId), ["default"]);
+    for (const path of ["/api/platform", "/api/bots/default/history"]) {
+      assert.equal((await fetch(`${base}${path}`)).status, 200, path);
+    }
+  } finally {
+    await service?.close().catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
