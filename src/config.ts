@@ -98,7 +98,7 @@ function validateProxyEnv(env: NodeJS.ProcessEnv): void {
  * Enable Node's global HTTP(S) proxy dispatcher from the environment when a proxy variable is set.
  * Needed when HTTPS_PROXY is loaded from --env-file=.env after Node startup; safe alongside NODE_USE_ENV_PROXY=1.
  * With ASTER_MITM_TOKEN_FILE set, the effective URLs carry the proxy credentials and are written back
- * so clients that build their own agent from process.env (TelegramClient, MCP children) use them too.
+ * so clients that build their own agent from process.env (MCP children) use them too.
  */
 export function configureEnvProxy(env: NodeJS.ProcessEnv = process.env): boolean {
   validateProxyEnv(env);
@@ -130,14 +130,11 @@ export function resolveMcpConfigPaths(env: NodeJS.ProcessEnv = process.env) {
 export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   validateProxyEnv(env);
   const paths = resolveMcpConfigPaths(env);
-  const telegramApiRoot = readTelegramApiRoot(env);
   const required = (key: string) => {
     const value = env[key]?.trim();
     if (!value) throw new ConfigurationError(`Missing configuration: ${key}`);
     return value;
   };
-  const telegramEnabled = readTelegramEnabled(env);
-  const ownerId = telegramEnabled ? readOwnerId(env) : "console";
   const provider = required("MODEL_PROVIDER");
   if (!isProviderId(provider)) {
     throw new ConfigurationError(`MODEL_PROVIDER must be one of: ${PROVIDER_IDS.join(", ")}`);
@@ -145,10 +142,6 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
   const providerKeyEnv = PROVIDERS[provider].apiKeyEnv;
   const providerKey = required(providerKeyEnv);
   assertValidCredentialShape(providerKeyEnv, providerKey);
-  // A console-only deployment has no Telegram identity at all; requiring a token there would be a
-  // configuration error the operator cannot satisfy without creating a bot they do not use.
-  const token = telegramEnabled ? required("TELEGRAM_BOT_TOKEN") : "";
-  if (telegramEnabled) assertValidCredentialShape("TELEGRAM_BOT_TOKEN", token);
   const ccrProfile = env.CCR_PROFILE?.trim();
   if (ccrProfile && (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,127}$/.test(ccrProfile))) {
     throw new ConfigurationError("CCR_PROFILE must be a configured profile name or id");
@@ -158,37 +151,15 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env) {
     throw new ConfigurationError("CCR_COMMAND must be an executable path without shell metacharacters");
   }
   const execution = readExecutionConfig(env);
-  const codemode = readCodemodeConfig(env);
-  // Remote code mode runs its VM on the execution agent, so the gateway must be configured and
-  // reachable. A local deployment keeps the previous codemode shape unchanged.
-  const codemodeConfig: CodemodeConfig | undefined = codemode.enabled
-    ? {
-        ...codemode,
-        ...(execution === undefined ? {} : {
-          ptc: {
-            rpc: readRpcClientConfig(env),
-            defaultTimeoutSeconds: execution.defaultTimeoutSeconds,
-            maxTimeoutSeconds: execution.maxTimeoutSeconds,
-          },
-        }),
-      }
-    : undefined;
-  const reminders = readReminderConfig(env);
   const consoleConfig = readConsoleConfig(env);
   return {
-    token,
-    ownerId,
-    telegramEnabled,
+    // The dashboard console is the only ingress; its optional config is resolved by the host.
     console: consoleConfig,
     provider,
     model: required("MODEL_ID"),
-    telegramApiRoot,
     ...(ccrProfile === undefined || ccrProfile === "" ? {} : { ccrProfile, ccrCommand }),
     ...(execution === undefined ? {} : { execution }),
-    ...(codemodeConfig === undefined ? {} : { codemode: codemodeConfig }),
     ...paths,
-    // Proactive sends need a Telegram identity; a console-only instance stores none.
-    ...(reminders.enabled && telegramEnabled ? { reminders } : {}),
     trace: readTraceConfig(env),
     platform: readPlatformConfig(env),
   };
@@ -223,8 +194,6 @@ export function readPlatformConfig(env: NodeJS.ProcessEnv = process.env): Platfo
     memoryEnabled: readMemoryConfig(env).enabled,
     webConfigured: webApiKey !== undefined || Boolean(ccrProfile),
     webViaPlatformCredential: webApiKey !== undefined,
-    taskDeliverable: readReminderConfig(env).enabled && readTelegramEnabled(env),
-    ptcConfigured: readCodemodeConfig(env).enabled,
     // A rpc transport owns Bash and the file primitives; ssh only carries shell commands.
     computerHost: execution?.transport === "rpc",
     // No OAuth integration is connected in this phase; the platform never claims one.
@@ -255,31 +224,6 @@ export function readLegacyCatalogEnabled(env: NodeJS.ProcessEnv = process.env): 
   return raw === "1";
 }
 
-/** One-time reminders (REMINDERS_*). Enabled by default; limits bound each owner's stored rows. */
-export type ReminderConfig = {
-  readonly enabled: boolean;
-  readonly maxPending: number;
-  readonly maxPerHour: number;
-  readonly horizonDays: number;
-};
-
-/**
- * Every reminder bound is validated even when reminders are disabled, so a malformed value cannot
- * silently take effect after the switch is flipped. Time itself is always resolved by the host.
- */
-export function readReminderConfig(env: NodeJS.ProcessEnv = process.env): ReminderConfig {
-  const enabledRaw = env.REMINDERS_ENABLED?.trim();
-  if (enabledRaw !== undefined && enabledRaw !== "" && enabledRaw !== "0" && enabledRaw !== "1") {
-    throw new ConfigurationError("REMINDERS_ENABLED must be 0 or 1");
-  }
-  return {
-    enabled: enabledRaw !== "0",
-    maxPending: boundedInteger(env, "REMINDERS_MAX_PENDING", 100, 1, 1_000),
-    maxPerHour: boundedInteger(env, "REMINDERS_MAX_PER_HOUR", 20, 1, 1_000),
-    horizonDays: boundedInteger(env, "REMINDERS_MAX_HORIZON_DAYS", 366, 1, 3_650),
-  };
-}
-
 /**
  * Langfuse Cloud tracing. Off unless both API keys are configured; `LANGFUSE_TRACING_ENABLED=0`
  * switches it off while keeping the keys in place. Tracing is diagnostics: an absent or incomplete
@@ -291,8 +235,8 @@ export type TraceConfig = {
   readonly secretKey?: string;
   readonly baseUrl?: string;
   /**
-   * Upload model-visible content (script, nested tool arguments and results) as observation
-   * input/output. Off by default: traces then keep only sizes, counts and error codes.
+   * Upload model-visible content (tool arguments and results) as observation input/output.
+   * Off by default: traces then keep only sizes, counts and error codes.
    */
   readonly captureContent?: boolean;
 };
@@ -343,14 +287,15 @@ export type ExecutionConfig = {
     }
   | {
       readonly transport: "rpc";
-      /** Validated execution agent connection; the agent also runs the direct sandbox. */
+      /** Validated execution agent connection; the agent runs the shared Phase 1 execution host. */
       readonly rpc: RpcClientConfig;
     }
 );
 
 /**
- * The roots a sandbox exposes to commands: the legacy `/shared` workspace and the per-bot
- * `/workspaces` tree. A per-bot directory is derived inside one of them, never elsewhere.
+ * The workspace roots the Phase 1 shared execution host exposes to commands: the legacy
+ * `/shared` workspace and the per-bot `/workspaces` tree. A per-bot directory is derived
+ * inside one of them, never elsewhere.
  */
 function isSandboxRootPath(value: string): boolean {
   if (value.includes("\\") || value.split("/").includes("..")) return false;
@@ -375,7 +320,7 @@ function boundedInteger(env: NodeJS.ProcessEnv, key: string, fallback: number, m
  * (default `ssh`, the legacy broker). Every setting of the selected transport is validated before the
  * process can reach the agent, and settings of the other transport are ignored rather than silently
  * taking effect after a later switch. Ownership of `EXECUTION_REMOTE_CWD` follows the transport: the
- * direct sandbox only exposes `/shared`, so the RPC path confines it there.
+ * shared execution host only exposes `/shared`, so the RPC path confines it there.
  */
 export function readExecutionConfig(env: NodeJS.ProcessEnv = process.env): ExecutionConfig | undefined {
   const mode = env.EXECUTION_MODE?.trim() || "local";
@@ -428,87 +373,6 @@ export function readExecutionConfig(env: NodeJS.ProcessEnv = process.env): Execu
     defaultTimeoutSeconds,
     maxTimeoutSeconds,
   };
-}
-
-/** PTC / code mode (ADR-0019). Disabled unless explicitly enabled. */
-export type CodemodeConfig = {
-  readonly enabled: boolean;
-  /** When enabled, model-visible file and command tools are hidden behind codemode. */
-  readonly scriptFirst: boolean;
-  /** Per-script deadline, including time spent in nested tool calls. */
-  readonly timeoutMs: number;
-  /** Maximum heap the QuickJS instance may allocate. */
-  readonly memoryLimitBytes: number;
-  /** Present only when execution is remote: the agent that runs the script's VM. */
-  readonly ptc?: CodemodePtcConfig;
-};
-
-/** The execution agent connection and timeout bounds a remote code mode run needs. */
-export type CodemodePtcConfig = {
-  readonly rpc: RpcClientConfig;
-  readonly defaultTimeoutSeconds: number;
-  readonly maxTimeoutSeconds: number;
-};
-
-/**
- * Code mode runs model-written JavaScript in the base's QuickJS sandbox. It is opt-in because the
- * tool adds a prompt section and a write-capable execution path. Both bounds are validated even
- * when disabled so a malformed value cannot silently take effect after the switch is flipped.
- */
-export function readCodemodeConfig(env: NodeJS.ProcessEnv = process.env): CodemodeConfig {
-  const enabledRaw = env.CODEMODE_ENABLED?.trim();
-  if (enabledRaw !== undefined && enabledRaw !== "" && enabledRaw !== "0" && enabledRaw !== "1") {
-    throw new ConfigurationError("CODEMODE_ENABLED must be 0 or 1");
-  }
-  const enabled = enabledRaw === "1";
-  const scriptFirstRaw = env.CODEMODE_SCRIPT_FIRST?.trim().toLowerCase();
-  if (
-    scriptFirstRaw !== undefined &&
-    scriptFirstRaw !== "" &&
-    scriptFirstRaw !== "0" &&
-    scriptFirstRaw !== "1" &&
-    scriptFirstRaw !== "false" &&
-    scriptFirstRaw !== "true"
-  ) {
-    throw new ConfigurationError("CODEMODE_SCRIPT_FIRST must be 0, 1, false, or true");
-  }
-  return {
-    enabled,
-    // Code mode replaces the model-visible file and command tools by default; an explicit
-    // 0/false keeps the previous exposure and remains a one-switch rollback.
-    scriptFirst: scriptFirstRaw === undefined || scriptFirstRaw === ""
-      ? enabled
-      : scriptFirstRaw === "1" || scriptFirstRaw === "true",
-    // Keep headroom under the 300 s request wait so the script reports its own timeout first.
-    timeoutMs: boundedInteger(env, "CODEMODE_TIMEOUT_MS", 240_000, 1_000, 300_000),
-    memoryLimitBytes: boundedInteger(
-      env,
-      "CODEMODE_MEMORY_LIMIT_BYTES",
-      128 * 1024 * 1024,
-      16 * 1024 * 1024,
-      512 * 1024 * 1024,
-    ),
-  };
-}
-
-/**
- * Optional Telegram Bot API root override (a reverse proxy, e.g. a Cloudflare Worker) for hosts
- * that cannot reach api.telegram.org directly. The value is a URL prefix: the client appends
- * /bot<token>/<method> to it. It must be an https URL without query or fragment; trailing
- * slashes are dropped so the join is exact. Unset means the default api.telegram.org root.
- */
-function readTelegramApiRoot(env: NodeJS.ProcessEnv): string | undefined {
-  const raw = env.TELEGRAM_API_ROOT?.trim();
-  if (!raw) return undefined;
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new ConfigurationError("TELEGRAM_API_ROOT must be a valid URL");
-  }
-  if (url.protocol !== "https:") throw new ConfigurationError("TELEGRAM_API_ROOT must be an https URL");
-  if (url.search || url.hash) throw new ConfigurationError("TELEGRAM_API_ROOT must not contain a query or fragment");
-  return url.href.replace(/\/+$/, "");
 }
 
 /** Memory wiring (MEM-07): budgets, the compaction reserve, the archive timezone and timeout. */
@@ -578,24 +442,17 @@ export function readMemoryConfig(env: NodeJS.ProcessEnv = process.env): MemoryCo
   };
 }
 
-/** Telegram long polling is the historical default; a local console replaces it entirely. */
-function readTelegramEnabled(env: NodeJS.ProcessEnv): boolean {
-  const raw = env.TELEGRAM_ENABLED?.trim();
-  if (raw !== undefined && raw !== "" && raw !== "0" && raw !== "1") {
-    throw new ConfigurationError("TELEGRAM_ENABLED must be 0 or 1");
-  }
-  return raw !== "0";
-}
-
 /**
- * The local console: an in-process HTTP surface for the owner's browser. It is off unless enabled,
- * and it refuses to start without a token: the browser is the only client, but the port is still a
- * listener, so an unauthenticated mode would be an open door rather than a convenience.
+ * The local console: an in-process HTTP surface for the owner's browser. It is off unless enabled.
+ * Authentication is the fail-closed default (`WEB_AUTH=token`); `WEB_AUTH=off` is an explicit host
+ * decision for a deployment whose only reachable ingress is already a loopback or tunnel boundary.
+ * The static page is always served so the browser can ask for a token when one is required.
  */
 export type ConsoleConfig = {
   readonly host: string;
   readonly port: number;
-  readonly token: string;
+  /** `null` only when the host explicitly disabled authentication with `WEB_AUTH=off`. */
+  readonly token: string | null;
   /** Directory holding the static page; the image copies `dashboard/web` there. */
   readonly webDir: string;
   readonly maxBots: number;
@@ -607,8 +464,14 @@ export function readConsoleConfig(env: NodeJS.ProcessEnv = process.env): Console
     throw new ConfigurationError("CONSOLE_ENABLED must be 0 or 1");
   }
   if (enabledRaw !== "1") return undefined;
-  const token = env.WEB_TOKEN?.trim() ?? "";
-  if (!/^[\x21-\x7e]{16,256}$/.test(token)) {
+  // The browser is still a listener client. Token authentication stays the default; turning it off
+  // must be an explicit host decision and is only appropriate behind a loopback/tunnel boundary.
+  const auth = env.WEB_AUTH?.trim() || "token";
+  if (auth !== "token" && auth !== "off") {
+    throw new ConfigurationError("WEB_AUTH must be token or off");
+  }
+  const token = auth === "off" ? null : (env.WEB_TOKEN?.trim() ?? "");
+  if (token !== null && !/^[\x21-\x7e]{16,256}$/.test(token)) {
     throw new ConfigurationError("WEB_TOKEN must be 16-256 printable characters without spaces");
   }
   const host = env.CONSOLE_HOST?.trim() || "0.0.0.0";
@@ -622,11 +485,4 @@ export function readConsoleConfig(env: NodeJS.ProcessEnv = process.env): Console
     webDir,
     maxBots: boundedInteger(env, "CONSOLE_MAX_BOTS", 8, 1, 64),
   };
-}
-
-function readOwnerId(env: NodeJS.ProcessEnv): string {
-  const ownerId = env.TELEGRAM_OWNER_ID?.trim();
-  if (!ownerId) throw new ConfigurationError("Missing configuration: TELEGRAM_OWNER_ID");
-  if (!/^[1-9]\d*$/.test(ownerId)) throw new ConfigurationError("TELEGRAM_OWNER_ID must be a positive numeric user ID");
-  return ownerId;
 }

@@ -1,10 +1,9 @@
 import { createHash } from "node:crypto";
 import { Type } from "@earendil-works/pi-ai";
 import { createRegistry, defineExtension, defineTool, GenerationTask, hook, type Extension, type Registry, type ToolExecutionApi, type ToolExecutionResult, type ToolRegistration } from "@earendil-works/pi-durable";
-import { CODEMODE_TOOL_NAME } from "@earendil-works/pi-durable/codemode";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { TOOL_SEARCH_TOOL_NAME } from "@earendil-works/pi-durable/tool-search";
-import { argumentBytes, beginTrace, recordGeneration, recordRegistryDecision } from "./trace.js";
+import { recordGeneration, recordRegistryDecision } from "./trace.js";
 import { parseCatalogProfile, parseToolScope, scopeAllows, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
 
 export const currentTime = defineTool({
@@ -73,7 +72,7 @@ export interface ToolRegistry extends Registry {
   setDisabled(name: string, disabled: boolean): void;
 }
 
-const READ_TOOLS = new Set(["read", "current_time", "working_read", "memory_search", "memory_read", "tool_search", "reminder_list"]);
+const READ_TOOLS = new Set(["read", "current_time", "working_read", "memory_search", "memory_read", "tool_search"]);
 
 function registration(extension: Extension, tool: GovernedTool): ToolRecord {
   const governance = tool.governance ?? {
@@ -113,7 +112,7 @@ export function createToolRegistry(
   const log = options.log ?? console.error;
   let records = new Map<string, ToolRecord>();
   let registrations = new Map<string, object>();
-  // Whether the model surface currently declares the tool; a hidden tool stays registered for scripts.
+  // Whether the model surface currently declares the tool; registration is tracked independently.
   let modelCallable = new Map<string, boolean>();
   const availability = new Map<string, ToolAvailability>();
   const conversationCatalogs = new Map<number, {
@@ -205,22 +204,6 @@ export function createToolRegistry(
       ...tool,
       execute: async (args, api, context) => {
         context.abortSignal?.throwIfAborted();
-        // The root trace starts before authorization so a denied codemode call is still observable.
-        // The model's raw `code` argument is captured only when content capture is enabled; the script
-        // actually handed to QuickJS is recorded separately under `codemode.prepared`.
-        const script = args !== null && typeof args === "object"
-          ? (args as { code?: unknown }).code
-          : undefined;
-        const root = tool.name === CODEMODE_TOOL_NAME
-          ? beginTrace({
-              conversationId: api.conversationId,
-              taskId: api.taskId,
-              callId: api.callId,
-              name: "codemode",
-              fields: { scriptBytes: argumentBytes(args) },
-              ...(typeof script === "string" ? { input: { code: script } } : {}),
-            })
-          : undefined;
         const run = async () => {
           const rejected = review(tool.name, { conversationId: api.conversationId, taskId: api.taskId, callId: api.callId }, registration);
           if (rejected !== undefined) return rejected;
@@ -241,7 +224,7 @@ export function createToolRegistry(
             } : {}),
           }, context);
         };
-        return root === undefined ? run() : root.run(run);
+        return run();
       },
     };
   }

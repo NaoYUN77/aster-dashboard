@@ -237,7 +237,23 @@ function showError(message) {
 function clearError() { banner.className = "banner"; banner.textContent = ""; }
 
 function readToken() {
-  try { return sessionStorage.getItem("aster.web.token") || ""; } catch { return ""; }
+  try {
+    const stored = sessionStorage.getItem("aster.web.token");
+    if (stored) return stored;
+  } catch {}
+  // A link that carries ?token= is a convenience for an authenticated deployment. Store it and
+  // drop it from the address bar so it does not linger in history or a shared screenshot.
+  try {
+    const url = new URL(location.href);
+    const fromUrl = url.searchParams.get("token") || "";
+    if (fromUrl) {
+      try { sessionStorage.setItem("aster.web.token", fromUrl); } catch {}
+      url.searchParams.delete("token");
+      history.replaceState(null, "", url.pathname + url.search + url.hash);
+      return fromUrl;
+    }
+  } catch {}
+  return "";
 }
 function writeToken(value) {
   try { value ? sessionStorage.setItem("aster.web.token", value) : sessionStorage.removeItem("aster.web.token"); } catch {}
@@ -336,11 +352,11 @@ function renderChatMeta() {
   $("cancel").disabled = !usable;
 }
 
-function appendMessage(role, text) {
+function appendMessage(role, text, parent = $("messages")) {
   const node = document.createElement("div");
   node.className = "msg " + role;
   node.textContent = text;
-  $("messages").append(node);
+  parent.append(node);
   return node;
 }
 
@@ -355,9 +371,15 @@ function clearLive() {
   state.live = null;
 }
 
+// Rendering the transcript is a read-modify-write of #messages, and `run_end` plus `message_end`
+// each start one without waiting for the other. A render that is superseded while its history is
+// still in flight must not commit, or every overlapping call appends another full copy.
+let historyRender = 0;
+
 async function loadHistory() {
   const bot = currentBot();
   const box = $("messages");
+  const render = ++historyRender;
   box.replaceChildren();
   if (!bot) {
     const empty = document.createElement("p");
@@ -370,22 +392,27 @@ async function loadHistory() {
   try {
     body = await api("/api/bots/" + encodeURIComponent(bot.botId) + "/history?limit=200");
   } catch (error) {
-    showError(error.message);
+    if (render === historyRender) showError(error.message);
     return;
   }
+  if (render !== historyRender) return;
+  // Build the transcript off-screen and commit it in one step, so a superseded render cannot
+  // leave a partial copy of the conversation behind.
+  const fragment = document.createDocumentFragment();
   // A platform status line, explicitly not a generated assistant turn and never saved as one.
   if (bot.greeting) {
-    note("系统状态 · " + bot.greeting + "（平台就绪提示，不是模型生成的回复）"
-      + (bot.provisioning.state === "degraded" ? "；部分能力当前不可用，见「平台状态」。" : ""));
+    appendMessage("note", "系统状态 · " + bot.greeting + "（平台就绪提示，不是模型生成的回复）"
+      + (bot.provisioning.state === "degraded" ? "；部分能力当前不可用，见「平台状态」。" : ""), fragment);
   }
-  if (bot.provisioning.error) note("初始化失败原因：" + bot.provisioning.error);
+  if (bot.provisioning.error) appendMessage("note", "初始化失败原因：" + bot.provisioning.error, fragment);
   if (body.messages.length === 0) {
     const empty = document.createElement("p");
     empty.className = "empty";
     empty.textContent = "还没有对话，直接交代任务即可。";
-    box.append(empty);
+    fragment.append(empty);
   }
-  for (const message of body.messages) appendMessage(message.role, message.text);
+  for (const message of body.messages) appendMessage(message.role, message.text, fragment);
+  box.replaceChildren(fragment);
   box.scrollTop = box.scrollHeight;
 }
 
@@ -651,20 +678,15 @@ async function boot() {
   });
 
   if (!state.token) state.token = readToken();
-  if (!state.token) {
-    if (!askToken()) { showError("需要 WEB_TOKEN 才能连接。"); return; }
-  }
   clearError();
   try {
+    // Try the data route first. A deployment with WEB_AUTH=off answers without a token; an
+    // authenticated one answers 401 and only then does the browser ask for it.
     await refreshBots();
   } catch (error) {
-    if (error.message.indexOf("访问令牌无效") >= 0) {
-      if (askToken()) { try { await refreshBots(); } catch (again) { showError(again.message); return; } }
-      else { showError(error.message); return; }
-    } else {
-      showError(error.message);
-      return;
-    }
+    if (error.message.indexOf("访问令牌无效") >= 0 && askToken()) {
+      try { await refreshBots(); } catch (again) { showError(again.message); return; }
+    } else { showError(error.message); return; }
   }
   // The first Bot already exists: the platform created and initialized it before this page loaded.
   const first = state.bots.find((bot) => bot.botId === "default") || state.bots[0];

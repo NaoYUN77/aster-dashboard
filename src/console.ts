@@ -23,8 +23,9 @@
 // from a request names a path, a model, a tool or a conversation: those are host decisions.
 //
 // Errors: every failure is a typed JSON answer with its status; an unknown bot is 404, an invalid
-// body 400, a full bot list 409. The token is compared in constant time and is required on every
-// route, including the event stream.
+// body 400, a full bot list 409. The static page is served without a token so the browser can ask
+// for one; every API route requires the configured token, compared in constant time, unless the
+// host explicitly disabled authentication with WEB_AUTH=off.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -173,13 +174,11 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
 
   async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://console");
-    if (!tokenMatches(config.token, headerToken(request, url) ?? "")) {
-      send(response, 401, { error: "unauthorized" });
-      return;
-    }
     const method = request.method ?? "GET";
     if (method === "GET" && url.pathname === "/") {
-      // The page is static; the nonce makes its inline script the only one allowed to run.
+      // The page is static and this route is deliberately unauthenticated: it must load before the
+      // browser can prompt for a token. The data routes below remain guarded.
+      // The nonce makes its inline script the only one allowed to run.
       const nonce = randomBytes(16).toString("base64");
       const html = page.replaceAll("{{NONCE}}", nonce);
       response.writeHead(200, {
@@ -200,6 +199,10 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
         ].join("; "),
       });
       response.end(html);
+      return;
+    }
+    if (config.token !== null && !tokenMatches(config.token, headerToken(request, url) ?? "")) {
+      send(response, 401, { error: "unauthorized" });
       return;
     }
     if (method === "GET" && url.pathname === "/api/bots") {

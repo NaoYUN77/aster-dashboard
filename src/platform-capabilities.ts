@@ -14,6 +14,11 @@ export const CAPABILITY_IDS = [
   "core", "memory", "web", "workspace", "computer", "task", "integration",
 ] as const;
 export type CapabilityId = typeof CAPABILITY_IDS[number];
+/**
+ * Retired features keep their durable ids so old `bot_provisioning.unavailable` rows still decode,
+ * but they are not a deployment fault: a removed capability must not degrade every new bot.
+ */
+export const RETIRED_CAPABILITY_IDS: readonly CapabilityId[] = Object.freeze(["task"]);
 export type CapabilityState = "available" | "unavailable";
 /** How the host knows the state; `configured-only` is never presented as a live vendor probe. */
 export type CapabilityVerification = "host-verified" | "configured-only" | "not-configured";
@@ -42,9 +47,6 @@ export type PlatformDependencies = {
   readonly webConfigured: boolean;
   /** True when the platform holds the Web credential itself rather than invoking an external CLI. */
   readonly webViaPlatformCredential: boolean;
-  /** One-time reminders need a delivery identity; without it the task capability is unavailable. */
-  readonly taskDeliverable: boolean;
-  readonly ptcConfigured: boolean;
   /**
    * A shared Computer / Execution Host is reachable over the RPC transport. Phase 1 does not
    * require OS-level isolation; the startup health probe is the real, fail-closed verification.
@@ -90,9 +92,8 @@ export function buildPlatformManifest(
       deps.computerHost
         ? "共享 CVM 执行主机已配置；启动时由 RPC health.check 验证 Bash 与文件原语，工作区由执行面按需创建。"
         : "未配置共享执行主机；Bash / Read / Write / Edit 不可用。"),
-    capability("task", deps.taskDeliverable ? "available" : "unavailable",
-      deps.taskDeliverable ? "host-verified" : "not-configured",
-      deps.taskDeliverable ? "提醒存储与投递身份可用。" : "一次性提醒需要 Telegram 投递身份；当前部署未启用。"),
+    capability("task", "unavailable", "not-configured",
+      "提醒功能已移除；当前仅支持控制台会话内回复。"),
     capability("integration", "available", "host-verified",
       "授权请求与连接状态查询可用；OAuth 连接建立尚未实现，不会返回已连接。"),
   ];
@@ -101,11 +102,10 @@ export function buildPlatformManifest(
     shell: deps.computerHost,
     files: true,
     web: deps.webConfigured,
-    // Phase 1 migrates Bash / Read / Write / Edit to the shared execution host. Codemode and the
-    // other tool families follow later; they are not granted just because CODEMODE_ENABLED is set.
+    // PTC/codemode and reminders are retired; their persisted compatibility keys stay off.
     ptc: false,
     memory: deps.memoryEnabled,
-    reminders: deps.taskDeliverable,
+    reminders: false,
     // External integrations are never open just because a bot was created.
     mcp: deps.mcpConnected,
   });

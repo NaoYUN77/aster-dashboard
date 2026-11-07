@@ -854,7 +854,7 @@ test("07-F/11: a plan-level refusal surfaces as a MEMORY_* error, never AGENT_SE
 // 07-G: the composition boundaries hold in the source tree
 // ---------------------------------------------------------------------------
 
-test("07-G: agent.ts composes only through the integration entry; telegram/inbox/delivery stay memory-free", async () => {
+test("07-G: agent.ts composes only through the integration entry; console/inbox/main stay memory-free", async () => {
   const root = join(dirname(fileURLToPath(import.meta.url)), "..");
   const read = (path: string) => readFile(join(root, path), "utf8");
 
@@ -865,7 +865,7 @@ test("07-G: agent.ts composes only through the integration entry; telegram/inbox
     assert.ok(!agent.includes(forbidden), `agent.ts must not contain ${forbidden}`);
   }
 
-  for (const path of ["src/telegram.ts", "src/inbox.ts", "src/deliveries.ts", "src/main.ts"]) {
+  for (const path of ["src/console.ts", "src/inbox.ts", "src/bot-manager.ts", "src/main.ts"]) {
     const source = await read(path);
     assert.ok(!/from\s+"[^"]*memory\//.test(source), `${path} must not import memory internals`);
   }

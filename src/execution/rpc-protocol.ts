@@ -2,10 +2,14 @@
  * Unified wire contract for the resident execution agent. Frames are length-prefixed JSON: a
  * 4-byte big-endian payload length followed by UTF-8 JSON. The protocol is deliberately small and
  * strict; the transport may be a Unix socket for local tests or TCP/TLS with mutual certificates
- * across VPS hosts. Phase 0 exposes the restricted test executor; Phase 1 adds the remote PTC
- * sandbox (`vm.start`/`vm.reply` requests and `vm.message`/`tool.output` events). Phase 2 adds
- * direct `bash` execution (`execute` with `executor: "bash"`) and the bounded `file.*` primitives
- * both direct sessions and PTC nested calls use.
+ * across VPS hosts. The production surface is the Phase 1 shared execution host: direct `bash`
+ * execution (`execute` with `executor: "bash"`) and the bounded `file.*` primitives.
+ *
+ * Versioned wire values of the retired PTC / code mode subsystem (`vm.start`, `vm.reply`,
+ * `vm.message`, `tool.call`, `tool.output` and their payload parsers) are retained here so the
+ * frame format stays stable across a rolling upgrade. They are NEVER executed: the agent rejects
+ * every such request with `not_implemented` and there is no VM, runner or client entry point.
+ * See archive/ptc-codemode/README.md for the retired implementation.
  */
 
 import { validateCommand, validateEnv } from "./protocol.js";

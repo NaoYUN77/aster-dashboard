@@ -28,8 +28,6 @@ function makeManifest(overrides: Partial<PlatformDependencies> = {}): PlatformMa
     memoryEnabled: true,
     webConfigured: true,
     webViaPlatformCredential: true,
-    taskDeliverable: true,
-    ptcConfigured: true,
     computerHost: true,
     mcpConnected: true,
     ...overrides,
@@ -145,8 +143,8 @@ function restarted(store: MemoryProvisioningStore, runtime: FakeRuntime, manifes
 
 test("platform manifest marks unconfigured services unavailable and gates internal defaults", () => {
   const manifest = makeManifest({
-    memoryEnabled: false, webConfigured: false, taskDeliverable: false,
-    ptcConfigured: false, computerHost: false, mcpConnected: false,
+    memoryEnabled: false, webConfigured: false,
+    computerHost: false, mcpConnected: false,
   });
   const states = new Map(manifest.capabilities.map((entry) => [entry.id, entry.state]));
   assert.equal(states.get("core"), "available");
@@ -175,17 +173,18 @@ test("a changed deployment changes the manifest fingerprint", () => {
   assert.notEqual(makeManifest().fingerprint, makeManifest({ webConfigured: false }).fingerprint);
 });
 
-test("a configured shared execution host grants Bash but not codemode", () => {
-  const manifest = makeManifest({ ptcConfigured: true, computerHost: true });
+test("a configured shared execution host grants Bash but never the retired groups", () => {
+  const manifest = makeManifest({ computerHost: true });
   assert.equal(manifest.capabilities.find((entry) => entry.id === "computer")!.state, "available");
   assert.equal(manifest.defaults.shell, true);
-  // Phase 1 migrates Bash / Read / Write / Edit only; a configured codemode is not a grant.
+  // Phase 1 migrates Bash / Read / Write / Edit only; retired PTC/reminders switches always stay off.
   assert.equal(manifest.defaults.ptc, false);
+  assert.equal(manifest.defaults.reminders, false);
 });
 
 test("capability resolver closes unavailable groups with exact-name reasons", () => {
   const { manifest, integrations } = harness({
-    manifest: makeManifest({ webConfigured: false, computerHost: false, taskDeliverable: false }),
+    manifest: makeManifest({ webConfigured: false, computerHost: false }),
   });
   const resolved = resolveCatalog({ manifest, integrations });
   assert.equal(resolved.profile.core, true);
@@ -197,8 +196,10 @@ test("capability resolver closes unavailable groups with exact-name reasons", ()
   assert.equal(resolved.profile.mcp, false, "no external integration is connected in this phase");
   assert.match(resolved.reasons.get("web_search") ?? "", /能力 web 不可用/);
   assert.match(resolved.reasons.get("bash") ?? "", /能力 computer 不可用/);
-  assert.match(resolved.reasons.get("reminder_create") ?? "", /能力 task 不可用/);
-  assert.deepEqual(resolved.unavailableCapabilities, ["web", "computer", "task"]);
+  // Retired groups select no tools, so no exact-name reason is emitted for them.
+  assert.equal(resolved.reasons.get("reminder_create"), undefined);
+  // A retired capability stays in the platform status but is excluded from provisioning degradation.
+  assert.deepEqual(resolved.unavailableCapabilities, ["web", "computer"]);
 });
 
 test("integration authorization never claims a connection", () => {

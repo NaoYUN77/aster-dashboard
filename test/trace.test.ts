@@ -8,7 +8,6 @@ import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import type { ConversationId, TaskId, ToolExecutionResult, ToolHookCall } from "@earendil-works/pi-durable";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { nestedToolObservationName } from "../src/codemode.js";
 import { ConfigurationError, readTraceConfig } from "../src/config.js";
 import {
   beginRequest,
@@ -107,7 +106,7 @@ test("trace config reads Langfuse keys and keeps tracing optional", () => {
   );
 });
 
-test("request, codemode, nested tool and RPC spans share one trace and nest", () => {
+test("request, root tool, nested tool and RPC spans share one trace and nest", () => {
   const { exporter, provider } = setup();
   let logs = 0;
   const runtime = startTrace({ enabled: true }, () => { logs += 1; }, { tracerProvider: provider });
@@ -116,20 +115,20 @@ test("request, codemode, nested tool and RPC spans share one trace and nest", ()
 
   const request = beginRequest({
     conversationId: 1,
-    requestId: "telegram:1:req-1",
+    requestId: "console:bot-one:req-00000001",
     fields: { textBytes: 123 },
   });
   assert.ok(request);
-  const codemode = beginTrace({
+  const rootTool = beginTrace({
     conversationId: 1 as ConversationId,
     taskId: 1 as TaskId,
     callId: "call-1",
-    name: "codemode",
+    name: "tool-root",
     fields: { scriptBytes: 42 },
   });
-  assert.ok(codemode);
+  assert.ok(rootTool);
 
-  const nested = codemode.run(() => {
+  const nested = rootTool.run(() => {
     recordRegistryDecision({
       tool: "read",
       decision: "allow",
@@ -138,7 +137,7 @@ test("request, codemode, nested tool and RPC spans share one trace and nest", ()
       conversationId: 1 as ConversationId,
       taskId: 1 as TaskId,
     });
-    return traceChild(nestedToolObservationName("read"), { tool: "read", argsBytes: 9 }, "tool");
+    return traceChild("tool.read", { tool: "read", argsBytes: 9 }, "tool");
   });
   assert.ok(nested);
   const rpc = nested.run(() => currentSpan()?.child("rpc.file.readText", { pathBytes: 8 }));
@@ -146,7 +145,7 @@ test("request, codemode, nested tool and RPC spans share one trace and nest", ()
   rpc.end("ok");
   nested.end("ok", { isError: false, outputItems: 1 });
   afterToolHook(runtime)(
-    { type: "toolCall", id: "call-1", name: "codemode", arguments: {} },
+    { type: "toolCall", id: "call-1", name: "tool-root", arguments: {} },
     { isError: false, output: [{ type: "text", text: "ok" }], diagnostics: [] },
     { conversationId: 1 as ConversationId, taskId: 1 as TaskId },
   );
@@ -154,21 +153,21 @@ test("request, codemode, nested tool and RPC spans share one trace and nest", ()
 
   const spans = exporter.getFinishedSpans();
   const requestSpan = spanByName(spans, "agent.request");
-  const codemodeSpan = spanByName(spans, "codemode");
+  const rootToolSpan = spanByName(spans, "tool-root");
   const nestedSpan = spanByName(spans, "tool.read");
   const rpcSpan = spanByName(spans, "rpc.file.readText");
   const decision = spanByName(spans, "registry.decision");
 
-  for (const span of [requestSpan, codemodeSpan, nestedSpan, rpcSpan, decision]) {
+  for (const span of [requestSpan, rootToolSpan, nestedSpan, rpcSpan, decision]) {
     assert.equal(span.spanContext().traceId, request.traceId, `${span.name} joins the request trace`);
   }
-  assert.equal(codemodeSpan.parentSpanContext?.spanId, request.spanId);
-  assert.equal(nestedSpan.parentSpanContext?.spanId, codemode.spanId);
+  assert.equal(rootToolSpan.parentSpanContext?.spanId, request.spanId);
+  assert.equal(nestedSpan.parentSpanContext?.spanId, rootTool.spanId);
   assert.equal(rpcSpan.parentSpanContext?.spanId, nested.spanId);
-  assert.equal(decision.parentSpanContext?.spanId, codemode.spanId);
+  assert.equal(decision.parentSpanContext?.spanId, rootTool.spanId);
   assert.equal(requestSpan.attributes["langfuse.observation.metadata.scriptBytes"], undefined);
-  assert.equal(codemodeSpan.attributes["langfuse.observation.metadata.scriptBytes"], "42");
-  assert.equal(codemodeSpan.attributes["langfuse.observation.metadata.outcome"], "\"ok\"");
+  assert.equal(rootToolSpan.attributes["langfuse.observation.metadata.scriptBytes"], "42");
+  assert.equal(rootToolSpan.attributes["langfuse.observation.metadata.outcome"], "\"ok\"");
   assert.equal(decision.attributes["langfuse.observation.metadata.decision"], "\"allow\"");
   assert.equal(logs, 0, "no tracing warnings during a healthy export");
 
@@ -179,14 +178,14 @@ test("an LLM generation joins the request trace without uploading prompt or outp
   const { exporter, provider } = setup();
   const runtime = startTrace({ enabled: true }, () => {}, { tracerProvider: provider });
   assert.ok(runtime);
-  const request = beginRequest({ conversationId: 2, requestId: "telegram:2:req-1" });
+  const request = beginRequest({ conversationId: 2, requestId: "console:bot-two:req-00000002" });
   assert.ok(request);
 
   recordGeneration(assistantMessage({
     content: [
       { type: "thinking", thinking: "THINKING_SECRET" },
       { type: "text", text: "PROMPT_SECRET body" },
-      { type: "toolCall", id: "tool-1", name: "codemode", arguments: {} },
+      { type: "toolCall", id: "tool-1", name: "tool-root", arguments: {} },
     ],
     errorMessage: "PROVIDER_SECRET error text",
   }), { conversationId: 2 as ConversationId, taskId: 2 as TaskId });

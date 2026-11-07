@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { sessionWorkspacePath } from "../src/execution/shared-host.js";
-import { PtcHostError } from "../src/execution/ptc-host.js";
+import { DirectHostError } from "../src/execution/direct-host.js";
 
 test("a session root is the workspace root or a clean directory below it", () => {
   assert.equal(sessionWorkspacePath("/workspaces", "/workspaces/researcher"), "/workspaces/researcher");
@@ -29,7 +29,7 @@ test("a path outside the workspace root is refused before anything is created", 
   ]) {
     assert.throws(
       () => sessionWorkspacePath("/workspaces", requested),
-      (error: unknown) => error instanceof PtcHostError && error.code === "invalid_request",
+      (error: unknown) => error instanceof DirectHostError && error.code === "invalid_request",
       `expected ${JSON.stringify(requested)} to be refused`,
     );
   }

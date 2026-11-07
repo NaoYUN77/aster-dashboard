@@ -5,7 +5,7 @@ import { openGithubGate } from "./github-gate.js";
 
 /**
  * Connect every configured MCP server, list its tools, and close. This is the deployment smoke test:
- * it exercises the same command, environment, network, and token paths as the bot without Telegram or a
+ * it exercises the same command, environment, network, and token paths as the bot without a
  * model. Run it as the service user so the sandbox and file ownership match the service.
  */
 async function main(): Promise<void> {

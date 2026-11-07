@@ -22,11 +22,11 @@ import { mkdir, mkdtemp, lstat, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { ConfigurationError } from "../errors.js";
 import { OutputWindow } from "./broker.js";
-import { clampWindow } from "./direct-executor.js";
+import { clampWindow } from "./output-window.js";
 import { handleFileRequest } from "./file-requests.js";
 import { chunkText, signalNumber } from "./output-chunks.js";
-import { PtcFileService } from "./ptc-fs.js";
-import { PtcHostError, type DirectHost } from "./ptc-host.js";
+import { FileService } from "./file-service.js";
+import { DirectHostError, type DirectHost } from "./direct-host.js";
 import type { RpcBashExecutePayload, RpcFileMethod, RpcSkippedOutput } from "./rpc-protocol.js";
 
 type SharedHostSession = {
@@ -34,7 +34,7 @@ type SharedHostSession = {
   /** Virtual root this session is confined to; also its path on the shared host. */
   readonly root: string;
   readonly tmpPath: string;
-  readonly files: PtcFileService;
+  readonly files: FileService;
   active?: { readonly child: ChildProcess };
 };
 
@@ -132,14 +132,14 @@ export function sessionWorkspacePath(root: string, requested: string | undefined
   const base = normalized(root);
   const value = normalized(requested ?? base);
   if (!base.startsWith("/") || value.includes("\0") || value.includes("\\")) {
-    throw new PtcHostError("invalid_request", "the workspace path is invalid", "not_started");
+    throw new DirectHostError("invalid_request", "the workspace path is invalid", "not_started");
   }
   const parts = value.split("/");
   if (parts.includes("..") || parts.includes(".")) {
-    throw new PtcHostError("invalid_request", "the workspace path is invalid", "not_started");
+    throw new DirectHostError("invalid_request", "the workspace path is invalid", "not_started");
   }
   if (value !== base && !value.startsWith(`${base}/`)) {
-    throw new PtcHostError("invalid_request", `the workspace must be ${base} or a directory below it`, "not_started");
+    throw new DirectHostError("invalid_request", `the workspace must be ${base} or a directory below it`, "not_started");
   }
   return value;
 }
@@ -152,18 +152,18 @@ export function sessionWorkspacePath(root: string, requested: string | undefined
 export async function ensureWorkspace(root: string, directory: string): Promise<void> {
   const existing = await lstat(directory).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return undefined;
-    throw new PtcHostError("internal", "the workspace cannot be inspected", "not_started");
+    throw new DirectHostError("internal", "the workspace cannot be inspected", "not_started");
   });
   if (existing?.isSymbolicLink()) {
-    throw new PtcHostError("invalid_request", "the workspace must not be a symbolic link", "not_started");
+    throw new DirectHostError("invalid_request", "the workspace must not be a symbolic link", "not_started");
   }
   if (existing !== undefined && !existing.isDirectory()) {
-    throw new PtcHostError("invalid_request", "the workspace is not a directory", "not_started");
+    throw new DirectHostError("invalid_request", "the workspace is not a directory", "not_started");
   }
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const [realRoot, realDirectory] = await Promise.all([realpath(root), realpath(directory)]);
   if (realDirectory !== realRoot && !realDirectory.startsWith(`${realRoot}/`)) {
-    throw new PtcHostError("invalid_request", "the workspace resolves outside the workspace root", "not_started");
+    throw new DirectHostError("invalid_request", "the workspace resolves outside the workspace root", "not_started");
   }
 }
 
@@ -192,7 +192,7 @@ export class SharedHostDirectHost implements DirectHost {
 
   async openSession(sessionId: string, cwd?: string): Promise<{ sharedMode: "rw"; tmpPath: string; workspace: string }> {
     if (this.#sessions.has(sessionId)) {
-      throw new PtcHostError("busy", "session already exists", "not_started");
+      throw new DirectHostError("busy", "session already exists", "not_started");
     }
     const root = sessionWorkspacePath(this.options.workspacesRoot, cwd);
     await ensureWorkspace(this.options.workspacesRoot, root);
@@ -201,7 +201,7 @@ export class SharedHostDirectHost implements DirectHost {
       sessionId,
       root,
       tmpPath,
-      files: new PtcFileService({
+      files: new FileService({
         roots: [
           { virtual: root, host: root, writable: true },
           { virtual: "/tmp", host: tmpPath, writable: true },
@@ -234,17 +234,17 @@ export class SharedHostDirectHost implements DirectHost {
     const session = this.requireSession(input.sessionId);
     const cwd = sessionWorkspacePath(session.root, input.payload.cwd);
     if (session.active !== undefined) {
-      throw new PtcHostError("busy", "a command is already running in this session", "not_started");
+      throw new DirectHostError("busy", "a command is already running in this session", "not_started");
     }
     if (input.signal.aborted) {
-      throw new PtcHostError("aborted", "the command was aborted before it started", "not_started");
+      throw new DirectHostError("aborted", "the command was aborted before it started", "not_started");
     }
     // The RPC payload's `env` is untrusted input at the execution boundary. Task-intent variables
     // are allowed, but host-owned ones (credentials, identity, runtime directory, service clients)
     // are fixed by the host and must not be specified or overridden by the caller.
     const owned = Object.keys(input.payload.env).filter((key) => HOST_ENV_KEYS.has(key));
     if (owned.length > 0) {
-      throw new PtcHostError(
+      throw new DirectHostError(
         "invalid_request",
         `the host owns these environment variables and the request cannot set them: ${owned.sort().join(", ")}`,
         "not_started",
@@ -255,7 +255,7 @@ export class SharedHostDirectHost implements DirectHost {
       : [...input.payload.command];
     const [file, ...args] = argv;
     if (file === undefined) {
-      throw new PtcHostError("internal", "the command is empty", "not_started");
+      throw new DirectHostError("internal", "the command is empty", "not_started");
     }
 
     let child: ChildProcess;
@@ -278,7 +278,7 @@ export class SharedHostDirectHost implements DirectHost {
         detached: true,
       });
     } catch (error) {
-      throw new PtcHostError(
+      throw new DirectHostError(
         "spawn_error",
         `the command could not start: ${error instanceof Error ? error.message : "spawn failed"}`,
         "not_started",
@@ -360,13 +360,13 @@ export class SharedHostDirectHost implements DirectHost {
     }
 
     if (spawnError !== undefined) {
-      throw new PtcHostError("spawn_error", `the command could not start: ${spawnError.message}`, "failed");
+      throw new DirectHostError("spawn_error", `the command could not start: ${spawnError.message}`, "failed");
     }
     if (timedOut) {
-      throw new PtcHostError("timeout", `the command timed out after ${input.payload.timeoutMs} ms`, "unknown");
+      throw new DirectHostError("timeout", `the command timed out after ${input.payload.timeoutMs} ms`, "unknown");
     }
     if (input.signal.aborted) {
-      throw new PtcHostError("aborted", "the command was aborted", "unknown");
+      throw new DirectHostError("aborted", "the command was aborted", "unknown");
     }
     return {
       exitCode: code ?? (128 + signalNumber(signal)),
@@ -382,7 +382,7 @@ export class SharedHostDirectHost implements DirectHost {
   }): Promise<unknown> {
     const session = this.requireSession(input.sessionId);
     if (input.signal.aborted) {
-      throw new PtcHostError("aborted", "the file request was aborted before it started", "not_started");
+      throw new DirectHostError("aborted", "the file request was aborted before it started", "not_started");
     }
     return handleFileRequest(session.files, session.sessionId, input);
   }
@@ -390,7 +390,7 @@ export class SharedHostDirectHost implements DirectHost {
   private requireSession(sessionId: string): SharedHostSession {
     const session = this.#sessions.get(sessionId);
     if (session === undefined) {
-      throw new PtcHostError("not_found", "session is not open", "not_started");
+      throw new DirectHostError("not_found", "session is not open", "not_started");
     }
     return session;
   }

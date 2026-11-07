@@ -98,13 +98,18 @@ test("first entry creates a usable bot with no user configuration, and a restart
     //    usable, but it is degraded rather than falsely Ready.
     assert.ok(first.provisioning.unavailable.includes("computer"));
     assert.ok(first.provisioning.unavailable.includes("web"));
-    assert.ok(first.provisioning.unavailable.includes("task"));
+    // A retired capability is reported in the platform status but is not a provisioning
+    // degradation: no deployment action could make it available again.
+    assert.ok(!first.provisioning.unavailable.includes("task"));
 
     const platform = await console.call("/api/platform");
     assert.equal(platform.status, 200);
     const computer = platform.body.capabilities.find((entry: { id: string }) => entry.id === "computer");
     assert.equal(computer.state, "unavailable");
     assert.equal(computer.verification, "not-configured");
+    const task = platform.body.capabilities.find((entry: { id: string }) => entry.id === "task");
+    assert.equal(task.state, "unavailable");
+    assert.match(task.reason, /提醒功能已移除/);
     assert.ok(platform.body.fingerprint.length >= 32);
     assert.equal(platform.body.provisioning.length, 1);
 
@@ -187,14 +192,16 @@ test("first entry creates a usable bot with no user configuration, and a restart
   }
 });
 
-test("the console still requires its token for every zero-setup route", { timeout: 120_000 }, async () => {
+test("the console still requires its token for every zero-setup API route", { timeout: 120_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "pa-zero-setup-auth-"));
   let service: ServiceHandle | undefined;
   try {
     service = await startService({ env: environment(directory), models: scriptedProvider(), log: () => {} });
     const port = service.console?.port;
     assert.ok(port !== undefined);
-    for (const path of ["/", "/api/bots", "/api/platform", "/api/integrations"]) {
+    // The static page must load before the browser can prompt for WEB_TOKEN; it holds no bot data.
+    assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status, 200);
+    for (const path of ["/api/bots", "/api/platform", "/api/integrations"]) {
       assert.equal((await fetch(`http://127.0.0.1:${port}${path}`)).status, 401, path);
     }
   } finally {

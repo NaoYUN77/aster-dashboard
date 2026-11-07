@@ -5,8 +5,8 @@
 并强制 `WEB_TOKEN`。
 
 > 本套验收针对**旧版显式 profile** 能力面：`run.sh` 会设置 `ALLOW_LEGACY_CATALOG=1`
-> （宿主级兼容开关，正常部署默认为 0）。Phase 1 只迁移 Bash / Read / Write / Edit，
-> `CODEMODE_ENABLED=0`，因此即使显式提交 `ptc=true` 也不会加载 codemode。生产部署默认走
+> （宿主级兼容开关，正常部署默认为 0）。Phase 1 只迁移 Bash / Read / Write / Edit；
+> PTC／codemode 已退役，`ptc=true` 只是兼容性负向用例，不会加载 codemode。生产部署默认走
 > 零配置模式：首次进入控制台自动创建并初始化 Bot，用户无需选择 Tool / Capability / MCP /
 > API Key。零配置流程由 `test/zero-setup-wiring.test.ts` 与 `test/zero-setup.test.ts` 覆盖。
 > 生产拓扑使用 `docker-compose.rpc.yml`（既有 mTLS RPC Gateway）连到共享 CVM 主机，步骤见
@@ -87,7 +87,7 @@ curl -sN "http://127.0.0.1:8787/api/bots/<botId>/events?token=$WEB_TOKEN"
 - 单机 overlay 的 `execution-host` 是**共享 CVM Execution Host 的同机替代**，不是每 Bot 容器：
   两个服务使用同一个镜像，执行面以专用非 root uid（1000）运行 `rpc-main.js` 的
   `EXECUTION_AGENT_SHARED_HOST=1` 模式，不启动 bwrap、cgroup 或 PTC。
-- `CODEMODE_ENABLED=0`；`health.check` 必须报告 `directBash: true`、`fileTools: true`、
+- PTC／codemode 已退役；`health.check` 必须报告 `directBash: true`、`fileTools: true`、
   `sharedMode: "rw"`、`ptc: false`、`testExecutor: false`。`execution-host-check.mjs` 的 S1
   即校验这些字段，而不是校验容器隔离。
 - Bash / Read / Write / Edit 走既有 RPC 协议；执行超时、`EXECUTION_AGENT_MAX_CONCURRENT`（3）、

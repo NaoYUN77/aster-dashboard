@@ -7,7 +7,7 @@
 #   2. docker compose up -d openbao, then `bao operator init` and `bao operator unseal`
 #      (the in-container CLI uses the plaintext loopback listener; see README.md).
 #   3. Rerun with secret names to write KV, the read-only OpenBao token, and the proxy token:
-#      ./bootstrap.sh DEEPSEEK_API_KEY DEEPSEEK_WEB_API_KEY TELEGRAM_BOT_TOKEN
+#      ./bootstrap.sh DEEPSEEK_API_KEY PLATFORM_WEB_SEARCH_API_KEY
 #   4. docker compose up -d mitm, then rerun once more to export the public MITM CA.
 #
 # Idempotent: existing TLS files, token files, KV entries, and policy updates are safe to repeat.

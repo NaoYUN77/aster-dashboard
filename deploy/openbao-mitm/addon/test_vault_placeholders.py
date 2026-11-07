@@ -12,7 +12,6 @@ from vault_placeholders import (
 ALLOWLIST = {
     "DEEPSEEK_API_KEY": ["api.deepseek.com"],
     "DEEPSEEK_WEB_API_KEY": ["api.deepseek.com"],
-    "TELEGRAM_BOT_TOKEN": ["api.telegram.org"],
     "LANGFUSE_PUBLIC_KEY": ["cloud.langfuse.com"],
     "LANGFUSE_SECRET_KEY": ["cloud.langfuse.com"],
 }
@@ -29,11 +28,9 @@ class SubstituteTests(unittest.TestCase):
         out = substitute("Bearer __vault_DEEPSEEK_API_KEY__", "api.deepseek.com", ALLOWLIST, resolve)
         self.assertEqual(out, "Bearer resolved-openbao-deepseek_api_key")
 
-    def test_replaces_web_and_telegram_placeholders_for_allowlisted_hosts(self):
+    def test_replaces_web_placeholder_for_allowlisted_host(self):
         web = substitute("Bearer __vault_DEEPSEEK_WEB_API_KEY__", "api.deepseek.com", ALLOWLIST, resolve)
         self.assertEqual(web, "Bearer resolved-openbao-deepseek_web_api_key")
-        tg = substitute("/bot__vault_TELEGRAM_BOT_TOKEN__/getMe", "api.telegram.org", ALLOWLIST, resolve)
-        self.assertEqual(tg, "/botresolved-openbao-telegram_bot_token/getMe")
 
     def test_host_match_is_case_insensitive_and_exact(self):
         out = substitute("__vault_DEEPSEEK_API_KEY__", "API.DeepSeek.com", ALLOWLIST, resolve)
@@ -44,8 +41,8 @@ class SubstituteTests(unittest.TestCase):
 
     def test_disallowed_host_is_refused_without_leaking_the_value(self):
         with self.assertRaises(PlaceholderError) as raised:
-            substitute("/bot__vault_TELEGRAM_BOT_TOKEN__/getMe", "attacker.example", ALLOWLIST, resolve)
-        self.assertIn("TELEGRAM_BOT_TOKEN", str(raised.exception))
+            substitute("Bearer __vault_DEEPSEEK_API_KEY__", "attacker.example", ALLOWLIST, resolve)
+        self.assertIn("DEEPSEEK_API_KEY", str(raised.exception))
         self.assertNotIn("resolved-openbao", str(raised.exception))
 
     def test_unknown_name_is_refused(self):
@@ -70,14 +67,14 @@ class SubstituteTests(unittest.TestCase):
         self.assertEqual(out, "resolved-openbao-deepseek_api_key;resolved-openbao-deepseek_web_api_key")
 
     def test_one_disallowed_placeholder_fails_the_whole_value(self):
-        text = "__vault_DEEPSEEK_API_KEY__ __vault_TELEGRAM_BOT_TOKEN__"
+        text = "__vault_DEEPSEEK_API_KEY__ __vault_LANGFUSE_SECRET_KEY__"
         with self.assertRaises(PlaceholderError):
             substitute(text, "api.deepseek.com", ALLOWLIST, resolve)
 
     def test_placeholder_names_lists_every_name(self):
         self.assertEqual(
-            placeholder_names("__vault_DEEPSEEK_API_KEY__ x __vault_TELEGRAM_BOT_TOKEN__"),
-            ["DEEPSEEK_API_KEY", "TELEGRAM_BOT_TOKEN"],
+            placeholder_names("__vault_DEEPSEEK_API_KEY__ x __vault_LANGFUSE_SECRET_KEY__"),
+            ["DEEPSEEK_API_KEY", "LANGFUSE_SECRET_KEY"],
         )
 
 

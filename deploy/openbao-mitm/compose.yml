@@ -62,7 +62,7 @@ services:
     image: ${MITMPROXY_IMAGE:?set MITMPROXY_IMAGE to the pinned mitmproxy image used in production}
     container_name: aster-mitm
     restart: unless-stopped
-    # -q keeps request URLs out of the log: the Telegram token is in the URL path after substitution.
+    # -q keeps request URLs out of the log: a substituted credential may appear in the URL path.
     entrypoint: ["mitmdump"]
     command:
       - "-q"
@@ -157,6 +157,6 @@ networks:
     ipam:
       config:
         - subnet: 10.89.143.0/24
-  # MITM-only outbound path to model providers and Telegram.
+  # MITM-only outbound path to model providers and the web tools endpoint.
   egress:
     name: aster_egress

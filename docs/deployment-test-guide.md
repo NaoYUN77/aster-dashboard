@@ -4,6 +4,8 @@
 
 状态：本手册是部署步骤和验收标准。所有者确认 Aster 已部署在腾讯云服务器上并持续运行。文中的“预期”是操作时的核对标准。第 9 节的脱敏记录（日期、镜像 digest、场景、结果）是可选项，没有它也不改变已部署这一事实。原 systemd 部署已停止支持，只保留[迁移路径](#7-从-systemd-迁移)。决定见 [ADR-0012](adr/0012-docker-replaces-systemd.md)。删除 Agent Vault、改成单服务的决定见 [ADR-0005](adr/0005-remove-agent-vault-single-service.md)。
 
+> **2026-11 更新**：Telegram 接入、提醒与人工投递补发已移除，唯一入口为 dashboard 控制台；本文的配置、日志与验收按控制台形态说明。基础 Compose 不发布端口，控制台由 [`dashboard/docker-compose.dashboard.yml`](../dashboard/docker-compose.dashboard.yml) overlay 发布到宿主回环地址。第 7 节 systemd 迁移只保留历史步骤。
+
 ## 1. 交付物与镜像
 
 | 文件 | 用途 |
@@ -25,11 +27,11 @@
 
 镜像入口为 `flock --no-fork --nonblock /data/app.lock node dist/src/main.js`。同一个数据卷上的第二个应用容器会因拿不到锁而立即退出，这是有意的保护。它只覆盖“同卷多容器”：
 
-- 不同数据卷、同一个 bot token 或同一个 owner 的两个实例不会被镜像检测。Telegram 长轮询会互相争抢，可能产生重复回复。
-- 迁移、回滚或演练期间不要让旧实例和新实例同时消费同一个 bot。
+- 不同数据卷的两个实例不会被镜像检测；若同时对外提供控制台，请求会落在各自独立的状态上，不能当作同一部署的冗余。
+- 迁移、回滚或演练期间不要让两个实例同时写同一个数据卷。
 - 同一数据卷只允许一个容器使用；不要用 `docker compose up --scale` 扩容。
 
-同一主机上的 `test` 与 `production` 共用这份 Compose，由版本化环境描述区分项目名、卷和 bot 身份。检查入口是 `npm run deployment:environment`。字段见 [部署环境描述](deployment-environments.md)。渲染通过不等于两环境已经隔离验收。
+同一主机上的 `test` 与 `production` 共用这份 Compose，由版本化环境描述区分项目名与应用卷名。检查入口是 `npm run deployment:environment`。字段见 [部署环境描述](deployment-environments.md)。渲染通过不等于两环境已经隔离验收。
 
 ## 2. 配置
 
@@ -43,18 +45,18 @@ chmod 600 .env
 
 必填项：
 
-- `TELEGRAM_BOT_TOKEN`：BotFather 创建的 bot token。
-- `TELEGRAM_OWNER_ID`：纯数字 Telegram 用户 ID；不要写用户名。
 - `MODEL_PROVIDER`：`src/providers.ts` 注册表内的 id。
 - `MODEL_ID`：该提供商在 pi-ai 1.3.0 模型目录中的 id。
 - 当前提供商对应的 API key 变量（如 `ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`）；其他提供商的 key 留空。
-- `TELEGRAM_API_ROOT`（可选）：https 前缀，无 query 或 fragment。供无法直连 `api.telegram.org` 的主机把 Bot API 指到自建反向代理。未设置时使用官方根地址。仓库没有记录这项是否在某台机器上使用。
+- `CONSOLE_ENABLED=1`：启用 dashboard 控制台，这是当前唯一入口。基础 `docker-compose.yml` 不发布端口；用 [`dashboard/docker-compose.dashboard.yml`](../dashboard/docker-compose.dashboard.yml) overlay 把控制台发布到宿主 `127.0.0.1:8787`，或通过 SSH 隧道／反向代理访问。
+- `WEB_TOKEN`：16–256 个可打印字符、不含空格的控制台令牌（`WEB_AUTH` 默认 `token`）。不要把它写进日志或聊天。
+- 可选：`CONSOLE_HOST`（IP 字面量，默认 `0.0.0.0`）、`CONSOLE_PORT`（默认 `8787`）、`CONSOLE_MAX_BOTS`。
 
-只检查键是否存在，不要在终端或日志中回显值：
+只检查键是否存在，不要在终端或日志中回显 `WEB_TOKEN` 或 API key 的值：
 
 ```sh
-grep -cE '^(TELEGRAM_BOT_TOKEN|TELEGRAM_OWNER_ID|MODEL_PROVIDER|MODEL_ID)=.+' .env   # 预期 4
-grep -cE '^[A-Z0-9_]*_API_KEY=.+' .env                                            # 至少 1
+grep -cE '^(MODEL_PROVIDER|MODEL_ID|CONSOLE_ENABLED|WEB_TOKEN)=.+' .env   # 预期 4
+grep -cE '^[A-Z0-9_]*_API_KEY=.+' .env                                  # 至少 1
 ```
 
 `DATA_DIR` 由 Compose 固定为 `/data`，`.env` 中的值不生效。数据卷的显式名称是 `personal-agent-data`，不随项目目录名变化；升级 Aster 改名时也不改卷名。
@@ -65,7 +67,7 @@ grep -cE '^[A-Z0-9_]*_API_KEY=.+' .env                                          
 docker compose run --rm --no-deps personal-agent node dist/src/check-config.js
 ```
 
-预期输出 `Configuration OK: MODEL_PROVIDER=... MODEL_ID=... MCP_SERVERS=...`。缺失项会打印 `Missing configuration: <KEY>`，提供商或模型 id 错误会打印候选列表；先修配置，不要反复重启。bot 已有 webhook 时应用拒绝启动，需先在原部署中停用。
+预期输出 `Configuration OK: MODEL_PROVIDER=... MODEL_ID=... MCP_SERVERS=...`。缺失项会打印 `Missing configuration: <KEY>`，提供商或模型 id 错误会打印候选列表；先修配置，不要反复重启。控制台令牌形状不合法时同样在启动前失败。
 
 MCP 配置默认读取 `DATA_DIR/mcp.json`，即卷内 `/data/mcp.json`；文件不存在表示关闭。默认路径上的文件级错误只禁用 MCP，`MCP_CONFIG` 显式指定的文件错误会使检查失败。配置格式见 [工具与 MCP](mcp.md)。
 
@@ -103,9 +105,9 @@ docker compose up -d --no-build
 docker compose logs --tail 50 personal-agent
 ```
 
-预期日志出现 `Personal agent starting; single-owner private Telegram messages enabled.`，随后进入长轮询且无持续报错。`docker compose ps` 显示 `running` 只表示进程存在，不代表已通过 Telegram 验收。
+预期日志出现 `Console listening on ...; open it with the WEB_TOKEN from the environment.`，且无持续报错。`docker compose ps` 显示 `running` 只表示进程存在，不代表控制台业务链已验收。
 
-用 owner 账号私聊 bot 发送“现在几点？”。预期收到与服务器 UTC 时间一致的回复，日志中没有 `Agent request failed`。数据卷中应出现：
+在浏览器打开 `http://127.0.0.1:8787`，用 `WEB_TOKEN` 登录后选择 Bot 并发送“现在几点？”。预期历史中出现与服务器 UTC 时间一致的回复，日志中没有 `Agent request failed`。数据卷中应出现：
 
 ```sh
 docker compose exec personal-agent ls -la /data /data/workspace
@@ -137,7 +139,7 @@ docker compose logs --tail 50 personal-agent
 把 `ASTER_IMAGE` 改回上一个可用 digest，执行 `docker compose up -d --no-build personal-agent`。镜像回滚不会自动回滚数据；应用没有数据库降级机制，旧镜像也不保证能读取新版本写入的状态。
 
 - 若新版本只运行过、未产生不可逆数据，直接用旧镜像启动即可。
-- 若出现 schema 或数据不兼容，这是一个显式的恢复决策：按第 6 节还原备份会丢失备份之后产生的会话、记忆和投递状态，可能造成重复回复。先停服、备份当前卷，再决定是否还原；不要把它当作回滚的默认步骤。
+- 若出现 schema 或数据不兼容，这是一个显式的恢复决策：按第 6 节还原备份会丢失备份之后产生的会话、记忆和控制台请求状态。先停服、备份当前卷，再决定是否还原；不要把它当作回滚的默认步骤。
 - 回滚前始终先备份当前卷，保留现场以便排查。
 
 ## 5. 维护命令
@@ -145,18 +147,13 @@ docker compose logs --tail 50 personal-agent
 所有一次性命令使用同一镜像，先停应用，避免与运行中的进程争用 SQLite 或 OAuth token 文件。
 
 ```sh
-# 投递核查
-docker compose stop personal-agent
-docker compose run --rm --no-deps personal-agent node dist/src/deliveries.js list
-docker compose start personal-agent
-
 # MCP 连接检查
 docker compose stop personal-agent
 docker compose run --rm --no-deps personal-agent node dist/src/mcp-check.js
 docker compose start personal-agent
 ```
 
-`deliveries.js list` 输出 `blocked` 与 `failures` 两个数组；该命令会先执行恢复，强杀时处于 `sending` 的分段会以 `uncertain` 出现。先核对 Telegram 实际收到的内容，再决定 `retry` 或 `sent`。命令语义见 [投递核查与补发](deliveries.md)。这两条命令只改本地投递状态，不重新执行 agent。
+控制台回复是终态：`inbox.sqlite` 保存请求与回复，`failures` 表记录 `AGENT_UNANSWERED` 等失败码，不再有分段投递、`retry`／`sent` 人工补发或 `deliveries.js`。排查时核对控制台历史与失败记录，不要重新执行 agent。MCP 检查只连接并列出工具名后关闭，不启动控制台与模型。
 
 ### MCP OAuth
 
@@ -185,7 +182,7 @@ docker stats --no-stream $(docker compose ps -q personal-agent)
 docker inspect --format '{{.State.OOMKilled}}' $(docker compose ps -q personal-agent)
 ```
 
-关注初始化日志、`Agent request failed`、`delivery`、`polling retry`、重启次数和 `OOMKilled`。1 GB 是保护线，不是性能保证；真实峰值仍需在目标机测量。
+关注初始化日志、`Agent request failed`、`AGENT_UNANSWERED`、控制台请求失败与重启次数和 `OOMKilled`。1 GB 是保护线，不是性能保证；真实峰值仍需在目标机测量。
 
 ## 6. 备份与还原（整个卷）
 
@@ -259,7 +256,7 @@ docker compose logs --tail 50 personal-agent
 | 内容 | 说明 |
 | --- | --- |
 | `agent.sqlite` 及其 WAL/SHM | 底座会话与执行恢复状态 |
-| `inbox.sqlite` 及其 WAL/SHM | 请求消费位置、身份绑定和投递状态 |
+| `inbox.sqlite` 及其 WAL/SHM | 控制台请求的接收、回复与失败状态；旧版兼容表保留既有数据 |
 | `workspace/` | 记忆和任务文件 |
 | `mcp.json` | 可选，MCP 配置 |
 | `mcp-oauth/` | 可选，MCP OAuth token 与动态注册信息 |
@@ -268,9 +265,9 @@ docker compose logs --tail 50 personal-agent
 配置迁移应在上述第 5 步启动前完成：
 
 - MCP 的 `cwd` 改为容器内路径，例如 `/data/workspace`；宿主 `/opt` 或用户目录下的命令不可直接复用，应在派生镜像中安装依赖并更新绝对路径。
-- 从 `/etc/personal-agent.env` 摘取 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_OWNER_ID`、`MODEL_PROVIDER`、`MODEL_ID` 和对应 API key 到 `.env`。
+- 从 `/etc/personal-agent.env` 摘取 `MODEL_PROVIDER`、`MODEL_ID` 与对应 API key 到 `.env`；旧版 `TELEGRAM_*` 变量不再被读取，不必迁移。
 - 不要复制 `DATA_DIR=/var/lib/personal-agent`；容器内固定 `/data`。
-- owner ID 使用 `.env` 中的内联 `TELEGRAM_OWNER_ID`。
+- 控制台按本文第 2 节配置 `CONSOLE_ENABLED`、`WEB_TOKEN` 与 overlay；旧版 owner ID 只作为历史数据留在卷内。
 - 旧 systemd 专用的 `ProtectHome`、`MemoryMax`、`ReadWritePaths` 等设置不再适用；资源限制由 Compose 提供。
 
 已有卷名必须保留：应用卷 `personal-agent-data`。如果旧 Compose 创建的是带项目前缀的卷（如 `<目录名>_personal-agent-data`），把内容复制到显式命名的卷后再启动，不要改名或新建空卷。迁移验收通过并保留一段回滚窗口后，再删除旧 unit 和旧数据目录；在此之前不要删除 `/var/lib/personal-agent`。
@@ -281,32 +278,33 @@ docker compose logs --tail 50 personal-agent
 | --- | --- | --- |
 | `pull access denied` / 找不到镜像 | 镜像未构建、未 `load` 或引用写错 | 核对 `ASTER_IMAGE`；构建机分发或从仓库拉取 |
 | 启动即退出，`Missing configuration` | `.env` 缺项 | 补齐对应键 |
-| 启动即退出，webhook 错误 | bot 已有 webhook | 先停用原 webhook |
-| 启动即退出，`belongs to another Telegram bot or owner` | 数据卷来自别的 bot／用户 | 换独立数据卷，或确认身份后迁移 |
+| 启动即退出，`CONSOLE_ENABLED`／`WEB_TOKEN` 配置错误 | 取值不是 `0`/`1` 或令牌形状不合法 | 按第 2 节补齐或修正，不回显令牌值 |
 | 启动即退出，`flock` 无法加锁 | 同一数据卷已有实例 | 停掉旧容器；不要并行运行 |
 | `EACCES` / `Unable to open the database file` | 卷内文件属主不是 uid 1000 | `chown -R 1000:1000 /data` |
-| 容器 `running` 但无回复 | 模型或 Telegram 网络失败 | 看日志错误码；核对服务器出网与模型端点可达性 |
+| 容器 `running` 但控制台打不开 | overlay 未发布端口或令牌错误 | 核对 `dashboard/docker-compose.dashboard.yml` 与 `127.0.0.1:8787`；令牌来自 `.env` |
+| 容器 `running` 但无回复 | 模型网络失败或 provider key 错误 | 看日志错误码；核对服务器出网与模型端点可达性 |
 | 备份归档为空 | 卷名错误 | `docker volume ls` 核对 `personal-agent-data` |
 | 收到截断提示 | 模型输出达到长度上限 | 让用户拆分问题；不会自动续写 |
-| 回复重复 | 发送结果曾未知后人工 `retry` | 核对 Telegram 实际消息，重复属预期风险 |
 
 ## 9. 上线判定与验证边界
 
 全部满足才算部署验收完成：
 
 - [ ] 配置检查输出 `Configuration OK`。
-- [ ] owner 私聊、会话连续、工具调用、记忆跨重启、非授权隔离均通过。
+- [ ] 控制台登录、会话连续、工具调用、记忆跨重启、未授权访问被拒均通过。
 - [ ] 正常重启、执行中断、强杀三种场景通过。
-- [ ] `deliveries.js list` 可用且输出可读。
+- [ ] 控制台历史与 `failures` 记录可查，回复不依赖外部投递进程。
 - [ ] 未触发 OOM，重启次数稳定。
 - [ ] 备份归档包含 SQLite、WAL、`workspace/` 和 `mcp-oauth/`，整卷还原演练成功。
 - [ ] 日志中没有凭据或完整消息内容。
 - [ ] 记录了镜像 digest、Compose 版本、真实模型和当日费用。
 
-仓库里能核对的范围：应用镜像可构建；基础 Compose 与 build 覆盖可渲染；主机测试和 GitHub Actions 的单服务拓扑通过。拓扑不覆盖真实 Telegram／模型链路，见 [CI/CD 实施计划的当前事实](ci-cd-implementation-plan.md#当前事实)。所有者确认生产环境已在腾讯云运行。上面的清单是可选核对项，未勾选不否定已部署。
+仓库里能核对的范围：应用镜像可构建；基础 Compose 与 build 覆盖可渲染；主机测试和 GitHub Actions 的单服务拓扑通过。拓扑不覆盖真实控制台业务链与模型链路，见 [CI/CD 实施计划的当前事实](ci-cd-implementation-plan.md#当前事实)。所有者确认生产环境已在腾讯云运行。上面的清单是可选核对项，未勾选不否定已部署。
 
 ### 部署记录
 
-> **TODO（维护者填写，可选）**  
-> 可在这里追加一条脱敏记录，至少包括：日期、镜像 digest（`repository@sha256:…`）、场景（例如 owner 私聊、记忆跨重启、容器重启）、结果。不要粘贴 token、聊天原文或日志全文。  
+> **TODO（维护者填写，可选）**
+>
+> 可在这里追加一条脱敏记录，至少包括：日期、镜像 digest（`repository@sha256:…`）、场景（例如控制台对话、记忆跨重启、容器重启）、结果。不要粘贴 token、聊天原文或日志全文。
+>
 > 没有这条记录时，仍以所有者确认为准：Aster 已部署在腾讯云并持续运行。记忆验收里的腾讯云机器是测试补测，见 [记忆系统验收](memory-verification.md)，不能代替本条生产说明。

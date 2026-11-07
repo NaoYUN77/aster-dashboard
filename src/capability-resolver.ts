@@ -13,7 +13,7 @@
 // zero-setup path never supplies it. A registered tool is not the same as an authorized tool.
 
 import { parseCatalogProfile, parseToolScope, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
-import { capabilityById, type CapabilityId, type PlatformManifest } from "./platform-capabilities.js";
+import { capabilityById, RETIRED_CAPABILITY_IDS, type CapabilityId, type PlatformManifest } from "./platform-capabilities.js";
 import type { IntegrationRegistry } from "./integrations.js";
 
 type GroupName = "core" | "shell" | "files" | "web" | "ptc" | "memory" | "reminders" | "mcp";
@@ -25,9 +25,9 @@ const GROUP_CAPABILITY: Readonly<Record<GroupName, CapabilityId>> = Object.freez
 
 /** Representative exact names, used only to give a caller a precise reason for a denial. */
 const GROUP_TOOLS: Readonly<Record<GroupName, readonly string[]>> = Object.freeze({
-  core: [], shell: ["bash"], files: [], web: ["web_search", "web_fetch"], ptc: ["codemode"],
+  core: [], shell: ["bash"], files: [], web: ["web_search", "web_fetch"], ptc: [],
   memory: ["memory_search", "memory_read", "working_read", "working_update"],
-  reminders: ["reminder_create", "reminder_list", "reminder_cancel"],
+  reminders: [],
   mcp: [],
 });
 
@@ -57,7 +57,8 @@ export function resolveCatalog(input: ResolveInput): ResolvedCatalog {
   // only widen the catalog after a real connection, which this phase never reports.
   const base = parseCatalogProfile({ ...manifest.defaults, mcp: manifest.defaults.mcp && connected });
   const override = input.override;
-  const profile = parseCatalogProfile(override?.profile === undefined ? base : { ...base, ...override.profile });
+  // Retired groups remain in persisted profiles, but even a host override cannot enable them.
+  const profile = parseCatalogProfile({ ...base, ...override?.profile, ptc: false, reminders: false });
   const scope = parseToolScope(override?.scope ?? { allow: [], deny: [] });
 
   const reasons = new Map<string, string>();
@@ -75,8 +76,12 @@ export function resolveCatalog(input: ResolveInput): ResolvedCatalog {
     profile,
     scope,
     reasons: new Map(reasons),
+    // A retired capability stays visible in the platform status but is not a provisioning
+    // degradation: there is no deployment action that could make it available again.
     unavailableCapabilities: Object.freeze(
-      manifest.capabilities.filter((entry) => entry.state === "unavailable").map((entry) => entry.id),
+      manifest.capabilities
+        .filter((entry) => entry.state === "unavailable" && !RETIRED_CAPABILITY_IDS.includes(entry.id))
+        .map((entry) => entry.id),
     ),
   });
 }

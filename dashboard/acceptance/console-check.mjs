@@ -18,8 +18,8 @@ const results = [];
 
 // Phase 1 migrates Bash / Read / Write / Edit to the shared Execution Host only. The legacy
 // explicit-profile surface is still exercised here (ALLOW_LEGACY_CATALOG=1), but an explicit
-// ptc: true must NOT resurrect codemode: the app sets CODEMODE_ENABLED=0 and the shared host
-// deliberately advertises no PTC. The two variable names below are historical identifiers.
+// ptc: true must NOT resurrect codemode: PTC/codemode is retired and the shared host never
+// advertises it. The two variable names below are historical identifiers.
 const ptcDisabledProfile = {
   core: true,
   shell: true,

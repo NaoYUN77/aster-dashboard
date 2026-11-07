@@ -42,7 +42,7 @@ export interface PlatformAgent {
     readonly botId: string;
     readonly conversationId?: string;
     readonly cwd: string;
-    readonly channel?: "telegram" | "console";
+    readonly channel?: "console";
     readonly prompt: string;
     readonly catalogProfile: CatalogProfile;
     readonly toolScope: ToolScope;

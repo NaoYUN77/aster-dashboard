@@ -1,3 +1,5 @@
+> **状态：已废弃（历史记录）。** `reminder_*` 工具、ReminderStore 与 ReminderScheduler 已移除，既有 SQLite 表和数据保留；当前唯一入口是 dashboard 控制台（dash），见[当前架构](../../../README.md#架构)。下文保留原始决策背景。
+
 # ADR-0022：提醒由宿主持久化并在进程内调度
 
 - **状态**：Accepted

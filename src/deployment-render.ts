@@ -101,7 +101,8 @@ export function checkRenderedProject(bytes: Uint8Array, options: RenderCheckOpti
     if (network.name !== undefined && network.name !== `${options.projectName}_default`) fail("RENDER_NETWORK_MISMATCH");
   }
 
-  // The app publishes no port: Telegram is long polling, so any published port is unsanctioned.
+  // The base stack publishes no port; an ingress port belongs to the separately reviewed
+  // dashboard overlay, which is not part of this render check.
   for (const service of Object.values(config.services)) {
     if ((service.ports ?? []).length > 0) fail("RENDER_PUBLISHED_PORT");
   }

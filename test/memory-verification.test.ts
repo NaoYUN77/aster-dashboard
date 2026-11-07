@@ -902,7 +902,7 @@ test("08-E: the real OpenAI adapter's request bodies keep a byte-stable prefix w
 // It proves the shape the design froze (§4): Context is pure (no I/O imports
 // at all), Daily Memory never touches the durable SDK, Working manages no
 // base execution state (types only, no submissions/tasks), the application
-// reaches memory only through the composition root, delivery-side modules
+// reaches memory only through the composition root, ingress/persistence modules
 // stay memory-free, and no memory source imports anything beyond Node
 // builtins, the two SDK packages, typebox and relative paths — no event
 // bus, database service or plugin framework crept in.
@@ -937,7 +937,7 @@ test("08-H: dependency review — pure Context, Harness-free Daily, state-only W
   const agentMemoryImports = importsOf(agentSource).filter((spec) => spec.includes("memory"));
   assert.deepEqual(agentMemoryImports, ["./memory/integration.js"], "the application reaches memory only through the composition root");
 
-  for (const path of ["src/telegram.ts", "src/inbox.ts", "src/deliveries.ts", "src/main.ts"]) {
+  for (const path of ["src/console.ts", "src/inbox.ts", "src/bot-manager.ts", "src/main.ts"]) {
     const source = await read(path);
     assert.ok(!/from\s+"[^"]*memory\//.test(source), `${path} must not import memory internals`);
   }
@@ -956,6 +956,6 @@ test("08-H: dependency review — pure Context, Harness-free Daily, state-only W
 
   const pkg = JSON.parse(await read("package.json")) as { dependencies: Record<string, string> };
   const dependencyNames = Object.keys(pkg.dependencies).sort();
-  assert.deepEqual(dependencyNames, ["@earendil-works/chord", "@earendil-works/pi-ai", "@earendil-works/pi-codemode", "@earendil-works/pi-durable", "@earendil-works/pi-mcp", "@langfuse/otel", "@langfuse/tracing", "@opentelemetry/api", "@opentelemetry/exporter-trace-otlp-http", "@opentelemetry/sdk-trace-node", "abort-controller", "grammy", "typebox"],
-    "the runtime dependency set is exactly the reviewed one (pi-codemode backs PTC, the two Langfuse packages plus their OTel API/exporter/provider back tracing; no event bus, database service or plugin framework)");
+  assert.deepEqual(dependencyNames, ["@earendil-works/chord", "@earendil-works/pi-ai", "@earendil-works/pi-durable", "@earendil-works/pi-mcp", "@langfuse/otel", "@langfuse/tracing", "@opentelemetry/api", "@opentelemetry/exporter-trace-otlp-http", "@opentelemetry/sdk-trace-node", "abort-controller", "typebox"],
+    "the runtime dependency set is exactly the reviewed one (the two Langfuse packages plus their OTel API/exporter/provider back tracing; no PTC sandbox, Telegram client, event bus, database service or plugin framework)");
 });

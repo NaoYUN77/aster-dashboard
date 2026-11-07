@@ -12,7 +12,7 @@ Aster Dashboard 当前明确是**单用户 MVP**：不考虑多租户，不要�
 
 | 位置 | 职责 |
 | --- | --- |
-| Lighthouse（10.1.4.9） | Agent Runtime、Session、Memory、Task、Tool Registry、Console／Telegram 适配；应用容器 |
+| Lighthouse（10.1.4.9） | Agent Runtime、Session、Memory、Task、Tool Registry、Dashboard Console 适配；应用容器 |
 | CVM（172.16.0.7） | 一台共享 Computer / Execution Host，运行 `rpc-main.js` 的 `EXECUTION_AGENT_SHARED_HOST=1` 模式 |
 | 两者之间 | 既有 RPC Gateway + 私网 mTLS（`docker-compose.rpc.yml`），**不重新开发传输协议** |
 
@@ -36,7 +36,7 @@ Execution Service 以专用非 root Linux 用户运行，不允许 root、sudo�
 - **本 runbook 不修改防火墙、安全组或 systemd 全局配置**。9443 的私网可达性是 Phase 0 既有
   前提；若不通，由运维按既有变更流程处理，不在本次代码交付范围内。
 - 控制面（Lighthouse）的 `docker-compose.rpc.yml` 无需改动传输层；其默认
-  `EXECUTION_REMOTE_CWD=/workspaces`、`CODEMODE_ENABLED=0` 即为 Phase 1 配置。
+  `EXECUTION_REMOTE_CWD=/workspaces` 即为 Phase 1 配置；PTC／codemode 已退役。
 
 ## 3. 专用非 root 用户与目录（人工执行，需审查）
 
@@ -109,13 +109,14 @@ chmod 0640 /etc/aster/shared-host.env
 
 要点：
 
-- `EXECUTION_AGENT_SHARED_HOST=1` 是唯一开关；缺失时 `rpc-main.js` 仍走旧 bwrap／cgroup PTC 路径。
+- `EXECUTION_AGENT_SHARED_HOST=1` 是必需配置；缺失时 `rpc-main.js` 直接拒绝启动：
+  `EXECUTION_AGENT_SHARED_HOST=1 is required; the retired PTC / bwrap execution agent is no longer supported`。
 - `PTC_ENABLED` 只能是 `0` 或空；其它值在 shared-host 模式下直接配置失败。
 - `EXECUTION_AGENT_WORKSPACES` 必须与控制面 `EXECUTION_REMOTE_CWD` 同为 `/workspaces`。
   控制面把 `/workspaces/<botId>` 作为虚拟 cwd 下发，执行面的 `sessionWorkspacePath()` 只接受
   该前缀；沿用旧值 `/shared/aster` 会在 `session.open` 时被拒绝（不是静默回退）。
-- `CODEMODE_ENABLED=0` 必须在控制面生效：`PtcGateway.start()` 在 `health.check` 报告
-  `ptc: false` 时会 fail-closed 拒绝启动。
+- 监听前执行 `assertNotRoot()`、`stat(workspacesRoot)` 与 `direct.preflight()`；
+  `PTC_ENABLED` 必须未设置、为空或为 `0`。PTC／codemode 已退役，不再启动 `PtcGateway`。
 
 ## 6. 配置检查（先于监听）
 
@@ -140,7 +141,7 @@ sudo -u aster-exec sh -c '
 sudo sh -c 'set -a; . /etc/aster/shared-host.env; set +a; npm run execution:rpc-agent -- --check'
 # 预期：shared host mode must not run as root
 
-# 不允许在共享主机上开启 PTC
+# 已退役的 PTC 不能重新启用；遗留配置必须被拒绝
 sudo -u aster-exec sh -c '
   set -a; . /etc/aster/shared-host.env; set +a
   PTC_ENABLED=1 npm run execution:rpc-agent -- --check
@@ -193,8 +194,8 @@ journalctl -u aster-shared-host -n 50 --no-pager
 
 ## 8. 控制面验收（从 Lighthouse 应用容器内执行）
 
-确认 `docker-compose.rpc.yml` 已带 `EXECUTION_REMOTE_CWD=/workspaces` 与
-`CODEMODE_ENABLED=0` 启动 `personal-agent` + `rpc-gateway`。随后执行：
+确认 `docker-compose.rpc.yml` 已带 `EXECUTION_REMOTE_CWD=/workspaces` 启动
+`personal-agent` + `rpc-gateway`；控制面不再配置 PTC／codemode。随后执行：
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.mitm.yml -f docker-compose.rpc.yml \
@@ -264,8 +265,8 @@ JS
 1. 在 Lighthouse 停止应用侧的 RPC 组合（`docker compose ... down`，不要 `-v`，保留 `/data`）。
 2. 在 CVM 执行 `systemctl stop aster-shared-host` 并 `systemctl disable aster-shared-host`；
    保留 `/etc/aster/shared-host.env`、`/workspaces` 与 systemd unit 文件供复查。
-3. 如需回到旧执行面，按 [Remote PTC Phase 1／2 Runbook](runbook-remote-ptc-phase1-2.md)
-   恢复原 PTC agent（注意 `CODEMODE_ENABLED` 与 `EXECUTION_REMOTE_CWD` 的旧默认值）。
+3. [Remote PTC Phase 1／2 Runbook](../archive/ptc-codemode/docs/runbook-remote-ptc-phase1-2.md)
+   仅保留为历史记录，不是回滚目标；当前版本不支持恢复已退役的 PTC agent。
 4. `/workspaces` 内的 Bot 文件不随回滚删除；会话是连接作用域的，断线不重放，回滚不会自动
    重跑任何命令。
 

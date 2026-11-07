@@ -29,7 +29,7 @@ export ASTER_IMAGE=${ASTER_IMAGE:-aster:local}
 export ASTER_APP_VOLUME=${ASTER_APP_VOLUME:-aster-acceptance-app}
 export ASTER_EXECUTION_RUNTIME_VOLUME=${ASTER_EXECUTION_RUNTIME_VOLUME:-aster-acceptance-runtime}
 export ASTER_EXECUTION_WORKSPACES_VOLUME=${ASTER_EXECUTION_WORKSPACES_VOLUME:-aster-acceptance-workspaces}
-# This harness exercises the pre-zero-setup explicit-profile surface (no PTC in Phase 1). Production
+# This harness exercises the pre-zero-setup explicit-profile surface (PTC/codemode is retired). Production
 # deployments keep ALLOW_LEGACY_CATALOG unset (zero-setup); only this acceptance run opts into it.
 export ALLOW_LEGACY_CATALOG=1
 

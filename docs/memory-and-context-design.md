@@ -84,15 +84,15 @@ working、B 和每日记忆中可以出现同一事实，但各自回答不同�
 - 先使用普通函数和少量有状态 module，不为每个存储操作建立一层转发 class。
 - 仅在真实变化点注入依赖：模型提取器、时钟、文件根目录以及底座接入。单一文件后端不预建通用存储插件协议。
 - 应用只定义自己拥有的 `WorkingState`、`CycleSnapshot`、`MemorySegment`、`ArchiveBatch`、`ContextPlan` 等契约。原生 Message、Entry、Task 和 ID 使用 SDK 类型，不能复制等价定义。
-- 纯业务与规划函数不依赖 Harness、Telegram、全局环境变量或文件系统；使用 SDK 的类型引用不等于依赖其运行时。
-- `src/agent.ts` 只保留组合和原有请求生命周期；`src/telegram.ts`、inbox、投递实现无需理解三块上下文。
+- 纯业务与规划函数不依赖 Harness、控制台入口、全局环境变量或文件系统；使用 SDK 的类型引用不等于依赖其运行时。
+- `src/agent.ts` 只保留组合和原有请求生命周期；`src/console.ts`、`src/inbox.ts` 与控制台回复展示无需理解三块上下文。
 - modules 通过返回结果或显式调用合作，不互相监听和改写对方内部状态。持久化通知先有可恢复事实，再有处理动作。
 
 建议代码归属：`src/memory/working.ts`、`context.ts`、`daily.ts`、`archive.ts`；SDK 接入放在 `src/memory/durable-*.ts`，模型提示与转换放在对应摘要／提取 Adapter。MEM-01 已建立 `src/memory/contracts.ts` 作为共享契约的唯一位置，并行 issue 在此基础上添加各自 module，不另建近似类型；这些路径不是要求增加空文件或包装层。
 
 ## 5. Working：当前任务与常驻偏好
 
-working 保存当前目标、范围、约束、已确认进度、阻塞、下一步、简短近期说明和关键来源。成功状态须引用已提交的工具证据；工具是否执行、generation 是否运行、Telegram 是否送达仍由其原生记录决定。
+working 保存当前目标、范围、约束、已确认进度、阻塞、下一步、简短近期说明和关键来源。成功状态须引用已提交的工具证据；工具是否执行、generation 是否运行、控制台回复是否已保存仍由其原生记录决定。
 
 跨任务偏好与当前任务分别建字段。偏好必须有明确用户来源、适用范围及必要的有效期；任务完成只清理任务状态，不清理有效偏好。自动事件归档不自动建立永久偏好。默认值、事实和授权保持原有语义，旧授权不能因检索被重新授予。
 

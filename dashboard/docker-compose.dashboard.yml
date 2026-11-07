@@ -20,8 +20,7 @@ services:
       - ${ASTER_DASHBOARD_ENV_FILE:-./dashboard/.env}
     environment:
       DATA_DIR: /data
-      # The console is the only owner surface; Telegram is off in this deployment.
-      TELEGRAM_ENABLED: "0"
+      # The dashboard console is the only ingress.
       CONSOLE_ENABLED: "1"
       CONSOLE_HOST: 0.0.0.0
       CONSOLE_PORT: "8787"
@@ -36,10 +35,6 @@ services:
       EXECUTION_REMOTE_CWD: /workspaces
       EXECUTION_RPC_TRANSPORT: unix
       EXECUTION_RPC_SOCKET: /run/aster/rpc.sock
-      # Phase 1 migrates Bash / Read / Write / Edit only. Codemode would require remote PTC, which
-      # the shared host deliberately does not advertise; leaving it off keeps startup fail-closed.
-      CODEMODE_ENABLED: "0"
-      CODEMODE_SCRIPT_FIRST: "0"
     ports:
       # Loopback only: the token is the second gate, never the only one.
       - "127.0.0.1:8787:8787"
@@ -81,7 +76,6 @@ services:
       EXECUTION_AGENT_TEST_EXECUTOR: "0"
       EXECUTION_AGENT_OUTPUT_CHUNK_BYTES: "32768"
       EXECUTION_AGENT_OUTPUT_BYTES_PER_SECOND: "4194304"
-      PTC_ENABLED: "0"
     tmpfs:
       - /tmp:mode=1777,size=256m
     mem_limit: 2g

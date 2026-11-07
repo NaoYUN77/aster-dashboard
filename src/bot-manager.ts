@@ -19,14 +19,13 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentEvent } from "@earendil-works/pi-durable";
 import type { openAgent } from "./agent.js";
-import { NotFoundError, StateError } from "./errors.js";
+import { failureCode, NotFoundError, StateError } from "./errors.js";
 import {
   isBotId,
   parseBotTools,
   type BotRecord,
   type Inbox,
 } from "./inbox.js";
-import { failureCode } from "./telegram.js";
 import {
   DEFAULT_CATALOG_PROFILE, catalogFor, legacyCapabilitiesForProfile,
   parseCatalogProfile, parseToolScope, type CatalogProfile, type ToolScope,
@@ -94,10 +93,6 @@ export type BotManagerOptions = {
    * installation does not move its files; new bots get their own directory under the root.
    */
   readonly defaultWorkspace?: string;
-  /** Where the bootstrap bot's replies go; the root conversation predates the console. */
-  readonly bootstrapChannel?: "telegram" | "console";
-  /** True when the deployment has code mode configured at all. */
-  readonly ptc: boolean;
   /** True when the deployment has a configured Claude Code Router profile. */
   readonly web: boolean;
   readonly signal: AbortSignal;
@@ -444,7 +439,7 @@ export class BotManager {
       systemPrompt: bot.systemPrompt,
       conversationId: bot.conversationId,
       cwd: await this.#workspace(bot.botId),
-      channel: bot.botId === "default" ? this.#options.bootstrapChannel ?? "telegram" : "console",
+      channel: "console",
     });
   }
 
@@ -495,7 +490,7 @@ export class BotManager {
         botId: bot.botId,
         conversationId: bot.botId === "default" ? "root" : bot.conversationId,
         cwd: await this.#workspace(bot.botId),
-        channel: bot.botId === "default" ? this.#options.bootstrapChannel ?? "telegram" : "console",
+        channel: "console",
         prompt: bot.systemPrompt,
         catalogProfile: profile,
         toolScope,

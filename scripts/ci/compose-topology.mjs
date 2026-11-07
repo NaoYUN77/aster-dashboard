@@ -14,7 +14,6 @@ const directory = await mkdtemp(join(tmpdir(), `${project}-`));
 const images = { app: process.env.ASTER_IMAGE ?? "aster:ci" };
 const random = (name) => `ci-${name}-${randomBytes(24).toString("hex")}`;
 const credentials = {
-  telegramToken: `900001:${randomBytes(24).toString("hex")}`,
   modelKey: random("model"),
 };
 const dashboardToken = random("webtoken");
@@ -82,11 +81,9 @@ try {
   assert.ok(process.argv.slice(2).every((value) => value === "--render-only"), "unsupported option");
   await chmod(directory, 0o755);
   await writeFile(file("empty.env"), "");
-  // Synthetic app environment: a well-formed token and owner, a real provider/model pair, and
-  // deliberately no provider key. The config-failure check below relies on exactly that gap.
+  // Synthetic app environment: a real provider/model pair and deliberately no provider key.
+  // The config-failure check below relies on exactly that gap.
   await writeFile(file("app.env"), [
-    `TELEGRAM_BOT_TOKEN=${credentials.telegramToken}`,
-    "TELEGRAM_OWNER_ID=424242",
     "MODEL_PROVIDER=deepseek",
     "MODEL_ID=deepseek-flash",
     "",
@@ -134,7 +131,7 @@ volumes:
     assert.ok(!app.network_mode, "the app uses direct networking");
     assert.equal(app.environment.DATA_DIR, "/data");
     // The synthetic env file is the one being read: its values are inlined by rendering.
-    assert.equal(app.environment.TELEGRAM_BOT_TOKEN, credentials.telegramToken);
+    assert.ok(!Object.keys(app.environment).some((name) => name.startsWith("TELEGRAM_")));
     assert.equal(app.environment.MODEL_PROVIDER, "deepseek");
     assert.equal(app.environment.DEEPSEEK_API_KEY, undefined);
     assert.deepEqual(Object.keys(config.volumes), ["personal-agent-data"]);
@@ -163,7 +160,7 @@ volumes:
     assert.equal(app.pids_limit, 256);
     // The overlay's env file replaced the base one; its synthetic values are the ones rendered.
     assert.equal(app.environment.WEB_TOKEN, dashboardToken);
-    assert.equal(app.environment.TELEGRAM_ENABLED, "0");
+    assert.ok(!Object.keys(app.environment).some((name) => name.startsWith("TELEGRAM_")));
     assert.equal(app.environment.CONSOLE_ENABLED, "1");
     assert.equal(app.environment.CONSOLE_HOST, "0.0.0.0");
     assert.equal(app.environment.CONSOLE_PORT, "8787");
@@ -172,8 +169,8 @@ volumes:
     assert.equal(app.environment.EXECUTION_REMOTE_CWD, "/workspaces");
     assert.equal(app.environment.EXECUTION_RPC_TRANSPORT, "unix");
     assert.equal(app.environment.EXECUTION_RPC_SOCKET, "/run/aster/rpc.sock");
-    // Phase 1 migrates Bash / Read / Write / Edit only; a shared host never advertises remote PTC.
-    assert.equal(app.environment.CODEMODE_ENABLED, "0");
+    // Retired feature configuration must not reappear in the app environment.
+    assert.ok(!Object.keys(app.environment).some((name) => /^(CODEMODE_|PTC_|REMINDERS_)/u.test(name)));
     assert.equal(app.depends_on["execution-host"].condition, "service_healthy");
 
     // The local stand-in runs as a dedicated non-root uid and claims no OS isolation boundary:
@@ -193,7 +190,7 @@ volumes:
     assert.equal(host.environment.EXECUTION_AGENT_TEST_EXECUTOR, "0");
     assert.equal(host.environment.EXECUTION_AGENT_OUTPUT_CHUNK_BYTES, "32768");
     assert.equal(host.environment.EXECUTION_AGENT_OUTPUT_BYTES_PER_SECOND, "4194304");
-    assert.equal(host.environment.PTC_ENABLED, "0");
+    assert.ok(!Object.keys(host.environment).some((name) => /^(TELEGRAM_|CODEMODE_|PTC_|REMINDERS_)/u.test(name)));
 
     // Only the workspaces and socket volumes are mounted; the app's /data volume is never shared.
     assert.deepEqual(host.volumes.map((volume) => volume.target).sort(), ["/run/aster", "/workspaces"]);
@@ -290,7 +287,7 @@ volumes:
       assertClean(logs.output);
     });
     console.info(`Topology acceptance passed: ${checks} checks; final image; isolated synthetic resources.`);
-    console.info("NOT COVERED: live Telegram/model business flow (needs real credentials; covered by unit tests and the production deployment); release/prod admission.");
+    console.info("NOT COVERED: live dashboard/model business flow (needs real credentials and target-environment acceptance); release/prod admission.");
   } else {
     console.info("Compose render checks passed; runtime topology was not executed.");
   }

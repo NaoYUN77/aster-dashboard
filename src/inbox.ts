@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { StateError } from "./errors.js";
-import { splitReply, type TextRequest } from "./messages.js";
+import type { TextRequest } from "./messages.js";
 import { parseCatalogProfile, serializeCatalogProfile, parseToolScope, serializeToolScope, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
 import { migrateBotCatalog } from "./bot-catalog-migration.js";
 import { CAPABILITY_IDS, type CapabilityId } from "./platform-capabilities.js";
@@ -23,7 +23,7 @@ export type BotStatus = "active" | "disabled";
 
 /**
  * One bot and the conversation it owns. `tools` is a comma-separated capability list (`bash`,
- * `files`, `ptc`, `web`) rather than free text, so the host can validate it instead of trusting a prompt.
+ * `files`, `web`) rather than free text, so the host can validate it instead of trusting a prompt.
  */
 export interface BotRecord {
   botId: string;
@@ -52,20 +52,10 @@ export interface BotRegistration {
   userId?: string;
 }
 
+// "ptc" stays a retired compatibility value for rows written before PTC was retired.
 const BOT_TOOLS: ReadonlySet<string> = new Set(["bash", "files", "ptc", "web"]);
 /** Bot ids are directory names under the workspace root, so the shape is fixed and short. */
 export const BOT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
-
-export interface Delivery {
-  requestId: string;
-  part: number;
-  text: string;
-  status: "pending" | "sending" | "sent" | "failed" | "uncertain";
-  messageId: string | null;
-  error: string | null;
-  createdAt: string | null;
-  updatedAt: string | null;
-}
 
 function timestamp(): string {
   return new Date().toISOString();
@@ -76,6 +66,10 @@ export class Inbox {
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
+    // The dashboard console is the only ingress. Every table from earlier builds is still
+    // created as-is: existing SQLite rows and their delivery/identity state are preserved, never
+    // rewritten or replayed by this build. The console path only writes inbox, failures, bots,
+    // bot_provisioning and integrations rows.
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
@@ -158,51 +152,6 @@ export class Inbox {
     addColumn(this.db, "bots", "userId", "TEXT NOT NULL DEFAULT 'owner'");
   }
 
-  bindIdentity(botId: string, ownerId: string): void {
-    const previous = this.db.prepare("SELECT botId, ownerId FROM identity WHERE id = 1").get();
-    if (previous && (previous.botId !== botId || previous.ownerId !== ownerId)) {
-      throw new StateError("Data directory belongs to another Telegram bot or owner; use a separate DATA_DIR");
-    }
-    this.db.prepare("INSERT OR IGNORE INTO identity VALUES (1, ?, ?)").run(botId, ownerId);
-  }
-
-  recover(): void {
-    this.transaction(() => {
-      this.db.prepare("UPDATE deliveries SET status = 'uncertain', error = 'PROCESS_INTERRUPTED' WHERE status = 'sending'").run();
-      this.db.prepare(`UPDATE inbox SET status = 'uncertain' WHERE status = 'sending'
-        OR requestId IN (SELECT requestId FROM deliveries WHERE status = 'uncertain')`).run();
-      // Earlier MVP builds saved whole replies without per-part records.
-      const legacy = this.db.prepare(`SELECT requestId, reply FROM inbox WHERE status = 'ready'
-        AND requestId NOT IN (SELECT requestId FROM deliveries)`).all();
-      for (const row of legacy) this.insertParts(String(row.requestId), String(row.reply));
-    });
-  }
-
-  get offset(): number {
-    return (this.db.prepare("SELECT offset FROM checkpoint WHERE id = 1").get() as { offset: number }).offset;
-  }
-
-  accept(nextOffset: number, request?: TextRequest): void {
-    this.transaction(() => {
-      if (request) {
-        const existing = this.db.prepare("SELECT * FROM inbox WHERE requestId = ?").get(request.requestId);
-        if (existing && (existing.text !== request.text || existing.conversationId !== request.conversationId || existing.senderId !== request.senderId)) {
-          throw new Error("Request ID reused with different content");
-        }
-        this.db.prepare(`INSERT OR IGNORE INTO inbox (requestId, conversationId, senderId, text, receivedAt)
-          VALUES (?, ?, ?, ?, ?)`).run(request.requestId, request.conversationId, request.senderId, request.text, timestamp());
-      }
-      // Telegram can randomize update IDs after an idle week; do not use MAX(offset).
-      this.db.prepare("UPDATE checkpoint SET offset = ? WHERE id = 1").run(nextOffset);
-    });
-  }
-
-  /** Telegram's queue: console requests are answered by their bot worker, never sent to a chat. */
-  next(): Job | undefined {
-    return this.db.prepare(`SELECT * FROM inbox WHERE status IN ('pending', 'ready')
-      AND requestId NOT LIKE 'console:%' ORDER BY rowid LIMIT 1`).get() as Job | undefined;
-  }
-
   /**
    * The next request a bot's own worker should answer. Ordering by rowid keeps one bot's requests
    * in arrival order; each bot has its own queue, so two bots run at the same time.
@@ -230,7 +179,7 @@ export class Inbox {
 
   /**
    * A console reply is terminal at once: it is read back from the conversation and streamed to the
-   * browser, so no delivery row is created and no part is ever sent to Telegram.
+   * browser, so no delivery row is created and no external message is ever sent.
    */
   saveConsoleReply(requestId: string, reply: string, errorCode?: string): void {
     const text = reply.trim() ? reply : "(no reply)";
@@ -254,19 +203,6 @@ export class Inbox {
     const row = this.db.prepare(`SELECT COUNT(*) AS count FROM inbox WHERE status = 'pending' AND requestId LIKE ?`)
       .get(`${consoleRequestPrefix(botId)}%`) as { count: number };
     return Number(row.count);
-  }
-
-  consoleRequests(botId: string, limit = 20): Job[] {
-    return this.db.prepare(`SELECT * FROM inbox WHERE requestId LIKE ? ORDER BY rowid DESC LIMIT ?`)
-      .all(`${consoleRequestPrefix(botId)}%`, limit) as unknown as Job[];
-  }
-
-  /** The bot this request belongs to, from its own request id; never from a caller-supplied field. */
-  botOfRequest(requestId: string): BotRecord | undefined {
-    const botId = consoleRequestBot(requestId);
-    if (botId !== undefined) return this.bot(botId);
-    const job = this.db.prepare("SELECT conversationId FROM inbox WHERE requestId = ?").get(requestId);
-    return job === undefined ? undefined : this.botByConversation(String(job.conversationId));
   }
 
   /** Register the bootstrap bot without overwriting an operator's later edits. */
@@ -415,81 +351,8 @@ export class Inbox {
     if (changed.changes !== 1) throw new StateError("Bot not found");
   }
 
-
-  saveReply(requestId: string, reply: string, errorCode?: string): void {
-    if (!reply.trim()) throw new Error("Cannot deliver an empty reply");
-    this.transaction(() => {
-      const changed = this.db.prepare("UPDATE inbox SET reply = ?, status = 'ready', repliedAt = ? WHERE requestId = ? AND status = 'pending'").run(reply, timestamp(), requestId);
-      if (changed.changes !== 1) throw new Error("Reply already saved or request missing");
-      this.insertParts(requestId, reply);
-      if (errorCode) this.db.prepare("INSERT INTO failures VALUES (?, ?)").run(requestId, errorCode);
-    });
-  }
-
-  nextPart(requestId: string): Delivery | undefined {
-    return this.db.prepare("SELECT * FROM deliveries WHERE requestId = ? AND status = 'pending' ORDER BY part LIMIT 1").get(requestId) as Delivery | undefined;
-  }
-
-  beginPart(requestId: string, part: number): void {
-    const now = timestamp();
-    const changed = this.db.prepare("UPDATE deliveries SET status = 'sending', error = NULL, updatedAt = ? WHERE requestId = ? AND part = ? AND status = 'pending'").run(now, requestId, part);
-    if (changed.changes !== 1) throw new Error("Delivery part is not pending");
-  }
-
-  confirmPart(requestId: string, part: number, messageId: string): void {
-    this.transaction(() => {
-      this.db.prepare("UPDATE deliveries SET status = 'sent', messageId = ?, error = NULL, updatedAt = ? WHERE requestId = ? AND part = ?").run(messageId, timestamp(), requestId, part);
-      this.finishIfDelivered(requestId);
-    });
-  }
-
-  failPart(requestId: string, part: number, status: "failed" | "uncertain", error: string): void {
-    this.transaction(() => {
-      this.db.prepare("UPDATE deliveries SET status = ?, error = ?, updatedAt = ? WHERE requestId = ? AND part = ?").run(status, error, timestamp(), requestId, part);
-      this.db.prepare("UPDATE inbox SET status = ? WHERE requestId = ?").run(status, requestId);
-    });
-  }
-
-  blocked() {
-    return this.db.prepare(`SELECT i.requestId, i.status, d.part, d.messageId, d.error, i.receivedAt, d.updatedAt
-      FROM inbox i LEFT JOIN deliveries d ON d.requestId = i.requestId AND d.status IN ('failed', 'uncertain')
-      WHERE i.status IN ('failed', 'uncertain') ORDER BY i.rowid, d.part`).all();
-  }
-
-  diagnostics() {
-    return this.db.prepare("SELECT requestId, code FROM failures ORDER BY rowid DESC LIMIT 100").all();
-  }
-
-  resolvePart(requestId: string, part: number, action: "retry" | "sent"): void {
-    this.transaction(() => {
-      const row = this.db.prepare("SELECT status FROM deliveries WHERE requestId = ? AND part = ?").get(requestId, part);
-      if (!row || !["failed", "uncertain"].includes(String(row.status))) throw new Error("Part is not failed or uncertain");
-      this.db.prepare("UPDATE deliveries SET status = ?, error = NULL, updatedAt = ? WHERE requestId = ? AND part = ?").run(action === "retry" ? "pending" : "sent", timestamp(), requestId, part);
-      this.db.prepare("UPDATE inbox SET status = 'ready' WHERE requestId = ?").run(requestId);
-      this.finishIfDelivered(requestId);
-    });
-  }
-
-  prune(): void {
-    // Retain the newest 100 sent requests for local diagnostics; unfinished requests are never pruned.
-    // Deliveries and failures go with their request through ON DELETE CASCADE.
-    this.db.prepare(`DELETE FROM inbox WHERE status = 'sent' AND requestId NOT IN
-      (SELECT requestId FROM inbox WHERE status = 'sent' ORDER BY rowid DESC LIMIT 100)`).run();
-  }
-
   close(): void {
     this.db.close();
-  }
-
-  private insertParts(requestId: string, reply: string): void {
-    const now = timestamp();
-    const insert = this.db.prepare("INSERT INTO deliveries (requestId, part, text, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?)");
-    splitReply(reply).forEach((text, part) => insert.run(requestId, part, text, now, now));
-  }
-
-  private finishIfDelivered(requestId: string): void {
-    this.db.prepare(`UPDATE inbox SET status = 'sent' WHERE requestId = ?
-      AND NOT EXISTS (SELECT 1 FROM deliveries WHERE requestId = ? AND status != 'sent')`).run(requestId, requestId);
   }
 
   private transaction<T>(operation: () => T): T {
@@ -517,7 +380,7 @@ export function consoleRequestBot(requestId: string): string | undefined {
   return match?.[1];
 }
 
-/** Normalize and validate a bot's capability list: `bash`, `files`, `ptc`, `web`, comma separated. */
+/** Normalize and validate a bot's capability list; `ptc` is a retired compatibility value. */
 export function parseBotTools(value: unknown): string {
   if (typeof value !== "string") throw new StateError("Bot tools must be a comma-separated string");
   const names = [...new Set(value.split(",").map((name) => name.trim()).filter((name) => name !== ""))];

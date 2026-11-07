@@ -1,6 +1,6 @@
 // One file primitive over a session's virtual roots.
 //
-// Interface: `handleFileRequest()` dispatches the wire method to `PtcFileService` and translates
+// Interface: `handleFileRequest()` dispatches the wire method to `FileService` and translates
 // its failures into the protocol's codes.
 //
 // Inputs: the service that owns the session's roots, the session key that owns opened handles, and
@@ -9,8 +9,8 @@
 // Errors: a write may have reached its rename when it was interrupted, so its outcome is reported
 // as unknown rather than as a clean failure. Every other file failure has no side effect to doubt.
 
-import { FileServiceError, type PtcFileService } from "./ptc-fs.js";
-import { PtcHostError } from "./ptc-host.js";
+import { FileServiceError, type FileService } from "./file-service.js";
+import { DirectHostError } from "./direct-host.js";
 import type { RpcErrorCode, RpcFileMethod } from "./rpc-protocol.js";
 
 const FILE_ERROR_CODES = new Set<RpcErrorCode>([
@@ -19,18 +19,18 @@ const FILE_ERROR_CODES = new Set<RpcErrorCode>([
 ]);
 
 /** File failures never carry a side effect whose outcome could be unknown. */
-export function fileHostError(error: unknown): PtcHostError {
+export function fileHostError(error: unknown): DirectHostError {
   if (error instanceof FileServiceError) {
     const code: RpcErrorCode = FILE_ERROR_CODES.has(error.code as RpcErrorCode)
       ? error.code as RpcErrorCode
       : "internal";
-    return new PtcHostError(code, error.message, "failed");
+    return new DirectHostError(code, error.message, "failed");
   }
-  return new PtcHostError("internal", "the file operation failed", "failed");
+  return new DirectHostError("internal", "the file operation failed", "failed");
 }
 
 export async function handleFileRequest(
-  files: PtcFileService,
+  files: FileService,
   sessionId: string,
   input: {
     readonly method: RpcFileMethod;
@@ -77,7 +77,7 @@ export async function handleFileRequest(
     if (input.method === "file.write" && error instanceof FileServiceError
       && (error.code === "aborted" || error.code === "unknown")) {
       // The write may or may not have reached its rename: never report a clean failure.
-      throw new PtcHostError(
+      throw new DirectHostError(
         FILE_ERROR_CODES.has(error.code as RpcErrorCode) ? error.code as RpcErrorCode : "internal",
         error.message,
         "unknown",

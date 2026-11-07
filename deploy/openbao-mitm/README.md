@@ -1,6 +1,6 @@
 # OpenBao + MITM 出站密钥占位
 
-Aster 应用的模型、Web 工具与 Telegram 请求经 MITM 代理出站；代理把请求头和 URL 路径里的 `__vault_<NAME>__` 占位符换成 OpenBao 中 `secret/aster/<NAME>` 的值。应用进程与模型只看到占位符，明文密钥不写入 `.env`、镜像、仓库、日志或聊天。
+Aster 应用的模型、Web 工具与 Langfuse 请求经 MITM 代理出站；代理把请求头和 URL 路径里的 `__vault_<NAME>__` 占位符换成 OpenBao 中 `secret/aster/<NAME>` 的值。应用进程与模型只看到占位符，明文密钥不写入 `.env`、镜像、仓库、日志或聊天。
 
 代理与 OpenBao 都不共享通用网络：应用只能经专用内网访问代理，OpenBao 只对代理可达，两个端口都不发布到宿主机。代理端口还要求客户端出示代理 token；OpenBao 的 `8200` 监听要求 TLS 客户端证书（mTLS），因此未认证的 `/v1/sys/health` 无法经代理或同网直连读取。详见下文“网络可达性”。
 
@@ -45,11 +45,10 @@ MITM 只把客户端**显式发出**的 `__vault_<NAME>__` 换成 OpenBao 中的
 
 | 变量名（`.env`） | 是否占位 | 占位符值 | OpenBao KV 路径 | 允许出站主机 |
 | --- | --- | --- | --- | --- |
-| `TELEGRAM_BOT_TOKEN` | 是 | `__vault_TELEGRAM_BOT_TOKEN__` | `secret/aster/TELEGRAM_BOT_TOKEN` | `api.telegram.org` |
 | `DEEPSEEK_API_KEY` | 是 | `__vault_DEEPSEEK_API_KEY__` | `secret/aster/DEEPSEEK_API_KEY` | `api.deepseek.com` |
-| `DEEPSEEK_WEB_API_KEY` | 是（可选） | `__vault_DEEPSEEK_WEB_API_KEY__` | `secret/aster/DEEPSEEK_WEB_API_KEY` | `api.deepseek.com` |
+| `PLATFORM_WEB_SEARCH_API_KEY` | 是（可选，零配置 Web 能力） | `__vault_PLATFORM_WEB_SEARCH_API_KEY__` | `secret/aster/PLATFORM_WEB_SEARCH_API_KEY` | `api.deepseek.com` |
+| `DEEPSEEK_WEB_API_KEY` | 是（已退役，仅兼容） | `__vault_DEEPSEEK_WEB_API_KEY__` | `secret/aster/DEEPSEEK_WEB_API_KEY` | `api.deepseek.com` |
 | 其他提供商 `*_API_KEY` | 是（按需） | `__vault_<NAME>__` | `secret/aster/<NAME>` | 见 `addon/allowlist.json` |
-| `TELEGRAM_OWNER_ID` | 否 | 数值用户 ID（进程内比对，不出站） | — | — |
 | `MODEL_PROVIDER` / `MODEL_ID` / `DATA_DIR` / `MEMORY_*` | 否 | 普通配置值 | — | — |
 | `LANGFUSE_SECRET_KEY` | 是（启用 Langfuse Trace 时） | `__vault_LANGFUSE_SECRET_KEY__` | `secret/aster/LANGFUSE_SECRET_KEY` | `cloud.langfuse.com`、`us.cloud.langfuse.com` |
 | `LANGFUSE_PUBLIC_KEY` | 否（公开值） | 明文即可；要统一管理也可用 `__vault_LANGFUSE_PUBLIC_KEY__` | `secret/aster/LANGFUSE_PUBLIC_KEY`（可选） | `cloud.langfuse.com`、`us.cloud.langfuse.com` |
@@ -124,7 +123,7 @@ docker exec -it aster-openbao bao operator unseal      # 按提示重复足够�
 docker exec -it aster-openbao bao status               # 期望 Sealed false
 
 # 3) 写入 KV、只读 token 与代理 token（隐藏输入根 token 与各密钥值）
-ASTER_OPENBAO_SECRETS=$HOME/Aster/secrets/openbao ./bootstrap.sh DEEPSEEK_API_KEY DEEPSEEK_WEB_API_KEY TELEGRAM_BOT_TOKEN LANGFUSE_SECRET_KEY
+ASTER_OPENBAO_SECRETS=$HOME/Aster/secrets/openbao ./bootstrap.sh DEEPSEEK_API_KEY PLATFORM_WEB_SEARCH_API_KEY LANGFUSE_SECRET_KEY
 
 # 4) 启动 mitm；首次启动生成 mitmproxy CA 后再跑一次（不传密钥名）导出公共 CA
 docker compose up -d mitm
@@ -150,9 +149,8 @@ ASTER_OPENBAO_SECRETS=$HOME/Aster/secrets/openbao ./bootstrap.sh
    ```
 3. **将 `.env` 中的密钥改为 `__vault_<NAME>__` 占位符**（非密钥配置保持不变；代理 token 不写入 `.env`）：
    ```dotenv
-   TELEGRAM_BOT_TOKEN=__vault_TELEGRAM_BOT_TOKEN__
    DEEPSEEK_API_KEY=__vault_DEEPSEEK_API_KEY__
-   DEEPSEEK_WEB_API_KEY=__vault_DEEPSEEK_WEB_API_KEY__
+   PLATFORM_WEB_SEARCH_API_KEY=__vault_PLATFORM_WEB_SEARCH_API_KEY__
    LANGFUSE_SECRET_KEY=__vault_LANGFUSE_SECRET_KEY__
    ```
 4. **叠加 `docker-compose.mitm.yml` 启动应用**（项目名保持 `aster-production`，不要用 `aster`，以免与 OpenBao/MITM 栈争夺网络名）：
@@ -166,7 +164,7 @@ ASTER_OPENBAO_SECRETS=$HOME/Aster/secrets/openbao ./bootstrap.sh
 `docker-compose.mitm.yml` 为 `personal-agent` 注入的环境变量与挂载：
 - `HTTPS_PROXY=http://aster-mitm:14322`、`HTTP_PROXY=http://aster-mitm:14322`（本身不含凭据；`configureEnvProxy()` 启动时把 token 注入 URL userinfo）
 - `NO_PROXY=localhost,127.0.0.1,::1,aster-mitm`（只保留回环与代理自身；OpenBao 不在应用的任何可达网络上）
-- `NODE_USE_ENV_PROXY=1`（配合应用启动时的 `configureEnvProxy()` 与 `TelegramClient` 的 `HttpsAgent({ keepAlive: true, proxyEnv })`，使 LLM、`web_search`/`web_fetch`、MCP 与 grammY Telegram Bot API 全部走代理）
+- `NODE_USE_ENV_PROXY=1`（应用启动时由 `configureEnvProxy()` 把代理 token 注入 URL userinfo；Node 运行时的 `fetch` 使 LLM、`web_search`/`web_fetch`、MCP 与 Langfuse 请求全部走代理）
 - `NODE_EXTRA_CA_CERTS=/run/aster-mitm/mitmproxy-ca.pem`（只读挂载 `${ASTER_MITM_CA_CERT:-~/Aster/secrets/openbao/mitmproxy-ca.pem}`）
 - `ASTER_MITM_TOKEN_FILE=/run/aster-mitm/mitm-proxy-token`（只读挂载 `${ASTER_MITM_PROXY_TOKEN:-~/Aster/secrets/openbao/mitm-proxy-token}`）
 - 只加入内部网络 `aster_mitm_clients`（固定地址 `10.89.143.3`）；没有默认网络，也没有直连公网的路由
@@ -318,4 +316,4 @@ openssl s_client -connect 10.89.82.2:8200 -CAfile ~/Aster/secrets/openbao/tls/ca
 
 ## 5. 已知问题说明
 
-- **Telegram 主机出口网络超时**：若宿主机所在网络无法直连 `api.telegram.org`（即使经同机 `aster-mitm` 出站仍受限于宿主机出口网络），Telegram `getMe` / `getUpdates` 超时属于**已知主机出口网络问题**，不是本 PR 的回归；在宿主机出口不可达 `api.telegram.org` 的机器上可配合 `TELEGRAM_API_ROOT`（并在 `addon/allowlist.json` 的 `TELEGRAM_BOT_TOKEN` 中加入对应反代域名）使用。
+- **模型／Web 端点出口网络超时**：若宿主机所在网络无法直连 `api.deepseek.com`（即使经同机 `aster-mitm` 出站仍受限于宿主机出口网络），模型与 Web 工具请求超时属于**已知主机出口网络问题**，不是本 PR 的回归；先核对 `HTTPS_PROXY`、`ASTER_PROXY_CLIENT_ALLOW` 与 `addon/allowlist.json` 中的目标主机，不要为此放宽白名单。

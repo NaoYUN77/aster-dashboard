@@ -35,9 +35,6 @@ function environment(dataDir: string): NodeJS.ProcessEnv {
     MODEL_ID: MODEL,
     OPENAI_API_KEY: "faux",
     MEMORY_ENABLED: "0",
-    // Code mode is on so the PTC switch is observable alongside the direct tools.
-    CODEMODE_ENABLED: "1",
-    CODEMODE_SCRIPT_FIRST: "0",
     // A configured CCR profile makes the web group available.
     CCR_PROFILE: "test-web-profile",
   };
@@ -195,9 +192,10 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     service = await startService({ env, models: scriptedProvider(), log: () => {}, allowLegacyCatalog: true });
     const console = consoleOf(service);
 
-    // Acceptance 10 (locally): every route, including the page, needs the token.
+    // Acceptance 10 (locally): every API route needs the token. The static page is deliberately
+    // public so the browser can load it before prompting for WEB_TOKEN; it holds no bot data.
+    assert.equal((await fetch(`${console.base}/`)).status, 200);
     assert.equal((await fetch(`${console.base}/api/bots`)).status, 401);
-    assert.equal((await fetch(`${console.base}/`)).status, 401);
     assert.equal((await fetch(`${console.base}/api/bots`, { method: "POST", body: "{}" })).status, 401);
     assert.equal((await fetch(`${console.base}/api/bots/x/messages`, { method: "POST", body: "{}" })).status, 401);
 
@@ -214,10 +212,11 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
       systemPrompt: "Use web tools when needed.",
     });
     assert.equal(webBot.status, 201);
+    // ptc is a retired persisted switch: it must stay off in the catalog and select no tools.
     const scriptBot = await console.call("/api/bots", {
       name: "Script Bot",
       profile: { ...DEFAULT_CATALOG_PROFILE, ptc: true },
-      systemPrompt: "Use code mode when needed.",
+      systemPrompt: "Work without web access.",
     });
     assert.equal(scriptBot.status, 201);
     const scoped = await console.call("/api/bots", {
@@ -232,12 +231,13 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     assert.notEqual(webBot.body.bot.conversationId, scriptBot.body.bot.conversationId);
     for (const { body } of [webBot, scriptBot, scoped]) assert.equal(Object.hasOwn(body.bot, "role"), false);
 
-    // Acceptance 3: explicit web/PTC switches select different tools.
+    // Acceptance 3: the explicit web switch selects different tools; the retired ptc switch
+    // stays in the persisted profile but never surfaces the removed codemode tool.
     assert.ok(webBot.body.bot.loadedTools.includes("bash"));
     assert.ok(webBot.body.bot.loadedTools.includes("web_search"));
     assert.ok(webBot.body.bot.loadedTools.includes("web_fetch"));
-    assert.ok(!webBot.body.bot.loadedTools.includes("codemode"));
-    assert.ok(scriptBot.body.bot.loadedTools.includes("codemode"));
+    assert.ok(!webBot.body.bot.loadedTools.includes("codemode"), "codemode is retired");
+    assert.ok(!scriptBot.body.bot.loadedTools.includes("codemode"), "codemode is retired even with ptc=true");
     assert.ok(!scriptBot.body.bot.loadedTools.includes("web_search"));
     assert.ok(!scriptBot.body.bot.loadedTools.includes("web_fetch"));
     assert.ok(webBot.body.bot.tools.includes("web"));
@@ -250,8 +250,9 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     const custom = await console.call("/api/bots", { name: "Custom", profile: customProfile });
     assert.equal(custom.status, 201);
     assert.deepEqual(custom.body.bot.profile, customProfile);
-    assert.deepEqual(custom.body.bot.tools, ["ptc", "web"]);
-    assert.ok(custom.body.bot.loadedTools.includes("codemode"));
+    // The legacy capability projection lists only live groups; ptc no longer emits a capability.
+    assert.deepEqual(custom.body.bot.tools, ["web"]);
+    assert.ok(!custom.body.bot.loadedTools.includes("codemode"), "codemode is retired");
     assert.ok(custom.body.bot.loadedTools.includes("web_search"));
     assert.ok(!custom.body.bot.loadedTools.includes("bash"));
     assert.ok(!custom.body.bot.loadedTools.includes("read"));
@@ -270,7 +271,7 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     assert.ok(updated.loadedTools.includes("read"));
     assert.ok(!updated.loadedTools.includes("write"));
     assert.ok(!updated.loadedTools.includes("bash"));
-    assert.ok(updated.loadedTools.includes("codemode"));
+    assert.ok(!updated.loadedTools.includes("codemode"), "codemode is retired");
     for (const invalid of [null, [], {}, { profile: "chief" }, { profile: updatedProfile, role: "programmer" }]) {
       const response = await fetch(`${console.base}/api/bots/${custom.body.bot.botId}`, {
         method: "PATCH", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" }, body: JSON.stringify(invalid),
@@ -285,7 +286,7 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
       botId: "host-explicit", cwd: directory, prompt: "",
       catalogProfile: customProfile,
     });
-    assert.ok(explicit.tools.includes("codemode") && explicit.tools.includes("web_search"));
+    assert.ok(!explicit.tools.includes("codemode") && explicit.tools.includes("web_search"));
     assert.ok(!explicit.tools.includes("bash") && !explicit.tools.includes("read"));
     // Host configuration also requires switches and rejects removed configuration inputs.
     for (const invalid of [
@@ -376,7 +377,7 @@ test("the console drives isolated bots and survives a restart", { timeout: 180_0
     const restoredCustom = afterRestart.body.bots.find((bot: { botId: string }) => bot.botId === custom.body.bot.botId);
     assert.deepEqual(restoredCustom.profile, updatedProfile);
     assert.deepEqual(restoredCustom.toolScope, { allow: [], deny: ["write"] });
-    assert.ok(restoredCustom.loadedTools.includes("codemode") && restoredCustom.loadedTools.includes("web_search"));
+    assert.ok(!restoredCustom.loadedTools.includes("codemode") && restoredCustom.loadedTools.includes("web_search"));
     assert.ok(!restoredCustom.loadedTools.includes("bash") && !restoredCustom.loadedTools.includes("write"));
     const restored = assistantTexts(await history(restarted, webBotId));
     assert.ok(restored.includes("WROTE"), `history lost after restart: ${restored.join("|")}`);

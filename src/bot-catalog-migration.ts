@@ -9,7 +9,7 @@ function legacyProfile(value: unknown): string {
   }
   return serializeCatalogProfile({
     core: true, shell: true, files: true, web: value === "researcher" || value === "research",
-    ptc: value === "programmer", memory: true, reminders: true, mcp: true,
+    ptc: false, memory: true, reminders: false, mcp: true,
   });
 }
 

@@ -78,7 +78,7 @@ export type ProvisionTarget = {
   readonly conversationId: string | undefined;
   /** Deterministic workspace path derived by the host from userId + botId. */
   readonly cwd: string;
-  readonly channel: "telegram" | "console";
+  readonly channel: "console";
 };
 
 export type ConfigureResult = {
@@ -92,7 +92,7 @@ export interface ProvisioningRuntime {
     readonly botId: string;
     readonly conversationId: string | undefined;
     readonly cwd: string;
-    readonly channel: "telegram" | "console";
+    readonly channel: "console";
     readonly prompt: string;
     readonly catalogProfile: CatalogProfile;
     readonly toolScope: ToolScope;

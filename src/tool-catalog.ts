@@ -15,6 +15,7 @@ export type ToolDefinition = {
   readonly inputSchema: unknown;
 };
 
+// Deprecated ptc/reminders keys preserve persisted-profile compatibility and are never enabled.
 export const CATALOG_GROUPS = ["core", "shell", "files", "web", "ptc", "memory", "reminders", "mcp"] as const;
 type ToolGroup = typeof CATALOG_GROUPS[number];
 
@@ -42,18 +43,17 @@ export function serializeCatalogProfile(profile: CatalogProfile): string {
 /** Explicit initial switches for the bootstrap bot and the console's creation form. */
 export const DEFAULT_CATALOG_PROFILE: CatalogProfile = Object.freeze({
   core: true, shell: true, files: true, web: false, ptc: false,
-  memory: true, reminders: true, mcp: true,
+  memory: true, reminders: false, mcp: true,
 });
 
 /** Preserve the legacy capability projection for older clients; deployment availability is a ceiling. */
 export function legacyCapabilitiesForProfile(
   profile: CatalogProfile,
-  deployment: { readonly ptc: boolean; readonly web: boolean },
+  deployment: { readonly web: boolean },
 ): string {
   return [
     ...(profile.shell ? ["bash"] : []),
     ...(profile.files ? ["files"] : []),
-    ...(profile.ptc && deployment.ptc ? ["ptc"] : []),
     ...(profile.web && deployment.web ? ["web"] : []),
   ].join(",");
 }
@@ -85,12 +85,10 @@ export function serializeToolScope(scope: ToolScope): string {
 
 function groupFor(name: string, record?: ToolRecord): ToolGroup | undefined {
   if (record?.source.kind === "mcp") return "mcp";
-  if (name === "codemode") return "ptc";
   if (name === "web_search" || name === "web_fetch") return "web";
   if (name === "bash") return "shell";
   if (name === "read" || name === "write" || name === "edit") return "files";
   if (name.startsWith("memory_") || name.startsWith("working_")) return "memory";
-  if (name.startsWith("reminder_")) return "reminders";
   // Integration status and authorization requests are platform core, not external capabilities.
   if (name === "current_time" || name === "tool_search" || name.startsWith("integration_")) return "core";
   return undefined;

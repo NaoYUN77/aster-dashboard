@@ -81,10 +81,10 @@ primitives (`read`, `write`, `edit`). The local service:
 - bounds commands at `EXECUTION_AGENT_MAX_CONCURRENT` (3) concurrent executions and clamps each
   command's output to the host's chunk/byte limits.
 
-Phase 1 migrates Bash / Read / Write / Edit only. `CODEMODE_ENABLED=0`: codemode would need remote
-PTC, which the shared host deliberately does not advertise (`health.check` reports `ptc: false`,
-`directBash: true`, `fileTools: true`, `sharedMode: "rw"`). The zero-setup manifest grants `shell`
-when the RPC transport is configured and leaves `ptc` off regardless of `CODEMODE_ENABLED`. CC,
+Phase 1 migrates Bash / Read / Write / Edit only. PTC/codemode is retired: the shared host never
+advertises it (`health.check` reports `ptc: false`, `directBash: true`, `fileTools: true`,
+`sharedMode: "rw"`), and the `ptc` catalog switch is a deprecated persisted key that is always
+forced off. The zero-setup manifest grants `shell` when the RPC transport is configured. CC,
 Herdr and the other installed CLIs are not separate Agent tools in this phase; a bot reaches them
 through Bash on the shared host.
 

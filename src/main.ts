@@ -1,4 +1,4 @@
-// Process composition: configuration, storage, the agent, the bots and the surfaces that read them.
+// Process composition: configuration, storage, the agent, the bots and the dashboard surface.
 //
 // Interface: `startService()` opens everything in dependency order and returns a handle with the
 // live objects and `done`, which resolves when the request loop ends and the process has cleaned
@@ -20,14 +20,12 @@ import { openAgent } from "./agent.js";
 import { BotManager } from "./bot-manager.js";
 import { ConfigurationError, configureEnvProxy, readConfig, readLegacyCatalogEnabled, readMemoryConfig } from "./config.js";
 import { startConsole, type ConsoleHandle } from "./console.js";
-import { StateError } from "./errors.js";
+import { failureCode, StateError } from "./errors.js";
 import { Inbox } from "./inbox.js";
 import {
   buildPlatformCapabilities, buildProvisioningRuntime,
   localWorkspaceCheck, verifiedRemoteWorkspaceCheck,
 } from "./platform-runtime.js";
-import { ReminderScheduler, ReminderStore } from "./reminders.js";
-import { failureCode, serveTelegram, TelegramClient } from "./telegram.js";
 import { startTrace, type TraceRuntime } from "./trace.js";
 
 export type ServiceConfig = ReturnType<typeof readConfig>;
@@ -70,9 +68,7 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
 
   let trace: TraceRuntime | undefined;
   let inbox: Inbox | undefined;
-  let reminderStore: ReminderStore | undefined;
   let agent: OpenServiceAgent | undefined;
-  let scheduler: ReminderScheduler | undefined;
   let bots: BotManager | undefined;
   let consoleHandle: ConsoleHandle | undefined;
   let shuttingDown: Promise<void> | undefined;
@@ -85,10 +81,8 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       // The console accepts no new work while the workers and the agent stop.
       await consoleHandle?.close().catch(() => undefined);
       await bots?.close().catch(() => undefined);
-      await scheduler?.stop().catch(() => undefined);
       await agent?.close().catch(() => undefined);
       inbox?.close();
-      reminderStore?.close();
       options.signal?.removeEventListener("abort", forward);
       await trace?.close().catch(() => undefined);
     })();
@@ -107,11 +101,10 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
     if (config.execution === undefined) {
       await mkdir(join(config.dataDir, "workspace"), { recursive: true, mode: 0o700 });
     }
-    reminderStore = config.reminders === undefined
-      ? undefined
-      : new ReminderStore(join(config.dataDir, "reminders.sqlite"), { limits: config.reminders });
     inbox = new Inbox(join(config.dataDir, "inbox.sqlite"));
     const inboxDb = inbox;
+    // The console is the only ingress. Existing Telegram-era tables and their rows are kept as
+    // they are: no polling checkpoint, bot identity or delivery state is read or rewritten here.
 
     // Host-verified deployment facts become one frozen manifest. The integration extension must
     // exist before openAgent(), so it joins the governed registry before the harness opens.
@@ -121,25 +114,10 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       integrations: inboxDb,
     });
 
-    // Telegram is optional: a console-only host has no bot identity to present and no polling loop.
-    let client: TelegramClient | undefined;
-    let botId: string;
-    if (config.telegramEnabled) {
-      client = new TelegramClient(config.token, config.telegramApiRoot);
-      botId = await client.identity(signal);
-    } else {
-      botId = "console";
-    }
-    inbox.bindIdentity(botId, config.ownerId);
-    inbox.recover();
-    // A sending row may already have reached Telegram; recovery records it as uncertain instead of resending.
-    reminderStore?.recover();
-
     agent = await openAgent(config, options.models, undefined, {
       signal,
       memory: readMemoryConfig(env),
       ...(legacy ? {} : { extraExtensions: [platform.integrationExtension] }),
-      ...(reminderStore === undefined ? {} : { reminderStore }),
     });
     // A local workspace is checked on disk. A remote one is checked against the execution-face
     // health probe that openAgent() already performed at startup; an unverifiable face stays
@@ -155,10 +133,6 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       // Persist that id before the health check, so a retry never allocates a second conversation.
       onConfigured: (id, conversationId) => inboxDb.setBotConversation(id, conversationId),
     });
-    scheduler = reminderStore === undefined || client === undefined
-      ? undefined
-      : new ReminderScheduler({ store: reminderStore, client, signal, log: console.error });
-    scheduler?.start();
 
     bots = new BotManager({
       inbox,
@@ -167,8 +141,6 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       ...(config.execution === undefined ? {} : { remoteWorkspaceRoot: config.execution.remoteCwd }),
       // The bootstrap bot keeps the single-bot installation's directory; new bots get their own.
       defaultWorkspace: config.execution?.remoteCwd ?? join(config.dataDir, "workspace"),
-      bootstrapChannel: config.telegramEnabled ? "telegram" : "console",
-      ptc: config.codemode !== undefined,
       web: config.ccrProfile !== undefined,
       manifest: platform.manifest,
       integrations: platform.integrations,
@@ -190,19 +162,19 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
         log: console.error,
         ...(legacy ? { allowLegacyCatalog: true } : {}),
       });
-      log(`Console listening on ${consoleHandle.address}; open it with the WEB_TOKEN from the environment.`);
+      log(
+        config.console.token === null
+          ? `Console listening on ${consoleHandle.address} with WEB_AUTH=off; the host has disabled token authentication.`
+          : `Console listening on ${consoleHandle.address}; open it with the WEB_TOKEN from the environment.`,
+      );
     }
 
-    // The Telegram poller is one long-running loop; the console waits for shutdown instead.
-    const loop = client === undefined
-      ? new Promise<void>((resolve) => {
-          if (signal.aborted) resolve();
-          else signal.addEventListener("abort", () => resolve(), { once: true });
-        })
-      : serveTelegram(config, botId, inbox, agent.reply, signal, client);
-    if (config.telegramEnabled) {
-      log("Personal agent starting; single-owner private Telegram messages enabled.");
-    }
+    // The dashboard is the only ingress. Each bot's own worker answers its console requests, so
+    // the service waits for shutdown; there is no external poller or delivery loop to reconcile.
+    const loop = new Promise<void>((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", () => resolve(), { once: true });
+    });
 
     const done = (async () => {
       try {

@@ -8,7 +8,6 @@ import {
   type ToolExecutionResult,
   type ToolHookCall,
 } from "@earendil-works/pi-durable";
-import { CODEMODE_TOOL_NAME } from "@earendil-works/pi-durable/codemode";
 import { recordLoopGuard } from "./trace.js";
 
 /** The first repeated signature that earns an explicit warning in the tool result. */
@@ -58,23 +57,9 @@ export function canonicalJSON(value: unknown): string {
   return JSON.stringify(canonicalValue(value)) ?? "undefined";
 }
 
-function normalizeScript(code: string): string {
-  return code.trim().replace(/\s+/g, " ");
-}
-
-/**
- * `(toolName, canonical arguments)`. Only the code mode script gets its source whitespace normalized,
- * because reformatting the same script is the same call; other arguments are compared as given.
- */
+/** Tool name and structural arguments identify a repeated call. */
 export function loopSignature(name: string, args: unknown): string {
-  const normalized = name === CODEMODE_TOOL_NAME
-    && args !== null
-    && typeof args === "object"
-    && !Array.isArray(args)
-    && typeof (args as { code?: unknown }).code === "string"
-    ? { ...(args as Record<string, unknown>), code: normalizeScript((args as { code: string }).code) }
-    : args;
-  return `${name}\u0000${canonicalJSON(normalized)}`;
+  return `${name}\u0000${canonicalJSON(args)}`;
 }
 
 export type LoopGuard = {
@@ -102,8 +87,8 @@ type RunState = {
  * Bounded autonomous loop detection for model-issued tool calls.
  *
  * Consecutive identical signatures warn at 3-5 and halt at 6; six consecutive error results halt
- * regardless of signature. Nested calls belong to the code mode script and are excluded (its own
- * guard runs inside `serializeNestedCalls`). State is deliberately in memory: a restarted process
+ * regardless of signature. Only top-level model calls contribute to these counters.
+ * State is deliberately in memory: a restarted process
  * starts at zero rather than re-counting a transcript, and within one process an already observed
  * `callId` is counted once, so a replay cannot inflate the counters.
  */
@@ -143,7 +128,7 @@ export function createLoopGuard(log: (line: string) => void = console.error): Lo
   }
 
   function observe(call: ToolHookCall, result: ToolExecutionResult, api: HookApi): ToolExecutionResult | undefined {
-    // A nested call is the script's control flow; the inner guard bounds it at its own boundary.
+    // Count only top-level model calls.
     if (call.parent !== undefined) return undefined;
     const key = `${api.conversationId}\u0000${call.id}`;
     if (seen.has(key)) return undefined;

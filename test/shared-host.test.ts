@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ConfigurationError } from "../src/errors.js";
-import { PtcHostError } from "../src/execution/ptc-host.js";
+import { DirectHostError } from "../src/execution/direct-host.js";
 import { RpcClientError, RpcExecutionClient } from "../src/execution/rpc-client.js";
 import { startRpcAgent } from "../src/execution/rpc-server.js";
 import { listenUnixRpc, unixRpcTransport } from "../src/execution/rpc-transport.js";
@@ -231,7 +231,7 @@ test("the shared host owns its runtime environment and rejects host-owned wire v
         signal,
         emit: () => undefined,
       }),
-      (error: unknown) => error instanceof PtcHostError
+      (error: unknown) => error instanceof DirectHostError
         && error.code === "invalid_request"
         && error.outcome === "not_started"
         && error.message.includes("PATH") && error.message.includes("PTC_INSIDE_SANDBOX"),

@@ -15,3 +15,9 @@ export class StateError extends Error {
 export class NotFoundError extends StateError {
   override name = "NotFoundError";
 }
+
+export function failureCode(error: unknown): string {
+  if (error instanceof Error && "code" in error && typeof error.code === "string" && /^[A-Z][A-Z_]{0,63}$/.test(error.code)) return error.code;
+  if (error instanceof Error && error.name === "TimeoutError") return "TIMEOUT";
+  return "EXECUTION_ERROR";
+}

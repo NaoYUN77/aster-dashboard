@@ -8,9 +8,9 @@ services:
     image: ${ASTER_IMAGE:-aster:local}
     restart: unless-stopped
     # In MITM mode, secret variables in .env use __vault_<NAME>__ placeholders (for example
-    # TELEGRAM_BOT_TOKEN=__vault_TELEGRAM_BOT_TOKEN__, DEEPSEEK_API_KEY=__vault_DEEPSEEK_API_KEY__,
-    # DEEPSEEK_WEB_API_KEY=__vault_DEEPSEEK_WEB_API_KEY__); non-secret settings (TELEGRAM_OWNER_ID,
-    # MODEL_PROVIDER, MODEL_ID, DATA_DIR, MEMORY_*) keep their normal values.
+    # DEEPSEEK_API_KEY=__vault_DEEPSEEK_API_KEY__,
+    # DEEPSEEK_WEB_API_KEY=__vault_DEEPSEEK_WEB_API_KEY__); non-secret settings
+    # (MODEL_PROVIDER, MODEL_ID, DATA_DIR, MEMORY_*) keep their normal values.
     env_file:
       - .env
     environment:

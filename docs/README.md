@@ -24,7 +24,7 @@ ADR 持续记录该功能所有部分的取舍与缺陷，跨越各份 spec 的�
 
 | 文档 | 用途与权威范围 |
 | --- | --- |
-| [契约与生命周期](contracts-and-lifecycle.md) | 工具、权限、请求、执行恢复与投递契约，以及当前实现限制 |
+| [契约与生命周期](contracts-and-lifecycle.md) | 工具、权限、请求、执行恢复与历史投递契约，以及当前实现限制 |
 | [Memory 与 Context 设计](memory-and-context-design.md) | 记忆架构与数据归属；模块实施结论按章节保留，验收状态链接到验收记录 |
 | [工具与 MCP](mcp.md) | MCP 配置、工具发现、pin、授权与 OAuth 操作 |
 | [ADR 索引](adr/README.md) | 已接受的工程取舍；正文中的早期范围描述是决策上下文 |
@@ -33,15 +33,12 @@ ADR 持续记录该功能所有部分的取舍与缺陷，跨越各份 spec 的�
 ## 运行与交付
 
 - [部署指南](deployment-test-guide.md)：当前部署、备份、更新与上线验证。
-- [远程工具执行](execution-remote.md)：阶段 1 的控制面／执行面分离、宿主 broker、SSH 基线与失败语义。
+- [远程工具执行](execution-remote.md)：当前共享 RPC 执行主机说明与历史 SSH broker 参考。
 - [Phase 0 RPC 部署与验收](runbook-execution-rpc-phase0.md)：常驻 Execution Agent、私网 mTLS、证书、systemd、正向／负向验收与断线检查。
 - [Phase 0 RPC 验收记录](acceptance/20261102-execution-rpc-phase0.md)：2026-11-02 真实双 VPS 的 PASS 证据、负向结果与网络变更边界。
-- [Remote PTC Phase 1／2 Runbook](runbook-remote-ptc-phase1-2.md)：bwrap／cgroup 前提、direct／PTC 配置、实机正向与负向验收、证据与回滚。
 - [共享 CVM Execution Host Runbook](runbook-shared-execution-host.md)：单用户 MVP 的专用非 root 用户、`/workspaces`、Phase 1 shared-host 模式、systemd 模板、正向／负向验收与回滚（不自动修改生产服务、权限或防火墙）。
-- [代码调用工具](codemode.md)：可选的 PTC／codemode 配置、脚本工具白名单、输出边界与恢复语义。
-- [一次性提醒](reminders.md)：`reminder_*` 工具、独立 SQLite 状态机、进程内调度、失败恢复与人工核查。
 - [Langfuse Tracing](langfuse-tracing.md)：可选 Trace 的环境变量、隐私边界、部署与第一条真实 Trace 验收。
-- [部署环境](deployment-environments.md)、[主机备份](host-backup.md)、[投递核查与补发](deliveries.md)：对应操作边界。
+- [部署环境](deployment-environments.md)、[主机备份](host-backup.md)：对应操作边界。
 - [CI 运行入口](ci-entrypoint.md)：现行检查入口与发布材料契约。
 - [CI/CD 设计与实施计划](ci-cd-implementation-plan.md)：当前工作流事实、后续交付设计和按日期保留的历史验收；任务待办不代表生产部署状态。
 
@@ -57,3 +54,4 @@ ADR 持续记录该功能所有部分的取舍与缺陷，跨越各份 spec 的�
 | [早期代码审查修复规划](review-fix-plan.md) | 特定基线的 F1～F7 修复要求，任务范围限制不延伸到后续开发 |
 | [早期 PR 正文草稿](pr-body.md) | F1～F7 当时的交付说明，不是当前待办或运行手册 |
 | [历史 Docker 验证](docker-verification.md) | 2026-10-26 的镜像迁移证据，包含已移除的 Vault／router 拓扑 |
+| [PTC／codemode 归档](../archive/ptc-codemode/README.md) | 已退役功能的源码、测试与文档，不构建、不启用，也不是回滚目标 |
