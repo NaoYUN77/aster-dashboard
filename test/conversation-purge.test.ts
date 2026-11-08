@@ -557,6 +557,7 @@ function fakeStore(options: {
     pendingRemovals: () => options.pending,
     removeProvisioning: () => undefined,
     deleteBotRequests: () => ({ requests: 0, deliveries: 0, failures: 0 }),
+    deleteBotJobs: () => ({ jobs: 0, notices: 0 }),
     finishRemoval: options.onFinish,
     failRemoval: options.onFail,
     vacuum: () => ({ vacuumed: false, error: null }),
