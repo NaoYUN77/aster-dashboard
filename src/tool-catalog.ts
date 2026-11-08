@@ -89,7 +89,7 @@ function groupFor(name: string, record?: ToolRecord): ToolGroup | undefined {
   if (name === "bash") return "shell";
   // Background jobs run shell commands, so they travel with the shell capability: a profile that
   // cannot run a command in the request cannot dispatch one out of it either.
-  if (name.startsWith("job.")) return "shell";
+  if (name.startsWith("job_")) return "shell";
   if (name === "read" || name === "write" || name === "edit") return "files";
   if (name.startsWith("memory_") || name.startsWith("working_")) return "memory";
   // Integration status and authorization requests are platform core, not external capabilities.
