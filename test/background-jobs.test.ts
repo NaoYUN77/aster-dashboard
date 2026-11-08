@@ -27,7 +27,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { RunningTask, TaskRuntime } from "@earendil-works/pi-durable";
-import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
+import { FileError, type ExecutionEnv } from "@earendil-works/pi-durable/env";
 import { Inbox, jobIdFor, type BackgroundJobRecord } from "../src/inbox.js";
 import {
   JOB_COMMAND_MAX_CHARS, JOB_LIVE_LIMIT, JOB_LOCAL_TIMEOUT_SECONDS, JOB_NOTICE_MAX_CHARS,
@@ -164,11 +164,23 @@ function runtimeOf(env: ExecutionEnv | undefined, journal: string[], signal = ne
   return { runtime, commits, reported };
 }
 
-function envOf(exec: ExecutionEnv["exec"]): ExecutionEnv {
+/**
+ * The environment a job runs on. `createDir` refuses by default, the way both remote faces do: a job
+ * on a POSIX workspace must reach the shell and never the file API, so a dependency on it shows up
+ * as a failure here rather than as a stub that always says yes.
+ */
+function envOf(
+  exec: ExecutionEnv["exec"],
+  cwd = "/workspace/alpha",
+  createDir: ExecutionEnv["createDir"] = async (path: string) => ({
+    ok: false as const,
+    error: new FileError("not_supported", "the remote environment supports reading, writing and editing files only", path),
+  }),
+): ExecutionEnv {
   return {
-    cwd: "/workspace/alpha",
+    cwd,
     joinPath: async (parts: readonly string[]) => ({ ok: true as const, value: parts.join("/") }),
-    createDir: async () => ({ ok: true as const, value: undefined }),
+    createDir,
     exec,
   } as unknown as ExecutionEnv;
 }
@@ -188,32 +200,50 @@ type TaskRun = {
   readonly commits: Commit[];
   readonly outcomes: JobOutcome[];
   readonly started: { jobId: string; botId: string; startedAt: string }[];
+  readonly prepared: string[];
   readonly executed: { command: string; cwd: string; timeout: number | undefined }[];
+};
+
+type PhaseOptions = {
+  readonly signal?: AbortSignal;
+  /** Answers the `mkdir` the task runs; the default succeeds. */
+  readonly mkdir?: ExecutionEnv["exec"];
+  readonly cwd?: string;
+  readonly createDir?: ExecutionEnv["createDir"];
 };
 
 async function runPhase(
   input: JobTaskInput,
   attempts: number,
   exec: ExecutionEnv["exec"],
-  signal?: AbortSignal,
+  phase: PhaseOptions = {},
 ): Promise<TaskRun> {
   const journal: string[] = [];
   const outcomes: JobOutcome[] = [];
   const started: TaskRun["started"] = [];
+  const prepared: string[] = [];
   const executed: TaskRun["executed"] = [];
   const options: JobTaskOptions = {
     onStarted: (jobId, botId, startedAt) => started.push({ jobId, botId, startedAt }),
     onTerminal: (_jobId, outcome) => outcomes.push(outcome),
   };
   const task = createJobTask(options);
+  const mkdir = phase.mkdir ?? (async () => ({ ok: true as const, value: { exitCode: 0 } }));
   const env = envOf(async (command, shellOptions) => {
+    // The task makes the job's directory with the shell, so the harness answers the two commands
+    // separately: a test that fails the real command must not fail the directory with it.
+    if (String(command).startsWith("mkdir -p -- ")) {
+      journal.push("mkdir");
+      prepared.push(String(command));
+      return mkdir(command, shellOptions, BACKGROUND_CONTEXT);
+    }
     journal.push("exec");
     executed.push({ command: String(command), cwd: String(shellOptions?.cwd), timeout: shellOptions?.timeout });
     return exec(command, shellOptions, BACKGROUND_CONTEXT);
-  });
-  const { runtime, commits } = runtimeOf(env, journal, signal);
+  }, phase.cwd ?? "/workspace/alpha", phase.createDir);
+  const { runtime, commits } = runtimeOf(env, journal, phase.signal);
   await task.definition.phases.execute(runningTask(input, attempts), runtime, BACKGROUND_CONTEXT);
-  return { journal, commits, outcomes, started, executed };
+  return { journal, commits, outcomes, started, prepared, executed };
 }
 
 test("a command is run once, in its own directory, under the host's limit", async () => {
@@ -222,9 +252,11 @@ test("a command is run once, in its own directory, under the host's limit", asyn
     options?.onOutput?.("job-ok\n", BACKGROUND_CONTEXT, { stream: "stdout" });
     return { ok: true, value: { exitCode: 0 } };
   });
-  // The durable proof that the command may have run must precede the execution itself.
-  assert.deepEqual(run.journal, ["commit:running", "exec", "commit:terminal"]);
+  // The durable proof that the command may have run must precede every command the task runs.
+  assert.deepEqual(run.journal, ["commit:running", "mkdir", "exec", "commit:terminal"]);
   assert.deepEqual(run.commits[0], { status: "running", checkpoint: { phase: "execute", attempts: 1 } });
+  // The directory is made by the shell, quoted as one word, and without a timeout of its own.
+  assert.deepEqual(run.prepared, [`mkdir -p -- '/workspace/alpha/jobs/${UUID}'`]);
   assert.deepEqual(run.executed, [{
     command: "echo job-ok",
     cwd: `/workspace/alpha/jobs/${UUID}`,
@@ -233,6 +265,57 @@ test("a command is run once, in its own directory, under the host's limit", asyn
   assert.deepEqual(run.started, [{ jobId: jobIdFor("alpha", UUID), botId: "alpha", startedAt: "2026-11-08T00:00:00.000Z" }]);
   assert.deepEqual(outcomeOf(run.commits), { state: "done", exitCode: 0, error: null, output: "partial job-ok\n" });
   assert.deepEqual(run.outcomes, [outcomeOf(run.commits)], "the host callback sees the same outcome that was committed");
+});
+
+test("a working directory that cannot be made fails the job before the command is handed over", async () => {
+  const ok = async () => ({ ok: true as const, value: { exitCode: 0 } });
+  // `mkdir` is a command like any other: a non-zero exit is a failure the operator can act on.
+  const refused = await runPhase(jobInput(), 0, ok, {
+    mkdir: async () => ({ ok: true, value: { exitCode: 1 } }),
+  });
+  assert.deepEqual(outcomeOf(refused.commits), { state: "failed", exitCode: null, error: "JOB_WORKDIR", output: "" });
+  assert.deepEqual(refused.executed, [], "the job's command is never handed over");
+
+  // An environment that throws is a failure too, never a success.
+  const threw = await runPhase(jobInput(), 0, ok, { mkdir: async () => { throw new Error("no shell"); } });
+  assert.deepEqual(outcomeOf(threw.commits), { state: "failed", exitCode: null, error: "JOB_WORKDIR", output: "" });
+  assert.deepEqual(threw.executed, []);
+
+  // A cancelled preparation is the cancellation's terminal state, not a workdir failure: the phase
+  // stops without committing anything, and the abort protocol owns the outcome.
+  const controller = new AbortController();
+  await assert.rejects(runPhase(jobInput(), 0, ok, {
+    signal: controller.signal,
+    mkdir: async () => {
+      controller.abort();
+      return { ok: false, error: Object.assign(new Error("aborted"), { code: "aborted" as const }) };
+    },
+  }));
+});
+
+test("a workspace that is not a POSIX path uses the environment's own directory primitive", async () => {
+  // Both remote faces are POSIX. A non-POSIX workspace is the local Node environment on Windows,
+  // whose shell the task cannot spell for from here, so `createDir` is the only primitive left —
+  // and a face that refuses it leaves the job unrunnable rather than quietly making the wrong
+  // directory somewhere the command will not run.
+  const ok = async () => ({ ok: true as const, value: { exitCode: 0 } });
+  const refused = await runPhase(jobInput(), 0, ok, { cwd: "C:\\work\\alpha" });
+  assert.deepEqual(refused.journal, ["commit:running", "commit:terminal"]);
+  assert.deepEqual(outcomeOf(refused.commits), { state: "failed", exitCode: null, error: "JOB_WORKDIR", output: "" });
+
+  const accepted = await runPhase(jobInput(), 0, ok, {
+    cwd: "C:\\work\\alpha",
+    createDir: async () => ({ ok: true as const, value: undefined }),
+  });
+  assert.deepEqual(accepted.prepared, [], "no shell command is spelled for a shell the task does not know");
+  assert.deepEqual(accepted.journal, ["commit:running", "exec", "commit:terminal"]);
+  assert.deepEqual(outcomeOf(accepted.commits), { state: "done", exitCode: 0, error: null, output: "" });
+});
+
+test("a path that is not a plain word stays one word for the shell", async () => {
+  const run = await runPhase(jobInput(), 0, async () => ({ ok: true, value: { exitCode: 0 } }),
+    { cwd: "/workspace/it's alpha" });
+  assert.deepEqual(run.prepared, [`mkdir -p -- '/workspace/it'\\''s alpha/jobs/${UUID}'`]);
 });
 
 test("a command that was already handed to an environment is never run again", async () => {
