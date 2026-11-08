@@ -11,7 +11,7 @@
 //     handlers, because "a command that exited 3 is a job that ran" is the contract the deletion gate
 //     and the notice both rest on.
 //
-// Two end-to-end tests then drive the real composition: a faux model calls `job.start`, the console
+// Two end-to-end tests then drive the real composition: a faux model calls `job_start`, the console
 // reads the job back as `done`, exactly one notice is unread, marking it read clears the badge, a
 // request sent while a job runs is answered, and a bot's removal takes its job rows and notices away
 // with its conversation.
@@ -828,21 +828,31 @@ test("a job outlives its reply, reports once, and its unread notice clears", { t
       }
       const ask = lastUserText(transcript.messages);
       if (ask.includes("会失败的")) {
-        return fauxAssistantMessage(fauxToolCall("job.start", { command: "exit 3" }, { id: "s2" }), { stopReason: "toolUse" });
+        return fauxAssistantMessage(fauxToolCall("job_start", { command: "exit 3" }, { id: "s2" }), { stopReason: "toolUse" });
       }
       if (ask.includes("什么情况")) {
-        return fauxAssistantMessage(fauxToolCall("job.status", { jobId: dispatched[1]! }, { id: "s3" }), { stopReason: "toolUse" });
+        return fauxAssistantMessage(fauxToolCall("job_status", { jobId: dispatched[1]! }, { id: "s3" }), { stopReason: "toolUse" });
       }
       if (ask.includes("都有哪些")) {
-        return fauxAssistantMessage(fauxToolCall("job.list", {}, { id: "s4" }), { stopReason: "toolUse" });
+        return fauxAssistantMessage(fauxToolCall("job_list", {}, { id: "s4" }), { stopReason: "toolUse" });
       }
-      return fauxAssistantMessage(fauxToolCall("job.start", { command: "echo job-ok" }, { id: "s1" }), { stopReason: "toolUse" });
+      return fauxAssistantMessage(fauxToolCall("job_start", { command: "echo job-ok" }, { id: "s1" }), { stopReason: "toolUse" });
     });
     // The legacy catalog is the only way a test can name the `shell` capability group; a
     // zero-setup deployment derives it from the platform, and a local transport denies it.
     service = await startService({
       env: environment(directory), models, log: (line) => logs.push(line), allowLegacyCatalog: true,
     });
+    // A tool name is a wire value, and the provider is the authority on it: an OpenAI-compatible
+    // endpoint rejects the whole request when one function name does not match `^[a-zA-Z0-9_-]+$`,
+    // which fails every request of every bot before the model is ever reached. The faux model above
+    // accepts any name it is handed, so this loop is the only place the rule is enforced — without it
+    // a name like `job.start` looks perfectly fine here and 400s in production.
+    const wireNames = service.agent.registry.records().map(({ name }) => name);
+    assert.ok(wireNames.includes("job_start"), "the job tools reach the model under their wire names");
+    for (const name of wireNames) {
+      assert.match(name, /^[a-zA-Z0-9_-]{1,64}$/, `${name} is not a provider function name`);
+    }
     const console = consoleOf(service);
 
     /** Send one message and wait for its reply, so the next turn starts from a settled transcript. */
@@ -942,10 +952,10 @@ test("a live job is real work: it blocks an immediate reclaim and goes away with
       }
       const ask = lastUserText(transcript.messages);
       if (ask.includes("取消")) {
-        return fauxAssistantMessage(fauxToolCall("job.cancel", { jobId: dispatched[0]! }, { id: "c1" }), { stopReason: "toolUse" });
+        return fauxAssistantMessage(fauxToolCall("job_cancel", { jobId: dispatched[0]! }, { id: "c1" }), { stopReason: "toolUse" });
       }
       if (ask.includes("顺便")) return fauxAssistantMessage("在的，你忙你的。");
-      return fauxAssistantMessage(fauxToolCall("job.start", { command: "sleep 30" }, { id: "s1" }), { stopReason: "toolUse" });
+      return fauxAssistantMessage(fauxToolCall("job_start", { command: "sleep 30" }, { id: "s1" }), { stopReason: "toolUse" });
     });
     service = await startService({
       env: environment(directory), models, log: (line) => logs.push(line), allowLegacyCatalog: true,
@@ -983,6 +993,7 @@ test("a live job is real work: it blocks an immediate reclaim and goes away with
     assert.equal((await console.call("/api/bots/worker/jobs")).body.jobs[0].state, "running", "the reply did not disturb the job");
 
     // Cancellation confirms the execution's end state; it does not claim the command had no effects.
+    const beforeCancel = await assistants();
     assert.equal((await console.call("/api/bots/worker/messages", { text: "取消那个作业" })).status, 202);
     const canceled = await waitFor("the job to be canceled", async () => {
       const view = (await console.call("/api/bots/worker/jobs")).body;
@@ -992,9 +1003,13 @@ test("a live job is real work: it blocks an immediate reclaim and goes away with
     assert.equal(canceled.unread, 1);
     assert.equal(canceled.jobs[0].error, "JOB_CANCELED");
     assert.match(canceled.notices[0].text, /^后台作业已取消：sleep 30/);
+    // The request that asked for the cancellation must settle too. The job reaching `canceled` says
+    // nothing about that reply, and a bot still mid-request is refused removal as `bot_is_running`.
+    await waitFor("the cancel reply", async () => (await assistants()) > beforeCancel ? true : undefined);
 
     // --- Removal takes the job rows and notices with the bot. ---
-    assert.equal((await console.call("/api/bots/worker", {}, "DELETE")).status, 202);
+    const removed = await console.call("/api/bots/worker", {}, "DELETE");
+    assert.equal(removed.status, 202, JSON.stringify(removed.body));
     assert.equal((await console.call("/api/bots/worker/jobs")).status, 410, "a removed bot answers for nothing");
     assert.equal(read(join(directory, "inbox.sqlite"), (db) =>
       Number((db.prepare("SELECT count(*) AS count FROM background_jobs WHERE botId = 'worker'").get() as { count: number }).count)), 1);

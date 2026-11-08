@@ -1,13 +1,19 @@
 // The four job tools (ADR-0024 decision 4): start, list, status, cancel. There is deliberately no
-// `job.wait`: any tool that waited would hold the request at the same 300-second wall the job exists
+// `job_wait`: any tool that waited would hold the request at the same 300-second wall the job exists
 // to move past, and the caller would learn nothing it cannot ask for again later.
+//
+// The names are snake_case because a tool name is a wire value, not a display string. OpenAI-compatible
+// endpoints (DeepSeek included) reject any name that does not match `^[a-zA-Z0-9_-]+$`, so a dotted
+// `job.start` is a 400 before the model runs at all — every request of every bot, not merely the tool
+// call. The faux provider the tests drive enforces no such rule, which is why only the real endpoint
+// caught it. `test/background-jobs.test.ts` now asserts the shape directly.
 //
 // The tools carry no host facts. A job's bot, conversation, working directory and time limit are
 // resolved by the service from the calling conversation and the host's configuration; a command
 // string and a job id are all the model supplies. Job ids are validated by shape and then looked up
 // under the calling bot, so a well-formed id of another bot's job reads as not found.
 //
-// Failure semantics are kept apart everywhere: a refusal (`job.start` over the limit, an unknown id)
+// Failure semantics are kept apart everywhere: a refusal (`job_start` over the limit, an unknown id)
 // is an error result with a business code, a job whose command exited non-zero is a *successful*
 // result that reports the exit code, and a job whose result could not be established says so.
 
@@ -102,9 +108,9 @@ function unwrap<T>(result: JobResult<T>): T | Failed {
 
 export function jobTools(jobs: BackgroundJobs): ToolRegistration[] {
   const start = defineTool({
-    name: "job.start",
+    name: "job_start",
     description:
-      "Start one shell command as a background job and return at once with its job id. Use this for work that outlives one reply: builds, downloads, long copies, anything slow. The command runs in the bot's own workspace under a dedicated jobs directory with the host's own time limit, and its combined output is kept as a bounded tail. Nothing is sent anywhere when the job finishes and this conversation is not told: read job.status or job.list afterwards and tell the user what actually happened.",
+      "Start one shell command as a background job and return at once with its job id. Use this for work that outlives one reply: builds, downloads, long copies, anything slow. The command runs in the bot's own workspace under a dedicated jobs directory with the host's own time limit, and its combined output is kept as a bounded tail. Nothing is sent anywhere when the job finishes and this conversation is not told: read job_status or job_list afterwards and tell the user what actually happened.",
     parameters: Type.Object(
       {
         command: Type.String({ minLength: 1, maxLength: JOB_COMMAND_MAX_CHARS, description: "The shell command to run." }),
@@ -118,7 +124,7 @@ export function jobTools(jobs: BackgroundJobs): ToolRegistration[] {
       return {
         output: [{
           type: "text",
-          text: `Dispatched as a background job: ${outcome.jobId} (${outcome.state}). It keeps running after this reply; ask for its state later with job.status.`,
+          text: `Dispatched as a background job: ${outcome.jobId} (${outcome.state}). It keeps running after this reply; ask for its state later with job_status.`,
         }],
         structuredOutput: { jobId: outcome.jobId, state: outcome.state, command: outcome.command },
       };
@@ -126,7 +132,7 @@ export function jobTools(jobs: BackgroundJobs): ToolRegistration[] {
   });
 
   const list = defineTool({
-    name: "job.list",
+    name: "job_list",
     description:
       "List this bot's background jobs, newest first, with their state, exit code, failure code and output tail. Use it to answer what is still running and what finished since the user last asked. A job that finished while nobody was watching appears here; nothing announces it.",
     parameters: Type.Object({}, { additionalProperties: false }),
@@ -146,11 +152,11 @@ export function jobTools(jobs: BackgroundJobs): ToolRegistration[] {
   });
 
   const status = defineTool({
-    name: "job.status",
+    name: "job_status",
     description:
       "Read one background job of this bot: its state, exit code, failure code and output tail. A command that exited non-zero is a normal read reporting that exit code; only an unknown job id is an error. A job still queued or running is reported as such.",
     parameters: Type.Object(
-      { jobId: Type.String({ pattern: JOB_ID_PATTERN, maxLength: 128, description: "The job id job.start returned." }) },
+      { jobId: Type.String({ pattern: JOB_ID_PATTERN, maxLength: 128, description: "The job id job_start returned." }) },
       { additionalProperties: false },
     ),
     structuredOutputSchema: jobOutput,
@@ -166,7 +172,7 @@ export function jobTools(jobs: BackgroundJobs): ToolRegistration[] {
   });
 
   const cancel = defineTool({
-    name: "job.cancel",
+    name: "job_cancel",
     description:
       "Ask one of this bot's background jobs to stop. This does not undo what the command already did, and it cannot report a cleaner result than the truth: the job ends as canceled. A job that already finished is not an error — the answer says which state it is in.",
     parameters: Type.Object(
