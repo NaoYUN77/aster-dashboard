@@ -44,7 +44,7 @@ flowchart LR
 | 路径 | 内容 |
 | --- | --- |
 | `agent.sqlite`（及 WAL） | 底座会话与执行恢复状态；记忆系统的 working 状态、周期快照投影、归档进度与轮数计数 |
-| `inbox.sqlite`（及 WAL） | 控制台请求的接收、回复与失败状态；旧版 `identity`／`deliveries` 等兼容表仅保留既有数据 |
+| `inbox.sqlite`（及 WAL） | 控制台请求的接收、回复与失败状态；后台作业的索引行与完成通知；旧版 `identity`／`deliveries` 等兼容表仅保留既有数据 |
 | `service.lock`（运行时存在） | 同一数据目录的单写者声明：服务进程持有到退出；离线回收命令也先取它，服务运行中即拒绝 |
 | `workspace/` | agent 的任务文件 |
 | `memory/daily/YYYY-MM-DD.md` | 每日事件记忆：归档任务从已确认的会话范围增量提取 |
@@ -84,6 +84,26 @@ flowchart LR
 设计取舍与已知边界见 [ADR-0023](docs/adr/zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md)。
 零配置流程由 `test/zero-setup.test.ts` 与 `test/zero-setup-wiring.test.ts` 覆盖；真实模型供应商、
 远程共享执行主机与控制台的部署验收仍需运维在目标机器上执行，仓库不把未执行的部署验证记为通过。
+
+## 后台作业
+
+超过一次请求能等的时间的活儿（下载、拉依赖、构建）交给后台作业，而不是把请求挂住。
+
+- **派发即返回。** Bot 用 `job.start` 拿到 `jobId` 后就回一句话，本次请求终结；命令在 Bot 工作目录下的
+  `jobs/<uuid>/`（`jobId` 的末段）里继续跑，不受 5 分钟等待窗口影响。同一个 Bot 同时只允许 1 个未完成作业（共享执行主机
+  共 4 个并发槽位，作业占 1 个、前台命令留 3 个），超限是明确的业务拒绝（附已在跑的 `jobId`），不是排队。
+- **时长上限由宿主决定。** 模型只能给命令，不能给秒数：上限取传输实际接受值（RPC 直连为
+  `min(EXECUTION_MAX_TIMEOUT_SECONDS, 3540s)`，本地运行为 3600s），超限是作业失败。
+- **完成时由宿主写通知。** 通知含命令、退出码、耗时与输出尾，不经模型、不消耗生成。控制台把未读数显示
+  在 Bot 列表与对话头，作业面板给出完整记录与「标为已读」，时间线末尾展示未读通知原文。通知不是回复：
+  `inbox` 仍然只表示"操作者请求"，`AGENT_TIMEOUT` 也不等于"这次请求什么都没发生"。
+- **查事实用 `job.list` / `job.status`，取消用 `job.cancel`。** 没有 `job.wait`：等待等于把请求重新挂住。
+- **重启不重放已经开始的命令。** 进程被杀时命令可能已经产生副作用，因此该作业以 `unknown` 收尾并如实
+  记录（`JOB_INTERRUPTED`），只有尚未开始执行的作业继续跑；索引行与通知在重启时按底座任务记录收敛。
+  删 Bot 时该 Bot 的作业与通知行一并清除。
+
+契约、恢复窗口与已知边界见 [契约与生命周期](docs/contracts-and-lifecycle.md#后台作业与完成通知)；长期取舍见
+[ADR-0024](docs/adr/background-jobs/0024-long-running-jobs.md)。
 
 ## 删除与重置 Bot
 

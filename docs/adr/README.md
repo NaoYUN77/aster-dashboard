@@ -82,3 +82,4 @@ spec 在功能开发完成后删除，ADR 及其记录长期保留。ADR 中的 
 | 0021 | 控制面与执行面分离，工具执行先下沉到执行 VPS | Proposed，2026-10-31 | [0021-control-execution-split.md](0021-control-execution-split.md) |
 | 0022 | 提醒由宿主持久化并在进程内调度 | 已废弃（历史记录），2026-11-05 | [reminders/0022-reminders-in-process-scheduler.md](reminders/0022-reminders-in-process-scheduler.md) |
 | 0023 | 开箱即用的 Bot 运行环境与平台能力清单（含 2026-11-06 共享 CVM Execution Host 修订） | Accepted，2026-11-06 | [zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md](zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md) |
+| 0024 | 长任务转为后台作业，并在完成时回报 | Accepted，2026-11-08 | [background-jobs/0024-long-running-jobs.md](background-jobs/0024-long-running-jobs.md) |
