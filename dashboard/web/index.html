@@ -150,7 +150,17 @@
   .banner { padding: 6px 16px; font-size: 12px; border-bottom: 1px solid var(--line); display: none; }
   .banner.show { display: block; }
   .banner.error { background: rgba(248,81,73,.12); color: var(--err); }
-  #platformList, #provisioningList, #integrationList { display: grid; gap: 6px; }
+  #platformList, #provisioningList, #integrationList, #jobList, #jobNotices { display: grid; gap: 6px; }
+  .mono { font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .output {
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    max-height: 160px; overflow: auto; margin: 0; padding: 6px 8px;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  }
+  .notice-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+  .dot.job { background: var(--accent); }
+  .dot.unread { background: var(--warn); }
   @media (max-width: 720px) {
     main { grid-template-columns: 1fr; }
     aside { display: none; }
@@ -181,6 +191,7 @@
       <span class="meta" id="chatMeta"></span>
       <span id="readyNote"></span>
       <span class="spacer"></span>
+      <button id="jobsBtn" hidden>作业</button>
       <button id="retryInit" hidden>重试初始化</button>
       <button id="cancel" class="danger" disabled>停止</button>
     </div>
@@ -205,6 +216,21 @@
       <button id="saveBot" value="create" type="submit" class="primary">创建</button>
     </div>
   </form>
+</dialog>
+
+<dialog id="jobsDialog">
+  <div class="body">
+    <h2>后台作业</h2>
+    <p class="hint">作业在后台运行，结束后由宿主写入一条通知，不占用对话。这里只读：启动和取消都由 bot 用 job 工具完成，控制台不会替它决定。</p>
+    <h3>完成通知</h3>
+    <div id="jobNotices"></div>
+    <h3>作业记录</h3>
+    <div id="jobList"></div>
+    <div class="actions">
+      <button id="markNoticesRead" type="button">全部标为已读</button>
+      <button id="closeJobs" type="button">关闭</button>
+    </div>
+  </div>
 </dialog>
 
 <dialog id="platformDialog">
@@ -300,6 +326,35 @@ function provisioningText(bot) {
     + (bot.provisioning.unavailable.length ? " · 未启用 " + bot.provisioning.unavailable.join(", ") : "");
 }
 
+/** The job projection a bot always carries, so a page from an older service still renders. */
+function jobsOf(bot) {
+  const jobs = bot && bot.jobs;
+  return jobs && Array.isArray(jobs.jobs)
+    ? jobs
+    : { jobs: [], notices: [], unread: 0, live: 0 };
+}
+
+const JOB_LABEL = {
+  queued: "排队中", running: "运行中", done: "已完成",
+  failed: "失败", canceled: "已取消", unknown: "结果未知",
+};
+
+function jobKind(jobState) {
+  if (jobState === "done") return "available";
+  if (jobState === "failed") return "failed";
+  if (jobState === "queued" || jobState === "running") return "unavailable";
+  return "";
+}
+
+/** The one line a bot row and the chat head carry: what is running and what is unread. */
+function jobSummary(bot) {
+  const jobs = jobsOf(bot);
+  return [
+    jobs.live > 0 ? jobs.live + " 个作业运行中" : "",
+    jobs.unread > 0 ? jobs.unread + " 条完成通知" : "",
+  ].filter((part) => part !== "").join(" · ");
+}
+
 function renderBots() {
   const list = $("bots");
   list.replaceChildren();
@@ -315,8 +370,10 @@ function renderBots() {
     const title = document.createElement("strong");
     title.append(dot, document.createTextNode(bot.name));
     const meta = document.createElement("small");
+    const summary = jobSummary(bot);
     meta.textContent = bot.botId + " · " + (PROVISION_LABEL[bot.provisioning.state] || bot.provisioning.state)
-      + (bot.running ? " · 运行中" : bot.pending > 0 ? " · 排队 " + bot.pending : "");
+      + (bot.running ? " · 运行中" : bot.pending > 0 ? " · 排队 " + bot.pending : "")
+      + (summary === "" ? "" : " · " + summary);
     button.append(title, meta);
     button.addEventListener("click", () => selectBot(bot.botId));
     item.append(button);
@@ -346,6 +403,11 @@ function renderChatMeta() {
     note.className = "bad";
   }
   $("retryInit").hidden = !(bot && (bot.provisioning.state === "failed" || bot.provisioning.state === "not_provisioned"));
+  const jobsBtn = $("jobsBtn");
+  jobsBtn.hidden = !bot;
+  const jobs = jobsOf(bot);
+  jobsBtn.textContent = jobs.unread > 0 ? "作业 · " + jobs.unread : "作业";
+  jobsBtn.className = jobs.unread > 0 || jobs.live > 0 ? "primary" : "";
   const usable = chatAllowed(bot);
   $("text").disabled = !usable;
   $("send").disabled = !usable;
@@ -412,6 +474,13 @@ async function loadHistory() {
     fragment.append(empty);
   }
   for (const message of body.messages) appendMessage(message.role, message.text, fragment);
+  // Completion notices are shown here because this is where the operator looks for the answer. They
+  // are the host's own text, labelled as such: the model never wrote them and never saw them.
+  const unread = jobsOf(bot).notices.filter((item) => !item.readAt);
+  for (const item of unread.slice(0, 5)) appendMessage("note", "后台作业通知 · " + item.text, fragment);
+  if (unread.length > 0) {
+    appendMessage("note", "以上是宿主写入的作业完成通知，不是模型回复；点顶部的「作业」查看完整记录并标为已读。", fragment);
+  }
   box.replaceChildren(fragment);
   box.scrollTop = box.scrollHeight;
 }
@@ -457,6 +526,22 @@ function openStream() {
     let payload;
     try { payload = JSON.parse(message.data); } catch { return; }
     if (payload.type === "snapshot") { setConnected(true); return; }
+    if (payload.type === "jobs") {
+      // Pushed by the stream's own heartbeat: a job finishing produces no conversation event, so
+      // this is how the badge and the timeline learn about it.
+      const bot = state.bots.find((entry) => entry.botId === state.selected);
+      const before = bot ? jobsOf(bot).unread : 0;
+      if (bot) bot.jobs = payload.jobs;
+      renderBots();
+      renderChatMeta();
+      if ($("jobsDialog").open) void loadJobs().catch(() => undefined);
+      // Redraw the timeline only while it is idle: nothing else would, and a render mid-stream would
+      // throw away the reply being written.
+      if (bot && jobsOf(bot).unread > before && state.live === null && !bot.running) {
+        void loadHistory().catch(() => undefined);
+      }
+      return;
+    }
     if (payload.type === "error") { showError(payload.message); return; }
     if (payload.type === "events") for (const event of payload.events) handleEvent(event);
   };
@@ -519,6 +604,100 @@ async function retryInit() {
     await api("/api/bots/" + encodeURIComponent(bot.botId) + "/retry", { method: "POST" });
     await refreshBots();
     await loadHistory();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+function renderJobs(view) {
+  const notices = $("jobNotices");
+  notices.replaceChildren();
+  if (view.notices.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "还没有完成通知。";
+    notices.append(empty);
+  }
+  for (const item of view.notices) {
+    const node = document.createElement("div");
+    node.className = "row-card";
+    const line = document.createElement("div");
+    line.className = "line";
+    const dot = document.createElement("span");
+    dot.className = "dot " + (item.readAt ? "" : "unread");
+    const head = document.createElement("span");
+    head.textContent = (item.readAt ? "已读" : "未读") + " · " + item.createdAt;
+    line.append(dot, head);
+    const body = document.createElement("div");
+    body.className = "notice-text";
+    body.textContent = item.text;
+    node.append(line, body);
+    notices.append(node);
+  }
+  const list = $("jobList");
+  list.replaceChildren();
+  if (view.jobs.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "这个 bot 还没有后台作业。";
+    list.append(empty);
+  }
+  for (const job of view.jobs) {
+    const node = document.createElement("div");
+    node.className = "row-card";
+    const line = document.createElement("div");
+    line.className = "line";
+    line.append(
+      badge(JOB_LABEL[job.state] || job.state, jobKind(job.state)),
+      Object.assign(document.createElement("span"), { className: "mono", textContent: job.command }),
+    );
+    const facts = [
+      job.exitCode === null ? "" : "退出码 " + job.exitCode,
+      job.error ? "错误 " + job.error : "",
+      job.startedAt ? "开始 " + job.startedAt : "",
+      job.finishedAt ? "结束 " + job.finishedAt : "",
+    ].filter((part) => part !== "").join(" · ");
+    const meta = document.createElement("div");
+    meta.className = "reason";
+    meta.textContent = job.jobId + (facts === "" ? "" : " · " + facts);
+    node.append(line, meta);
+    if (job.output) {
+      const output = document.createElement("pre");
+      output.className = "output";
+      output.textContent = job.output;
+      node.append(output);
+    }
+    list.append(node);
+  }
+  $("markNoticesRead").disabled = view.unread === 0;
+}
+
+/** Read one bot's jobs. The panel and the badge both come from the host's own records. */
+async function loadJobs() {
+  const bot = currentBot();
+  if (!bot) return null;
+  const view = await api("/api/bots/" + encodeURIComponent(bot.botId) + "/jobs");
+  renderJobs(view);
+  return view;
+}
+
+async function openJobs() {
+  try {
+    await loadJobs();
+    const dialog = $("jobsDialog");
+    if (!dialog.open) dialog.showModal();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+async function markNoticesRead() {
+  const bot = currentBot();
+  if (!bot) return;
+  try {
+    await api("/api/bots/" + encodeURIComponent(bot.botId) + "/jobs/notices", { method: "POST", body: "{}" });
+    await loadJobs();
+    await refreshBots();
   } catch (error) {
     showError(error.message);
   }
@@ -663,6 +842,9 @@ async function boot() {
   $("cancel").addEventListener("click", () => void cancel());
   $("newBot").addEventListener("click", () => void createBot());
   $("retryInit").addEventListener("click", () => void retryInit());
+  $("jobsBtn").addEventListener("click", () => void openJobs());
+  $("closeJobs").addEventListener("click", () => $("jobsDialog").close());
+  $("markNoticesRead").addEventListener("click", () => void markNoticesRead());
   $("platformBtn").addEventListener("click", () => void openPlatform());
   $("closePlatform").addEventListener("click", () => $("platformDialog").close());
   $("menu").addEventListener("click", () => $("sidebar").classList.toggle("open"));

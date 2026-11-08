@@ -31,6 +31,8 @@ import { startConsole, type ConsoleHandle } from "./console.js";
 import { openConversationPurger, type SqliteConversationPurger } from "./conversation-purge.js";
 import { failureCode, StateError } from "./errors.js";
 import { Inbox } from "./inbox.js";
+import { jobTimeoutSeconds } from "./jobs/contracts.js";
+import { BackgroundJobs } from "./jobs/service.js";
 import {
   buildPlatformCapabilities, buildProvisioningRuntime,
   localWorkspaceCheck, verifiedRemoteWorkspaceCheck,
@@ -58,6 +60,7 @@ export type ServiceHandle = {
   readonly config: ServiceConfig;
   readonly agent: OpenServiceAgent;
   readonly bots: BotManager;
+  readonly jobs: BackgroundJobs;
   readonly console: ConsoleHandle | undefined;
   /** Resolves once the request loop ended and cleanup finished; rejects if the loop failed. */
   readonly done: Promise<void>;
@@ -150,9 +153,19 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       integrations: inboxDb,
     });
 
+    // Background jobs (ADR-0024): the durable command task, its index rows and its completion
+    // notices. The per-command limit is a host fact derived from the configured transport here, not
+    // from a tool call, and the extension is installed before the harness opens.
+    const jobs = new BackgroundJobs({
+      index: inboxDb,
+      timeoutSeconds: jobTimeoutSeconds(config.execution),
+      log,
+    });
+
     agent = await openAgent(config, options.models, undefined, {
       signal,
       memory: readMemoryConfig(env),
+      jobs,
       ...(legacy ? {} : { extraExtensions: [platform.integrationExtension] }),
     });
     // A local workspace is checked on disk. A remote one is checked against the execution-face
@@ -192,6 +205,9 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       ...(legacy ? { allowLegacyCatalog: true } : {}),
       // The console can only accept a removal the host can carry out; without the seam it refuses.
       ...(purger === undefined ? {} : { purger }),
+      // Background jobs: the console reads them for its panel and badge; a live job also counts as
+      // work an immediate reclaim would interrupt.
+      jobs,
       signal,
       log: console.error,
     });
@@ -235,6 +251,7 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       config,
       agent,
       bots,
+      jobs,
       console: consoleHandle,
       done,
       close: async () => {

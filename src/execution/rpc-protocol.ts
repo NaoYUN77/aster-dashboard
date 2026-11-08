@@ -39,6 +39,16 @@ export const PTC_MAX_REPLY_PAYLOAD_BYTES = RPC_MAX_FRAME_BYTES - 64 * 1024;
 
 /** Direct execution bounds. They are wire bounds; the agent clamps them to its own configuration. */
 export const RPC_MAX_EXECUTE_TIMEOUT_MS = RPC_MAX_DEADLINE_MS - 60_000;
+/**
+ * Whole seconds a direct execution may ask for under a configured ceiling. The wire bound wins: the
+ * client's own deadline has to outlast the command, so a request at the configured maximum can still
+ * be one the transport refuses. The derivation lives here, beside the bound it applies, so a caller
+ * that needs the *accepted* maximum (a background job's own time limit) gets the same number the
+ * environment enforces.
+ */
+export function rpcMaxTimeoutSeconds(maxTimeoutSeconds: number): number {
+  return Math.floor(Math.min(maxTimeoutSeconds * 1_000, RPC_MAX_EXECUTE_TIMEOUT_MS) / 1_000);
+}
 export const FILE_MAX_PATH_BYTES = 4_096;
 export const FILE_MAX_WRITE_BYTES = 2 * 1024 * 1024;
 export const FILE_MAX_READ_TEXT_BYTES = 2 * 1024 * 1024;

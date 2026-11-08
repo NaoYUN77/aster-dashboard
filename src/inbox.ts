@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
 import { NotFoundError, StateError } from "./errors.js";
 import type { TextRequest } from "./messages.js";
 import { parseCatalogProfile, serializeCatalogProfile, parseToolScope, serializeToolScope, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
@@ -11,7 +12,12 @@ import type {
 
 export type { ProvisioningRecord, ProvisioningSettlement } from "./bot-provisioner.js";
 
-export interface Job extends TextRequest {
+/**
+ * An operator's request as stored in `inbox`. Named `InboxRequest`, not `Job`: the background-jobs
+ * feature (ADR-0024) uses "作业/job" for a long-running background command, which is a different
+ * thing from an inbox row.
+ */
+export interface InboxRequest extends TextRequest {
   status: "pending" | "ready" | "sent" | "failed" | "uncertain";
   reply: string | null;
   /** ISO 8601 UTC; null only for rows written before timestamps existed. */
@@ -20,6 +26,57 @@ export interface Job extends TextRequest {
 }
 
 export type BotStatus = "active" | "disabled" | "deleted";
+
+/**
+ * One background command's durable index row. It exists to enumerate and to answer "which of my jobs
+ * finished"; the terminal truth is `harness.getTask(taskId)` (ADR-0024 decision 3). A disagreement is
+ * recorded as `unknown`, never resolved by guessing a terminal state.
+ */
+export type BackgroundJobState = "queued" | "running" | "done" | "failed" | "canceled" | "unknown";
+
+export const BACKGROUND_JOB_STATES: readonly string[] = ["queued", "running", "done", "failed", "canceled", "unknown"];
+
+/**
+ * The states a job has not left yet. `unknown` is deliberately not one of them: it is a terminal
+ * state — the command ended and its result could not be established — so it is never re-finished and
+ * does not count against a bot's unfinished work.
+ */
+export const LIVE_JOB_STATES: readonly BackgroundJobState[] = ["queued", "running"];
+/** The same list as a SQL literal. Not an input: the values are the two above, spelled out. */
+const LIVE_JOB_SQL = LIVE_JOB_STATES.map((state) => `'${state}'`).join(", ");
+
+export interface BackgroundJobRecord {
+  readonly jobId: string;
+  readonly botId: string;
+  /** The conversation that dispatched it; the notice is attributed to it. */
+  readonly conversationId: string;
+  /** The base task id, as text. Parsed back to a number before every `getTask` read. */
+  readonly taskId: string;
+  readonly kind: "command";
+  /** The command as written, bounded at `JOB_COMMAND_MAX_CHARS` for display. */
+  readonly command: string;
+  readonly state: BackgroundJobState;
+  /** Only meaningful for a terminal state. */
+  readonly exitCode: number | null;
+  /** A business failure code; never a transport exception's message. */
+  readonly error: string | null;
+  /** Bounded tail of the combined output; null until the job reached a terminal state. */
+  readonly output: string | null;
+  readonly createdAt: string;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+}
+
+/** A job's terminal state, host-written. It is a notice, not a reply: nothing generates it. */
+export interface NoticeRecord {
+  readonly noticeId: string;
+  readonly botId: string;
+  /** Unique: one job produces at most one notice, whichever path observed the terminal state. */
+  readonly jobId: string;
+  readonly text: string;
+  readonly createdAt: string;
+  readonly readAt: string | null;
+}
 
 export type BotRemovalKind = "delete" | "reset";
 
@@ -150,6 +207,31 @@ export class Inbox {
         requestedAt TEXT,
         updatedAt TEXT
       );
+      CREATE TABLE IF NOT EXISTS background_jobs (
+        jobId TEXT PRIMARY KEY,
+        botId TEXT NOT NULL,
+        conversationId TEXT NOT NULL,
+        taskId TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        command TEXT NOT NULL,
+        state TEXT NOT NULL,
+        exitCode INTEGER,
+        error TEXT,
+        output TEXT,
+        createdAt TEXT NOT NULL,
+        startedAt TEXT,
+        finishedAt TEXT
+      );
+      CREATE INDEX IF NOT EXISTS background_jobs_bot ON background_jobs (botId, createdAt);
+      CREATE TABLE IF NOT EXISTS notices (
+        noticeId TEXT PRIMARY KEY,
+        botId TEXT NOT NULL,
+        jobId TEXT NOT NULL UNIQUE,
+        text TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        readAt TEXT
+      );
+      CREATE INDEX IF NOT EXISTS notices_bot ON notices (botId, createdAt);
     `);
     // Existing databases predate the timestamps. Adding a nullable column leaves those rows unknown
     // instead of backfilling them with a time the process never observed.
@@ -184,9 +266,9 @@ export class Inbox {
    * The next request a bot's own worker should answer. Ordering by rowid keeps one bot's requests
    * in arrival order; each bot has its own queue, so two bots run at the same time.
    */
-  nextForBot(botId: string): Job | undefined {
+  nextForBot(botId: string): InboxRequest | undefined {
     return this.db.prepare(`SELECT * FROM inbox WHERE status = 'pending' AND requestId LIKE ?
-      ORDER BY rowid LIMIT 1`).get(`${consoleRequestPrefix(botId)}%`) as Job | undefined;
+      ORDER BY rowid LIMIT 1`).get(`${consoleRequestPrefix(botId)}%`) as InboxRequest | undefined;
   }
 
   /** Durably accept a console request before the console answers its caller. */
@@ -379,6 +461,151 @@ export class Inbox {
     if (changed.changes !== 1) throw new StateError("Bot not found");
   }
 
+  // --- Background jobs: an enumerable index projection, plus one notice per job. ---
+
+  createJob(job: Omit<BackgroundJobRecord, "exitCode" | "error" | "output" | "startedAt" | "finishedAt">): void {
+    this.transaction(() => {
+      const existing = this.db.prepare("SELECT botId, command FROM background_jobs WHERE jobId = ?").get(job.jobId) as
+        { botId: string; command: string } | undefined;
+      if (existing !== undefined) {
+        // Reusing a job id with other content is a caller bug, not a retry: job ids are host-minted UUIDs.
+        if (existing.botId !== job.botId || existing.command !== job.command) {
+          throw new StateError("Job ID reused with different content");
+        }
+        return;
+      }
+      this.db.prepare(`INSERT INTO background_jobs
+        (jobId, botId, conversationId, taskId, kind, command, state, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        job.jobId, job.botId, job.conversationId, job.taskId, job.kind, job.command, job.state, job.createdAt,
+      );
+    });
+  }
+
+  jobForBot(botId: string, jobId: string): BackgroundJobRecord | undefined {
+    // The botId is part of the predicate, not a post-filter: one bot can never read another's job.
+    const row = this.db.prepare("SELECT * FROM background_jobs WHERE jobId = ? AND botId = ?").get(jobId, botId);
+    return row === undefined ? undefined : decodeJob(row);
+  }
+
+  /**
+   * One job by its own host-minted id, without a bot predicate. Internal only: the id is generated by
+   * the host when the row is written, so it is not an input here — a caller that took an id from a
+   * model must use {@link jobForBot} instead.
+   */
+  jobById(jobId: string): BackgroundJobRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM background_jobs WHERE jobId = ?").get(jobId);
+    return row === undefined ? undefined : decodeJob(row);
+  }
+
+  jobsForBot(botId: string, limit: number): readonly BackgroundJobRecord[] {
+    return this.db.prepare("SELECT * FROM background_jobs WHERE botId = ? ORDER BY rowid DESC LIMIT ?")
+      .all(botId, limit).map(decodeJob);
+  }
+
+  /** Jobs this bot has not finished; the bound that keeps one bot from fanning out. */
+  liveJobsForBot(botId: string): readonly BackgroundJobRecord[] {
+    return this.db.prepare(
+      `SELECT * FROM background_jobs WHERE botId = ? AND state IN (${LIVE_JOB_SQL}) ORDER BY rowid`,
+    ).all(botId).map(decodeJob);
+  }
+
+  /** Every live job in the store, for the reconciler that converges rows with the base's task records. */
+  liveJobs(): readonly BackgroundJobRecord[] {
+    return this.db.prepare(
+      `SELECT * FROM background_jobs WHERE state IN (${LIVE_JOB_SQL}) ORDER BY rowid`,
+    ).all().map(decodeJob);
+  }
+
+  /** Mark a job as actually running. A job whose row is already terminal is left alone. */
+  markJobRunning(botId: string, jobId: string, startedAt: string): boolean {
+    const changed = this.db.prepare(
+      `UPDATE background_jobs SET state = 'running', startedAt = ? WHERE jobId = ? AND botId = ? AND state = 'queued'`,
+    ).run(startedAt, jobId, botId);
+    return changed.changes === 1;
+  }
+
+  /**
+   * Record the durable task id on the row written before the task existed. Linking is idempotent —
+   * the dispatcher and the reconciler both make this call — and only ever fills an empty slot or
+   * restates the same id, so a later caller cannot repoint a row at another task.
+   */
+  linkJobTask(jobId: string, taskId: string): boolean {
+    if (taskId === "") throw new StateError("A job row is never linked to an empty task id");
+    const changed = this.db.prepare(
+      "UPDATE background_jobs SET taskId = ? WHERE jobId = ? AND (taskId = '' OR taskId = ?)",
+    ).run(taskId, jobId, taskId);
+    return changed.changes === 1;
+  }
+
+  /**
+   * Record one job's terminal state and write its notice in the same transaction. The notice is keyed
+   * by `jobId`, so however many paths observe the same terminal state — the task itself, a restart, a
+   * console poll — exactly one notice exists and the later ones are no-ops. Returns false when another
+   * path already finished this job, which is not a failure.
+   */
+  finishJob(jobId: string, terminal: {
+    readonly state: Exclude<BackgroundJobState, "queued" | "running">;
+    readonly exitCode: number | null;
+    readonly error: string | null;
+    readonly output: string | null;
+    readonly notice: string;
+    readonly finishedAt: string;
+  }): boolean {
+    return this.transaction(() => {
+      const changed = this.db.prepare(`UPDATE background_jobs
+        SET state = ?, exitCode = ?, error = ?, output = ?, finishedAt = ?
+        WHERE jobId = ? AND state IN (${LIVE_JOB_SQL})`).run(
+        terminal.state, terminal.exitCode, terminal.error, terminal.output, terminal.finishedAt, jobId,
+      );
+      if (changed.changes !== 1) return false;
+      const row = this.db.prepare("SELECT botId FROM background_jobs WHERE jobId = ?").get(jobId) as
+        { botId: string } | undefined;
+      if (row === undefined) throw new StateError("Job row disappeared in its own transaction");
+      this.db.prepare(`INSERT OR IGNORE INTO notices (noticeId, botId, jobId, text, createdAt)
+        VALUES (?, ?, ?, ?, ?)`).run(randomUUID(), row.botId, jobId, terminal.notice, terminal.finishedAt);
+      return true;
+    });
+  }
+
+  noticesForBot(botId: string, limit: number): readonly NoticeRecord[] {
+    return this.db.prepare("SELECT * FROM notices WHERE botId = ? ORDER BY rowid DESC LIMIT ?")
+      .all(botId, limit).map(decodeNotice);
+  }
+
+  unreadNotices(botId: string): number {
+    const row = this.db.prepare("SELECT count(*) AS count FROM notices WHERE botId = ? AND readAt IS NULL")
+      .get(botId) as { count: number };
+    return Number(row.count);
+  }
+
+  /** Mark this bot's notices read. Ids outside the bot's own rows are ignored, never an error. */
+  markNoticesRead(botId: string, noticeIds?: readonly string[]): number {
+    return this.transaction(() => {
+      const markedAt = timestamp();
+      if (noticeIds === undefined) {
+        return Number(this.db.prepare("UPDATE notices SET readAt = ? WHERE botId = ? AND readAt IS NULL")
+          .run(markedAt, botId).changes);
+      }
+      let marked = 0;
+      const statement = this.db.prepare("UPDATE notices SET readAt = ? WHERE noticeId = ? AND botId = ? AND readAt IS NULL");
+      for (const noticeId of noticeIds) marked += Number(statement.run(markedAt, noticeId, botId).changes);
+      return marked;
+    });
+  }
+
+  /** Drop one bot's jobs and notices. Same boundary as `deleteBotRequests`: the reclaim pass only. */
+  deleteBotJobs(botId: string): { readonly jobs: number; readonly notices: number } {
+    return this.transaction(() => {
+      const count = (table: string): number =>
+        Number((this.db.prepare(`SELECT count(*) AS count FROM ${table} WHERE botId = ?`).get(botId) as { count: number }).count);
+      const result = { jobs: count("background_jobs"), notices: count("notices") };
+      this.db.prepare("DELETE FROM background_jobs WHERE botId = ?").run(botId);
+      this.db.prepare("DELETE FROM notices WHERE botId = ?").run(botId);
+      return result;
+    });
+  }
+
   // --- Removal: one durable intent per bot, written before anything is deleted. ---
 
   /**
@@ -492,6 +719,20 @@ export function consoleRequestBot(requestId: string): string | undefined {
   return match?.[1];
 }
 
+/** Job ids name their bot, so one bot's jobs can never be read or cancelled by another. */
+export function jobIdFor(botId: string, uuid: string): string {
+  if (!BOT_ID_PATTERN.test(botId)) throw new StateError("Bot id is invalid");
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid)) {
+    throw new StateError("Job id must be a UUID");
+  }
+  return `job:${botId}:${uuid}`;
+}
+
+/** The bot id inside a job id, or undefined when this is not a job id. */
+export function jobBotId(jobId: string): string | undefined {
+  return /^job:([a-z0-9][a-z0-9_-]{0,31}):[0-9a-f-]{36}$/.exec(jobId)?.[1];
+}
+
 /** Normalize and validate a bot's capability list; `ptc` is a retired compatibility value. */
 export function parseBotTools(value: unknown): string {
   if (typeof value !== "string") throw new StateError("Bot tools must be a comma-separated string");
@@ -567,6 +808,42 @@ const PROVISIONING_STATES: readonly string[] = ["provisioning", "ready", "degrad
 const INTEGRATION_STATES: readonly string[] = ["disconnected", "authorization_pending", "connected"];
 
 /** Durable rows are untrusted at the storage boundary: an invalid enum is a host error, not a default. */
+/** A stored job row is decoded with the same suspicion as any other durable row. */
+function decodeJob(row: object): BackgroundJobRecord {
+  const raw = row as Record<string, unknown>;
+  if (!BACKGROUND_JOB_STATES.includes(String(raw.state))) throw new StateError("Invalid background job state");
+  if (String(raw.kind) !== "command") throw new StateError("Invalid background job kind");
+  const exitCode = raw.exitCode == null ? null : Number(raw.exitCode);
+  if (exitCode !== null && !Number.isSafeInteger(exitCode)) throw new StateError("Invalid background job exit code");
+  return Object.freeze({
+    jobId: String(raw.jobId),
+    botId: String(raw.botId),
+    conversationId: String(raw.conversationId),
+    taskId: String(raw.taskId),
+    kind: "command" as const,
+    command: String(raw.command),
+    state: raw.state as BackgroundJobState,
+    exitCode,
+    error: raw.error == null ? null : String(raw.error),
+    output: raw.output == null ? null : String(raw.output),
+    createdAt: String(raw.createdAt),
+    startedAt: raw.startedAt == null ? null : String(raw.startedAt),
+    finishedAt: raw.finishedAt == null ? null : String(raw.finishedAt),
+  });
+}
+
+function decodeNotice(row: object): NoticeRecord {
+  const raw = row as Record<string, unknown>;
+  return Object.freeze({
+    noticeId: String(raw.noticeId),
+    botId: String(raw.botId),
+    jobId: String(raw.jobId),
+    text: String(raw.text),
+    createdAt: String(raw.createdAt),
+    readAt: raw.readAt == null ? null : String(raw.readAt),
+  });
+}
+
 function decodeProvisioning(row: object): ProvisioningRecord {
   const raw = row as Record<string, unknown>;
   if (!PROVISIONING_STATES.includes(String(raw.state))) throw new StateError("Invalid provisioning state");
