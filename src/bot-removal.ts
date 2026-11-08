@@ -27,6 +27,12 @@ export interface RemovalOutcome {
   /** `absent` means there was nothing left to remove: a transcript that never existed or a re-run. */
   readonly state: "purged" | "absent" | "failed";
   readonly rows: Readonly<Record<PurgeTable, number>>;
+  /**
+   * Index rows this pass dropped: the bot's background jobs and their completion notices. They live
+   * in the bot store rather than the conversation store, so `rows` never accounts for them.
+   */
+  readonly jobs: number;
+  readonly notices: number;
   readonly code: string | null;
 }
 
@@ -49,7 +55,8 @@ export const MAX_REMOVALS_PER_PASS = 64;
 /** The store side of a pass, so the same code serves service startup and the offline command. */
 export type RemovalStore = Pick<
   Inbox,
-  "pendingRemovals" | "deleteBotRequests" | "removeProvisioning" | "finishRemoval" | "failRemoval" | "vacuum"
+  | "pendingRemovals" | "deleteBotRequests" | "deleteBotJobs" | "removeProvisioning"
+  | "finishRemoval" | "failRemoval" | "vacuum"
 >;
 
 export interface RemovalPassOptions {
@@ -77,6 +84,10 @@ export function runPendingRemovals(options: RemovalPassOptions): RemovalPassRepo
       const report = purgeOne(options.purger, bot, removal.kind, removal.forced);
       options.store.removeProvisioning(bot.botId);
       options.store.deleteBotRequests(bot.botId);
+      // The job index and its notices belong to the bot that just left; leaving them would keep a
+      // deleted bot's ids readable from the console. They are dropped in the same pass, and counted
+      // apart from the conversation rows because they are a different store.
+      const dropped = options.store.deleteBotJobs(bot.botId);
       // The report is written last: it is the only field that ends the intent's life.
       options.store.finishRemoval(bot.botId, JSON.stringify({
         at: new Date().toISOString(),
@@ -84,17 +95,21 @@ export function runPendingRemovals(options: RemovalPassOptions): RemovalPassRepo
         forced: report.forced,
         removed: report.removed,
         rows: report.rows,
+        jobs: dropped.jobs,
+        notices: dropped.notices,
       }));
-      if (!report.absent) changed = true;
+      if (!report.absent || dropped.jobs > 0 || dropped.notices > 0) changed = true;
       outcomes.push(Object.freeze({
         botId: bot.botId,
         kind: removal.kind,
         conversationId: bot.conversationId,
         state: report.absent ? "absent" as const : "purged" as const,
         rows: report.rows,
+        jobs: dropped.jobs,
+        notices: dropped.notices,
         code: null,
       }));
-      options.log?.(`Bot removed: ${bot.botId} (${removal.kind}, ${report.absent ? "already absent" : `conversation ${report.removed.join(",")}`})`);
+      options.log?.(`Bot removed: ${bot.botId} (${removal.kind}, ${report.absent ? "already absent" : `conversation ${report.removed.join(",")}`}, ${dropped.jobs} job row(s))`);
     } catch (error) {
       const code = error instanceof ConversationPurgeError ? error.code : failureCode(error);
       options.store.failRemoval(bot.botId, code);
@@ -105,6 +120,10 @@ export function runPendingRemovals(options: RemovalPassOptions): RemovalPassRepo
         conversationId: bot.conversationId,
         state: "failed" as const,
         rows: emptyPurgeReport(bot.conversationId, mode(removal.kind)).rows,
+        // The pass removes no rows when it fails, so nothing was dropped from the job index either;
+        // the counts stay for the next pass rather than being reported as done.
+        jobs: 0,
+        notices: 0,
         code,
       }));
     }

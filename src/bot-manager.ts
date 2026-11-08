@@ -49,6 +49,7 @@ import {
 import { resolveCatalog } from "./capability-resolver.js";
 import { createProvisioningStore } from "./platform-runtime.js";
 import type { IntegrationRegistry, IntegrationView } from "./integrations.js";
+import type { BackgroundJobs, BotJobsView } from "./jobs/service.js";
 import type { CapabilityId, PlatformCapability, PlatformManifest } from "./platform-capabilities.js";
 
 export type OpenAgent = Awaited<ReturnType<typeof openAgent>>;
@@ -77,7 +78,7 @@ export type BotRemovalView = {
 /** One bot the optional self-restart would interrupt, and why. */
 export type BusyBotView = {
   readonly botId: string;
-  readonly reason: "running" | "pending_input";
+  readonly reason: "running" | "pending_input" | "background_jobs";
 };
 
 /** The outcome of one removal request; `restart` asks the caller to exit once its response is out. */
@@ -104,6 +105,11 @@ export type BotView = {
   /** Deployment-local tenant; workspace paths and views are scoped to it. */
   readonly userId: string;
   readonly provisioning: BotProvisioningView;
+  /**
+   * This bot's background jobs, its completion notices and the unread count. A read-only projection:
+   * the console shows them and can mark notices read, but it never starts or stops a job.
+   */
+  readonly jobs: BotJobsView;
   /** Null while the bot is live. A bot is hidden from `views()` once this is a delete. */
   readonly removal: BotRemovalView | null;
   /**
@@ -153,6 +159,11 @@ export type BotManagerOptions = {
    * unfinished or unexplained work, and whether anything inherits from its conversation.
    */
   readonly purger?: ConversationPurger;
+  /**
+   * The background-job host. Without it no job can be dispatched (the `job.*` tools are absent from
+   * the registry) and one live job no longer counts as work a restart would interrupt.
+   */
+  readonly jobs?: BackgroundJobs;
 };
 
 type Worker = {
@@ -166,6 +177,9 @@ type Worker = {
 const RESERVED_BOT_ID = "default";
 /** Bounded because it is kept forever on the tombstone; it is a note, never an authorization. */
 const REMOVAL_REASON_LIMIT = 500;
+
+/** The projection a deployment without background jobs reports: nothing was ever dispatched. */
+const NO_JOBS: BotJobsView = Object.freeze({ jobs: Object.freeze([]), notices: Object.freeze([]), unread: 0, live: 0 });
 
 /** A one-shot wake-up used by a bot worker instead of polling. */
 class Notifier {
@@ -456,16 +470,48 @@ export class BotManager {
     return this.#removalResult(this.#options.inbox.requestRemoval(bot.botId, { kind, force, reason }), true, purge === "now");
   }
 
-  /** Bots with work in flight that the removal of `except` would interrupt. Identifiers only. */
+  /**
+   * Bots with work in flight that the removal of `except` would interrupt. Identifiers only; the
+   * three reasons are the caller's actionable list — stop the run, answer the queued input, or wait
+   * for (or cancel) a job.
+   */
   busyBots(except: string): readonly BusyBotView[] {
     return Object.freeze(this.#bots()
       .filter((bot) => bot.botId !== except && bot.status !== "deleted")
       .flatMap((bot) => {
         const reason: BusyBotView["reason"] | null = this.#running.has(bot.botId)
           ? "running"
-          : this.#options.inbox.pendingForBot(bot.botId) > 0 ? "pending_input" : null;
+          : this.#options.inbox.pendingForBot(bot.botId) > 0
+            ? "pending_input"
+            // A restart stops every command this process is running, background ones included: the
+            // job would resume at the next start as work whose outcome is unknown, so it counts.
+            : (this.#options.jobs?.view(bot.botId).live ?? 0) > 0 ? "background_jobs" : null;
         return reason === null ? [] : [Object.freeze({ botId: bot.botId, reason })];
       }));
+  }
+
+  /** One bot's background jobs, notices and unread count, for the console's panel and badge. */
+  jobsView(botId: unknown): BotJobsView {
+    const bot = this.#activeBot(botId);
+    return this.#jobs().view(bot.botId);
+  }
+
+  /**
+   * Mark this bot's completion notices read. Bounded by the ids the caller names, which are looked
+   * up under this bot: a notice of another bot is never touched, and an unknown id changes nothing.
+   */
+  markJobNoticesRead(botId: unknown, noticeIds?: readonly string[]): { readonly read: number } {
+    const bot = this.#activeBot(botId);
+    if (noticeIds !== undefined && (noticeIds.length > 100 || noticeIds.some((id) => typeof id !== "string" || id === ""))) {
+      throw new StateError("Notice ids must be at most 100 non-empty strings");
+    }
+    return { read: this.#jobs().markRead(bot.botId, noticeIds) };
+  }
+
+  #jobs(): BackgroundJobs {
+    const jobs = this.#options.jobs;
+    if (jobs === undefined) throw new StateError("Background jobs are not configured");
+    return jobs;
   }
 
   /**
@@ -531,6 +577,7 @@ export class BotManager {
       loadedTools: this.#loadedTools.get(bot.botId) ?? (this.#zeroSetup ? this.#catalogNames() : []),
       userId: bot.userId,
       provisioning,
+      jobs: this.#options.jobs?.view(bot.botId) ?? NO_JOBS,
       removal: removalView(bot.removal),
       greeting: chatAllowed(record?.state) ? "你好，我已经准备好了。" : null,
     };
@@ -722,28 +769,28 @@ export class BotManager {
 
   async #runWorker(botId: string, signal: AbortSignal, wake: Notifier): Promise<void> {
     while (!signal.aborted) {
-      const job = this.#options.inbox.nextForBot(botId);
-      if (job === undefined) {
+      const request = this.#options.inbox.nextForBot(botId);
+      if (request === undefined) {
         await wake.wait(signal);
         continue;
       }
-      this.#running.set(botId, job.requestId);
+      this.#running.set(botId, request.requestId);
       try {
-        const text = await this.#options.agent.replyFor(job.conversationId, {
-          requestId: job.requestId,
-          conversationId: job.conversationId,
+        const text = await this.#options.agent.replyFor(request.conversationId, {
+          requestId: request.requestId,
+          conversationId: request.conversationId,
           senderId: "console",
-          text: job.text,
+          text: request.text,
         }, signal);
-        this.#options.inbox.saveConsoleReply(job.requestId, text);
+        this.#options.inbox.saveConsoleReply(request.requestId, text);
       } catch (error) {
         if (signal.aborted) break;
         try {
           // Saving first distinguishes a real failure from a request the operator already withdrew:
           // only a still-pending row can be updated, and only that one is logged as a failure.
           const code = failureCode(error);
-          this.#options.inbox.saveConsoleReply(job.requestId, `[request failed: ${code}]`, code);
-          this.#options.log?.(`Bot request failed: ${job.requestId} (${code})`);
+          this.#options.inbox.saveConsoleReply(request.requestId, `[request failed: ${code}]`, code);
+          this.#options.log?.(`Bot request failed: ${request.requestId} (${code})`);
         } catch {
           // The request was cancelled while its run was ending; the row is already terminal.
         }

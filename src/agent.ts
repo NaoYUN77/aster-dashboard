@@ -42,6 +42,9 @@ import { createWebExtension } from "./web-tools.js";
 import { inspectGithubToolRecovery, readResidentTools, withToolLedger } from "./tool-ledger.js";
 import { installMcpTools, orderedMcpExtensions } from "./tool-pins.js";
 import { catalogFor, parseCatalogProfile, parseToolScope, type CatalogProfile, type ToolScope } from "./tool-catalog.js";
+import { JOB_TASK_KIND } from "./jobs/contracts.js";
+import { createJobTaskHost } from "./jobs/host.js";
+import type { BackgroundJobs } from "./jobs/service.js";
 
 const context = BACKGROUND_CONTEXT;
 // Failures the request can recover from in-process; anything else thrown by the durable calls means the Session is unusable.
@@ -89,6 +92,19 @@ function memoryStartupError(error: unknown): unknown {
   return memoryAppError(error);
 }
 
+/**
+ * Whether a restart would resume work that a declaration change could conflict with: a run that is
+ * still reasoning with the catalog it read, or one that will write the conversation's model-visible
+ * context. A background job is deliberately not such work — it runs a shell command and never
+ * reasons — so it is excluded by kind. `background` alone would not answer this question: the memory
+ * archive task is background too, and it does reason.
+ */
+function hasConflictingWork(inspection: {
+  readonly tasks: readonly { readonly record: { readonly kind: string } }[];
+}): boolean {
+  return inspection.tasks.some((task) => task.record.kind !== JOB_TASK_KIND);
+}
+
 export type OpenAgentOptions = {
   /** Already-connected MCP host; the agent owns and closes it. Startup config is skipped. */
   readonly mcp?: McpHost;
@@ -108,6 +124,12 @@ export type OpenAgentOptions = {
    * registry: a model cannot install, widen or grant itself a tool through these.
    */
   readonly extraExtensions?: readonly Extension[];
+  /**
+   * The background-job host (ADR-0024). Its extension joins the same governed registry and its
+   * durable task surface is bound here, immediately after the harness opens, so the job tools can
+   * never run before the service they depend on is attached.
+   */
+  readonly jobs?: BackgroundJobs;
 };
 
 /**
@@ -260,6 +282,9 @@ Your final response is shown in the owner's local console as plain text: do not 
   // Platform-owned extensions join the same governed registry before the harness opens, so their
   // declarations, deferred discovery and execution review are indistinguishable from built-ins.
   for (const extension of options.extraExtensions ?? []) registry.install(extension);
+  // The job task must be resolvable in the registry the harness opens with; its tools are selected
+  // per conversation by the ordinary catalog, so a bot without the shell capability gets none.
+  if (options.jobs !== undefined) registry.install(options.jobs.extension());
   // Tracing observes the raw tool result; registering it first keeps Loop Guard's warning out of
   // the measured output counts. Disabled tracing installs nothing.
   const tracing = traceExtension();
@@ -358,6 +383,12 @@ Your final response is shown in the owner's local console as plain text: do not 
 
   try {
     const root = await harness.root(context);
+    if (options.jobs !== undefined) {
+      options.jobs.attach(createJobTaskHost(harness, durableStorage, context));
+      // Converge the job index before anything can be scheduled. The pass decides "never dispatched"
+      // from the absence of a durable task, which is only sound while no dispatch is in flight.
+      await options.jobs.reconcile();
+    }
     // A halt is decided inside a tool hook, which must return promptly; cancel the run outside it.
     // The next user request starts a new run, so this conversation-wide stop is not a Session failure.
     // Only the conversation whose guard tripped is stopped: another bot's run keeps going.
@@ -371,7 +402,7 @@ Your final response is shown in the owner's local console as plain text: do not 
     const checkGithubRecovery = async () => {
       if (!githubRecovery.changed) return;
       const inspection = await harness.inspect(context);
-      const unfinished = inspection.tasks.length > 0 || inspection.submissions.length > 0
+      const unfinished = hasConflictingWork(inspection) || inspection.submissions.length > 0
         || (memory !== undefined && await hasUnsubmittedMemoryProjection(durableStorage, root.id, context));
       if (unfinished) {
         throw Object.assign(new Error("GitHub approval changed while unfinished work exists; preserve the prior baseline and settle or explicitly stop that work before publishing new declarations."), {
@@ -395,7 +426,7 @@ Your final response is shown in the owner's local console as plain text: do not 
     const priorPins = await readResidentTools(durableStorage, root.id, context);
     const inspection = await harness.inspect(context);
     const hasPins = priorPins.length > 0 || Object.values(mcp.pins?.tools ?? {}).some(({ pin }) => pin);
-    const recovering = inspection.tasks.length > 0 || inspection.submissions.length > 0
+    const recovering = hasConflictingWork(inspection) || inspection.submissions.length > 0
       || (memory !== undefined && hasPins && await hasUnsubmittedMemoryProjection(durableStorage, root.id, context));
     if (recovering && hasPins) {
       console.error("MCP pin configuration deferred until an idle restart (TOOL_PIN_RECOVERY)");

@@ -15,6 +15,9 @@
 //   DELETE /api/bots/:id          accept the bot's removal and durably record the intent
 //   GET  /api/bots/:id/history    the conversation's model-visible history
 //   GET  /api/bots/:id/events     server-sent events for that conversation
+//   GET  /api/bots/:id/jobs       the bot's background jobs, notices and unread count
+//   POST /api/bots/:id/jobs/notices
+//                                 mark the bot's completion notices read (ids optional)
 //
 // Compatibility: `allowLegacyCatalog` is a host-internal switch (never a request field) that keeps
 // `POST /api/bots` with explicit `profile`/`toolScope` and `PATCH /api/bots/:id` for pre-zero-setup
@@ -45,9 +48,16 @@ import type { AgentEvent } from "@earendil-works/pi-durable";
 import type { BotManager } from "./bot-manager.js";
 import type { ConsoleConfig } from "./config.js";
 import { ConflictError, GoneError, NotFoundError, StateError } from "./errors.js";
+import type { BotJobsView } from "./jobs/service.js";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BOT_PATH = /^\/api\/bots\/([a-z0-9][a-z0-9_-]{0,31})(\/(messages|cancel|history|events|retry))?$/;
+/**
+ * Background jobs are a sub-resource rather than another action, because the read is a panel of its
+ * own and the write names the notices it covers.
+ */
+const JOB_PATH = /^\/api\/bots\/([a-z0-9][a-z0-9_-]{0,31})\/jobs(\/notices)?$/;
+const NOTICE_READ_FIELDS: readonly string[] = ["noticeIds"];
 const INTEGRATION_PATH = /^\/api\/integrations\/([a-z_]+)(\/authorization-requests)?$/;
 const CREATE_FIELDS: readonly string[] = ["name", "systemPrompt", "botId", "profile", "toolScope"];
 const ZERO_SETUP_CREATE_FIELDS: readonly string[] = ["name", "systemPrompt", "botId"];
@@ -60,6 +70,14 @@ const REMOVAL_FIELDS: readonly string[] = ["force", "purge", "reason"];
 const REMOVAL_NOTE = "Removed from the console immediately and irreversibly. The conversation store is reclaimed at the next service start, before the agent opens; /api/platform reports how many are still waiting.";
 /** Comment frames keep proxies and browsers from closing an idle stream. */
 const HEARTBEAT_MS = 20_000;
+
+/**
+ * What a jobs frame is about: how many jobs are unfinished, how many notices are unread, and every
+ * job's state. Two reads with the same key carry the same news, so the stream stays quiet.
+ */
+function jobsKey(view: BotJobsView): string {
+  return `${view.live}/${view.unread}/${view.jobs.map((job) => `${job.jobId}:${job.state}`).join(",")}`;
+}
 
 export type ConsoleHandle = {
   readonly port: number;
@@ -283,6 +301,32 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
       send(response, 201, { bot });
       return;
     }
+    const jobMatch = JOB_PATH.exec(url.pathname);
+    if (jobMatch !== null) {
+      const id = jobMatch[1] as string;
+      if (method === "GET" && jobMatch[2] === undefined) {
+        send(response, 200, bots.jobsView(id));
+        return;
+      }
+      if (method === "POST" && jobMatch[2] === "/notices") {
+        const input = await readJson(request);
+        if (input === null || typeof input !== "object" || Array.isArray(input)) throw new StateError("Notice read request must be an object");
+        const body = input as Record<string, unknown>;
+        if (Object.keys(body).some((key) => !NOTICE_READ_FIELDS.includes(key))) throw new StateError("Notice read request has unknown fields");
+        const ids = body.noticeIds;
+        let noticeIds: readonly string[] | undefined;
+        if (ids !== undefined) {
+          if (!Array.isArray(ids) || !ids.every((id): id is string => typeof id === "string")) {
+            throw new StateError("noticeIds must be a list of strings");
+          }
+          noticeIds = ids;
+        }
+        send(response, 200, bots.markJobNoticesRead(id, noticeIds));
+        return;
+      }
+      send(response, 404, { error: "not found" });
+      return;
+    }
     const match = BOT_PATH.exec(url.pathname);
     if (match === null) {
       send(response, 404, { error: "not found" });
@@ -356,8 +400,26 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
       if (!response.writableEnded) response.write(`data: ${JSON.stringify(payload)}\n\n`);
     };
     let watcher: { stop(): Promise<void> } | undefined;
+    // Background jobs complete without producing any conversation event, so the stream carries them
+    // itself: the heartbeat re-reads the index and pushes one frame when it changed. It is a read of
+    // the bot store only — no job is started, stopped or acknowledged from here.
+    let lastJobs = "";
+    const pushJobs = (): void => {
+      let view;
+      try {
+        view = bots.jobsView(botId);
+      } catch {
+        // The bot is gone or the store is closed; the stream is about to end anyway.
+        return;
+      }
+      const key = jobsKey(view);
+      if (key === lastJobs) return;
+      lastJobs = key;
+      write({ type: "jobs", jobs: view });
+    };
     const heartbeat = setInterval(() => {
       if (!response.writableEnded) response.write(": keep-alive\n\n");
+      pushJobs();
     }, HEARTBEAT_MS);
     heartbeat.unref();
     const cleanup = async (): Promise<void> => {
@@ -376,7 +438,10 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
       });
       watcher = attached;
       streams.add(attached);
-      write({ type: "snapshot", state: bots.views().find((view) => view.botId === botId) ?? null });
+      const snapshot = bots.views().find((view) => view.botId === botId) ?? null;
+      write({ type: "snapshot", state: snapshot });
+      // Seeded from the snapshot, so the first push is a change rather than a duplicate of it.
+      lastJobs = snapshot === null ? "" : jobsKey(snapshot.jobs);
     } catch (error) {
       write({ type: "error", message: error instanceof StateError ? error.message : "stream failed" });
       response.end();

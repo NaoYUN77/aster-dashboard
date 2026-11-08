@@ -40,6 +40,7 @@ import {
   PTC_MAX_WINDOW_BYTES,
   PTC_MAX_WINDOW_LINES,
   RPC_MAX_DEADLINE_MS,
+  rpcMaxTimeoutSeconds,
   type PtcOutputWindow,
   type RpcBashExecutePayload,
   type RpcFileMethod,
@@ -178,7 +179,9 @@ export class RemoteRpcExecutionEnv implements ExecutionEnv {
     this.#client = options.client;
     this.#sessionId = options.sessionId;
     this.#defaultTimeoutSeconds = options.defaultTimeoutSeconds;
-    this.#maxTimeoutMs = Math.min(options.maxTimeoutSeconds * 1_000, RPC_MAX_DEADLINE_MS - RPC_DEADLINE_SLACK_MS);
+    // The ceiling is the transport's, not the configuration's: this is the same number a background
+    // job derives its own time limit from, so a dispatched job never asks for a refused timeout.
+    this.#maxTimeoutMs = rpcMaxTimeoutSeconds(options.maxTimeoutSeconds) * 1_000;
     this.#files = new RemoteFileSystem({
       namespace: this.id,
       cwd: this.cwd,
