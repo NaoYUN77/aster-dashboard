@@ -12,6 +12,7 @@
 //   POST /api/bots/:id/retry      retry a failed initialization on the same resources
 //   POST /api/bots/:id/messages   durably accept one request; answers with its id
 //   POST /api/bots/:id/cancel     withdraw the bot's pending request and stop its run
+//   DELETE /api/bots/:id          accept the bot's removal and durably record the intent
 //   GET  /api/bots/:id/history    the conversation's model-visible history
 //   GET  /api/bots/:id/events     server-sent events for that conversation
 //
@@ -20,27 +21,43 @@
 // callers. It is off in production, so a browser cannot name a tool, capability or scope.
 //
 // Inputs: the validated console configuration, the bot manager and the shutdown signal. Nothing
-// from a request names a path, a model, a tool or a conversation: those are host decisions.
+// from a request names a path, a model, a tool or a conversation: those are host decisions. A
+// removal body carries only `force`, `purge` and `reason` — none of which can widen the set of rows
+// the host removes.
 //
-// Errors: every failure is a typed JSON answer with its status; an unknown bot is 404, an invalid
-// body 400, a full bot list 409. The static page is served without a token so the browser can ask
-// for one; every API route requires the configured token, compared in constant time, unless the
+// Removal: the 202 answers what was accepted, never that the rows are gone — they leave the
+// conversation store at the next process boundary — and the body carries the console's wording for
+// that. `purge: "now"` asks the host to restart for it; the answer is written and flushed first, and
+// the actual exit is `onRequestShutdown`, the host's own graceful path rather than a signal.
+//
+// Errors: every failure is a typed JSON answer with its status; an unknown bot is 404, a removed one
+// 410, a removal that conflicts with live or unexplained work 409 with the reason the host named, an
+// invalid body 400, a full bot list 409. The static page is served without a token so the browser can
+// ask for one; every API route requires the configured token, compared in constant time, unless the
 // host explicitly disabled authentication with WEB_AUTH=off.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
+import { finished } from "node:stream/promises";
 import type { AgentEvent } from "@earendil-works/pi-durable";
 import type { BotManager } from "./bot-manager.js";
 import type { ConsoleConfig } from "./config.js";
-import { NotFoundError, StateError } from "./errors.js";
+import { ConflictError, GoneError, NotFoundError, StateError } from "./errors.js";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BOT_PATH = /^\/api\/bots\/([a-z0-9][a-z0-9_-]{0,31})(\/(messages|cancel|history|events|retry))?$/;
 const INTEGRATION_PATH = /^\/api\/integrations\/([a-z_]+)(\/authorization-requests)?$/;
 const CREATE_FIELDS: readonly string[] = ["name", "systemPrompt", "botId", "profile", "toolScope"];
 const ZERO_SETUP_CREATE_FIELDS: readonly string[] = ["name", "systemPrompt", "botId"];
+const REMOVAL_FIELDS: readonly string[] = ["force", "purge", "reason"];
+/**
+ * What a 202 means, in the console's own words. The user-facing removal is immediate; the physical
+ * reclaim has its own time, and a response that blurred the two would be claiming something that has
+ * not happened yet. `pendingPurge` on `/api/platform` is where the queue can be seen.
+ */
+const REMOVAL_NOTE = "Removed from the console immediately and irreversibly. The conversation store is reclaimed at the next service start, before the agent opens; /api/platform reports how many are still waiting.";
 /** Comment frames keep proxies and browsers from closing an idle stream. */
 const HEARTBEAT_MS = 20_000;
 
@@ -57,6 +74,12 @@ export type ConsoleOptions = {
   readonly log?: (line: string) => void;
   /** Host-internal compatibility switch; never read from a request or a bot row. */
   readonly allowLegacyCatalog?: boolean;
+  /**
+   * The host's own graceful shutdown, for a removal that asked to reclaim now. Called only after the
+   * response is flushed. It is a callback rather than a process signal so an embedded service never
+   * kills its host, and it is the host that decides whether anything is still running.
+   */
+  readonly onRequestShutdown?: () => void;
 };
 
 /** Compared without an early exit, so a wrong token cannot be narrowed by timing. */
@@ -156,6 +179,16 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
     void handle(request, response).catch((error: unknown) => {
       if (response.headersSent) {
         response.end();
+        return;
+      }
+      if (error instanceof GoneError) {
+        send(response, 410, { error: error.message });
+        return;
+      }
+      if (error instanceof ConflictError) {
+        // The reason is the host's stable code; `extra` is metadata the caller may act on, never a
+        // description of the work itself.
+        send(response, 409, { error: error.message, ...error.extra });
         return;
       }
       if (error instanceof NotFoundError) {
@@ -279,12 +312,33 @@ export async function startConsole(options: ConsoleOptions): Promise<ConsoleHand
       send(response, 200, await bots.cancel(botId));
       return;
     }
+    if (method === "DELETE" && action === undefined) {
+      const input = await readJson(request);
+      if (input === null || typeof input !== "object" || Array.isArray(input)) throw new StateError("Removal request must be an object");
+      const body = input as Record<string, unknown>;
+      if (Object.keys(body).some((key) => !REMOVAL_FIELDS.includes(key))) throw new StateError("Removal request has unknown fields");
+      const result = bots.remove(botId, { force: body.force, purge: body.purge, reason: body.reason });
+      // 202 the first time the intent is recorded, 200 for a repeat: the operator's decision is
+      // accepted once and stays accepted, and repeating it can never queue a second removal.
+      send(response, result.accepted ? 202 : 200, { bot: result.bot, removal: result.removal, note: REMOVAL_NOTE });
+      if (result.restart) {
+        // The 202 is on the wire before anything is torn down; otherwise the exit would cut it off.
+        await finished(response).catch(() => undefined);
+        options.log?.(`Removal of ${botId} asked for immediate reclaim; the host is shutting down to run it`);
+        options.onRequestShutdown?.();
+      }
+      return;
+    }
     if (method === "GET" && action === "history") {
       const limit = Number(url.searchParams.get("limit") ?? "100");
       send(response, 200, { messages: await bots.history(botId, Number.isSafeInteger(limit) ? limit : 100) });
       return;
     }
     if (method === "GET" && action === "events") {
+      // The stream writes its 200 headers before it can learn the bot is gone, so a removed bot would
+      // get an SSE error frame instead of the 410 every other route answers with. The check has to
+      // happen here, while a JSON answer is still available.
+      bots.requireActive(botId);
       await stream(botId, response);
       return;
     }

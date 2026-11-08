@@ -29,6 +29,7 @@ flowchart LR
 | --- | --- | --- |
 | 入口与部署 | 组合接线、部署渲染、环境预检、发布清单 | `src/main.ts`、`src/deployment-*.ts`、`src/release-*.ts` |
 | 接入 | dashboard 控制台接收请求、持久化收件箱与 Bot 路由 | `src/console.ts`、`src/bot-manager.ts`、`src/inbox.ts` |
+| Bot 回收 | 墓碑受理、启动窗口的行级回收、离线入口与单写者判定 | `src/bot-manager.ts`、`src/bot-removal.ts`、`src/conversation-purge.ts`、`src/bot-purge.ts`、`src/service-lock.ts` |
 | 运行时 | 基于 pi-durable 的 Session：durable 执行、checkpoint、replay 恢复 | `src/agent.ts` |
 | 记忆 | 归档、工作状态、压缩、上下文规划与快照、生命周期接入与记忆工具 | `src/memory/` |
 | 工具 | 工具注册表（常驻 + deferred）、MCP 接入与 OAuth 凭据保管 | `src/tools.ts`、`src/mcp*.ts` |
@@ -44,12 +45,13 @@ flowchart LR
 | --- | --- |
 | `agent.sqlite`（及 WAL） | 底座会话与执行恢复状态；记忆系统的 working 状态、周期快照投影、归档进度与轮数计数 |
 | `inbox.sqlite`（及 WAL） | 控制台请求的接收、回复与失败状态；旧版 `identity`／`deliveries` 等兼容表仅保留既有数据 |
+| `service.lock`（运行时存在） | 同一数据目录的单写者声明：服务进程持有到退出；离线回收命令也先取它，服务运行中即拒绝 |
 | `workspace/` | agent 的任务文件 |
 | `memory/daily/YYYY-MM-DD.md` | 每日事件记忆：归档任务从已确认的会话范围增量提取 |
 | `mcp.json`（可选） | MCP server 配置 |
 | `mcp-oauth/<server>.json`（可选） | 远程 MCP server 的 OAuth token，仅属主可读 |
 
-约束：同一数据目录只允许一个应用进程（镜像入口以 `flock` 互斥）。当前为单用户、多 Bot，各 Bot 请求按接收顺序处理，工具顺序执行；单个请求等待上限 5 分钟，超时向底座请求取消（外部副作用不保证可撤销）。请求标识包含控制台来源与 Bot 命名空间；既有 SQLite 表和数据保留。
+约束：同一数据目录只允许一个应用进程（镜像入口以 `flock` 互斥；应用自身另持有 `DATA_DIR/service.lock`，离线回收命令据此拒绝在服务运行期间执行）。当前为单用户、多 Bot，各 Bot 请求按接收顺序处理，工具顺序执行；单个请求等待上限 5 分钟，超时向底座请求取消（外部副作用不保证可撤销）。请求标识包含控制台来源与 Bot 命名空间；既有 SQLite 表和数据保留。
 
 ## 开箱即用：首次进入即可对话（默认）
 
@@ -83,6 +85,40 @@ flowchart LR
 零配置流程由 `test/zero-setup.test.ts` 与 `test/zero-setup-wiring.test.ts` 覆盖；真实模型供应商、
 远程共享执行主机与控制台的部署验收仍需运维在目标机器上执行，仓库不把未执行的部署验证记为通过。
 
+## 删除与重置 Bot
+
+控制台可以删除一个 Bot：`DELETE /api/bots/:id`。它分两段，且两段必须分开表述。
+
+- **墓碑即时**：状态置为 `deleted`、从 `GET /api/bots` 隐藏、该 `botId` 永久不复用（再用同 id 创建返回
+  `409 bot_id_retired`），该 Bot 的消息／取消／重试／历史／事件一律 `410 bot_deleted`。用户视角到这里
+  就已经删掉了。
+- **物理回收在下一个进程边界**：会话、记忆与执行账本的行（`entries`／`documents`／`document_revisions`／
+  `tasks`／`submissions`）在进程启动时、`openAgent()` 打开 harness 与任何会话**之前**删除；该 Bot 在
+  `inbox.sqlite` 的用户正文与旧版投递引用行也在同一次回收里清除。回收之前，响应与留痕都不会声称已擦除；
+  积压数量看 `/api/platform` 的 `pendingPurge`。
+
+到达这个边界有三条路：**默认就是重启或下一次部署**——启动时一遍回收清空所有积压墓碑，删 N 个 Bot 只付
+一次重启；服务已停止时用 `npm run bots:purge`（需先 `npm run build`；读 `.env` 的 `DATA_DIR`，也可
+`npm run bots:purge -- --data-dir <目录>`）执行同一份实现；body 带 `"purge": "now"` 时可选自重启，在响应
+写出并 flush 之后走与 `SIGTERM` 相同的优雅关闭路径退出，由容器的 `restart: unless-stopped` 拉起。
+
+其它取舍：
+
+- **保留 Bot（`default`）不能被删除，只能重置**：`bots` 行与会话 id 保留，只清空该会话的历史内容。删掉
+  root 会话只会换来一个新的 root，那是重置而非删除。
+- **拒绝与 `force`**：运行中、有待处理输入、底座里仍有在途工作（非终态 task 或未结算 submission）各有明确
+  的 409，`force` 不放行——先取消再重试是可行动的下一步。只有"终态但结局未知"的记录默认拒绝、显式
+  `force` 放行，并记在墓碑行的留痕列上。`purge: "now"` 在其它 Bot 有在途工作时返回 `409 busy_bots` 并列出
+  受影响的 Bot，不静默打断；`force` 与 `purge` 是两个独立字段。
+- **不动的面**：工作区文件全部保留，`memory/daily/*.md` 按归属模型清理而不是按目录清空，`record_ids`
+  与其它会话一行不碰（id 水位不回滚）。
+- **只有控制台 API 能触发删除**，它不是模型工具，模型参数不能指定路径、会话、表或凭据。回收失败不阻塞
+  启动，墓碑保留 intent 等下一次；失败原因记在 `removalError`。
+
+契约与已知限制见 [契约与生命周期](docs/contracts-and-lifecycle.md#bot-删除与重置)，取舍与实现结果见
+[ADR-0023](docs/adr/zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md)；本地验收由
+`test/conversation-purge.test.ts` 与 `test/bot-deletion.test.ts` 覆盖。
+
 ## 已验证与尚未验证
 
 生产状态以所有者确认为准。下面的测试和 CI 数字以仓库里的记录为准。
@@ -93,6 +129,7 @@ flowchart LR
 - 最终镜像与单服务拓扑 6 项：Compose 边界、缺 provider key 时不回显凭据、同卷 `flock`、离线卷预检与整卷备份还原、容器日志不含合成凭据。脚本写明不覆盖真实控制台业务链与模型链路，见 [CI 运行入口](docs/ci-entrypoint.md)。
 - 记忆机制的离线验收，以及一次 DeepSeek 真实模型补测（28 次调用里 27 次前缀缓存命中，约 87%）。腾讯云 4 核、7680 MB 的机器在同一份记录里跑过验收测试和资源测量（峰值 RSS 约 136 MiB）。那是测试补测，不是部署验收。见 [记忆系统验收](docs/memory-verification.md)。
 - 启动配置在联网前拒绝未知提供商和未知模型 id；进程日志只打印本应用的配置／状态错误或错误码（`src/config.ts`、`src/main.ts`）。这是代码和测试里的行为，不是一份生产日志审计。
+- 删除与重置的本地离线验收（2026-11-08）：`npm test` 406 项、390 通过、0 失败、16 项跳过（卷预检与 Unix socket 等 root／POSIX 专属用例），`npm run check` 与 `npm run build` 通过；新增 `test/conversation-purge.test.ts` 与 `test/bot-deletion.test.ts` 各 9 项，用已安装底座的 schema 与真实 HTTP 路由覆盖墓碑、重置、四类 409、退役 id、`purge: "now"` 与离线入口。这是本地运行，不是 CI 或部署验收。
 - 早期 Telegram 部署说明仅属于已移除入口的历史记录，不作为当前 dashboard 与共享执行主机的部署证据。
 
 **仓库记录尚未覆盖**
@@ -107,6 +144,7 @@ flowchart LR
 - 各 Bot 内请求串行；接收、执行和控制台展示状态独立保存。
 - `bash` 等工具不是沙箱。Phase 1 的 Computer 能力经 mTLS RPC 连到单台共享 CVM Execution Host，所有 Bot 共用软件与文件，只保留各自默认工作目录。
 - 本阶段没有真实 OAuth 集成连接、供应商实时连通性探测、OS 级隔离（按 2026-11-06 架构决策明确不需要），也没有进程内多用户账号体系（单用户 MVP，跨用户隔离仍按独立 `DATA_DIR` 部署）。Memory 仍是全局而非每 Bot 独立；共享执行主机的原始 bash 可列出兄弟工作区目录，这是被接受的取舍而非待修复缺陷。见 [ADR-0023](docs/adr/zero-setup-bot-runtime/0023-zero-setup-bot-runtime.md)。
+- 删除的行级回收需要一次进程边界（墓碑即时、回收在下次启动；可选的 `purge: "now"` 把它收敛成一次请求，默认不等）。失败的删除没有控制台读出口：墓碑已从列表隐藏，只能在部署日志与 `inbox.sqlite` 的 `removalError` 查因，`/api/platform` 只给数量。回收直接操作底座 SQLite，版本闸门按已安装底座（1.3.0）的 schema 精确匹配，不匹配即拒绝删除并保留 intent（不影响启动）；升级底座必须先复核闸门，见 [契约与生命周期](docs/contracts-and-lifecycle.md#bot-删除与重置)。
 
 ## 对话示例
 

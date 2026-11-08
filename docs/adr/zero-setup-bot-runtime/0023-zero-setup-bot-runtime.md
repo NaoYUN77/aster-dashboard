@@ -154,3 +154,138 @@ ADR-0020 / 0021 记录远程 PTC sandbox 与控制面 / 执行面分离尚未通
   Edit、工作区隔离与超时的 Linux 回环）、`test/shared-host-workspace.test.ts`、
   `test/zero-setup.test.ts` 通过；CVM 部署验收由运维按 runbook 执行，本 ADR 不把未执行的部署
   验证记为已通过。
+
+### 2026-11-07：Bot 删除语义与长期记忆归属
+
+- **决策 9（删除 Bot）**：`DELETE /api/bots/:id` 写入即时生效的墓碑——状态 `deleted`、从列表隐藏、
+  `botId` 永久不复用、运行中或有待处理输入时 409 拒绝——会话与记忆的物理回收放在**下一个进程
+  边界**：进程启动时、`openAgent()` 打开 harness 与任何会话**之前**执行 purge。同一份实现另以
+  离线运维命令暴露，用于不愿等待重启的回收。purge 收在单一接缝之后：上游一旦提供
+  `deleteConversation`，整体替换实现，业务层不动。到达这个进程边界有三条路：自然重启或下一次
+  部署（默认，启动 purge 一次清空全部积压墓碑，删 N 个 Bot 只付一次重启）、离线运维命令，以及
+  **可选的「请求即重启」**（body 带 `purge: "now"`，默认关）：一个进程承载所有 Bot，所以它中断的
+  是其它 Bot 在途的工作，故在其它 Bot 运行中或有待处理输入时以 409 拒绝并列出受影响的 Bot，且必须
+  先写出响应再退出。删除的即时性因此不依赖运维动作：默认即时的是用户视角的移除，物理回收的时点是
+  可选的、显式的。
+- **事实依据**：pi-durable 1.3.0–1.5.0 的 `Storage` 接口没有删除方法，仅有 `removeInboxItem` /
+  `removeCompactionStatus` / `removeNestedSlots`；`Conversation.reset()` 只写入 `pi.reset`
+  条目（"starts a new context"），不删除任何内容。受影响的行分布在 `entries` / `documents` /
+  `document_revisions` / `tasks` / `submissions`；`record_ids` 与 `mintId()` 的水位不得回滚，
+  `mintId()` 承诺返回值 "greater than every ID minted or stored before, also across reopen"。
+  `durable_schema` 记录迁移版本，1.4.0 把 SQLite 升到 schema 2 且迁移后的库无法被 1.3.0 打开，
+  因此宿主自删行与底座内部 schema 逐版本耦合——这是把它收在接缝后并向上游要 API 的理由，而不是
+  可长期维持的方案。
+- **备选方案**：
+  - 请求内同步删除（冻结 harness 后删行）：删除一步完成；不采纳，因为服务是常驻进程，harness 与
+    所有 Bot 会话在进程退出前一直打开（`BotManager` 没有空闲回收），不存在安全的进程内窗口，
+    且 `VACUUM` 要求独占且不能在事务内。
+  - 只提供离线运维命令：完全不碰启动路径；不采纳，因为删除要等一次人工命令，与「直接删」的用户
+    语义不符。这一条要的「不必等运维」已由决策 9 的可选「请求即重启」吸收，而它仍不是默认行为。
+  - 更换底座：可能自带删除原语；不采纳，因为删除难在语义（append-only 恢复日志对用户数据擦除），
+    不是 API 缺失，且 `src/memory` 几乎整体建立在底座的 documents / compaction 契约上，而
+    `src/execution` 与底座无关，换底座的代价正好落在最难重建的一层，见 ADR-0013。
+
+- **决策 10（长期记忆归属）**：长期记忆改为**按 Bot 可选、新建 Bot 默认关闭**；working memory 与
+  compaction 保持常开，它们的作用域是会话（`scope: "conversation"`），随会话一起删除，不构成
+  独立的长期存储。
+- **对上文决策的修订**：后果一节记录的未完成项「Memory 仍是根会话 / 全局而非每 Bot 独立」由本节
+  转为待实施的方向，不再作为接受的现状。现状是：记忆集成绑定 root 会话（`integration.ts` 的每一处
+  都以 `root.id` 取值，归档只扫描 root 的 entries），而 root 会话属于 `default` Bot；daily 归档写在
+  全局 Markdown（`DATA_DIR/memory/daily/*.md`），`MemorySegment` 没有 owner 字段。因此普通 Bot
+  今天没有长期记忆，删除它不产生 daily 负债，只有显式开启长期记忆的 Bot 才有这层负债。
+  备选（未采纳）：**A** 维持仅 root 并禁止删除 `default`——零改动、删除语义最干净，但非默认 Bot
+  永远没有长期记忆；**C** 在 B 之上保证按 Bot 可擦除——需要解决 provenance（归档游标与批次
+  `ArchiveDoc` 是 `scope: "conversation"`，归属信息正好存在被删的那一侧），做法是把 daily 改为按
+  Bot 分目录，或给 segment 增加 owner 字段（需要迁移）。B 落地时若记忆仍按会话绑定，C 只在真的为
+  非默认 Bot 开启记忆时才必须做。
+- **取舍与代价**：删除生效分两步（墓碑即时、回收在下次进程边界），换来不冻结常驻 harness；宿主动
+  底座内部 SQLite 是有意的技术债，须按底座版本复核并收在接缝之后。长期记忆默认关闭会让新建 Bot
+  不自带记忆——这正是本决策要的边界，代价是长期 Bot 需要显式开启。
+- **决策 11（保留 Bot 的删除语义：重置）**：`default` 是保留 Bot，`DELETE /api/bots/:id` 对它不
+  表示「删除」而表示「重置」：保留 `bots` 行与 root 会话行，物理清空该会话的历史内容（`entries` /
+  `documents` / `document_revisions` / `tasks` / `submissions`），响应与控制台措辞都明确标注
+  重置而不是删除，也不从列表隐藏、不复用其它 Bot 的墓碑语义。理由：`Harness.root()` 的契约是
+  「保留会话，不存在时创建」，删掉 root 的行只会换来一个新的 root（新 id），那是重置而非删除；
+  而真删 `bots` 行会让 root 变成没有归属的会话——`#target` 只把 `botId === "default"` 映射到哨兵
+  `"root"`，于是没有任何请求再落到 root 上，`usesMemory`（`conversation.id === root.id`）永不成立，
+  整个部署的长期记忆随之失效。那不是「删一个 Bot」，是关掉一项平台能力。重置沿用同一份 purge
+  实现与同一个进程边界（启动时、`openAgent()` 之前），并受同样的 409 条件约束（运行中或有待处理
+  输入时拒绝）。
+  与决策 10 的相互作用：今天只有 root 写 daily 归档，所以「重置该 Bot 的记忆」与「清空 daily 存储」
+  当前恰好等价；这是记忆仅绑 root 的巧合，记忆按 Bot 可选之后不再成立，因此实现必须按归属模型
+  清理，而不是按目录清空。
+- **删除范围与护栏（本轮确认）**：范围按**作用域**过滤、不按 kind——删该会话的 `entries` /
+  `documents` / `document_revisions` / `tasks` / `submissions`，以及 `scope: { kind: "conversation",
+  conversationId }` 的文档（含 Tool Ledger 的 `personal.tools.loads`）；**保留** `record_ids`、
+  `durable_schema`、`scope: { kind: "session" }` 的文档（含 `personal.tools.catalog`）与其它会话的
+  每一行。工作记录随会话一并删除（甲），不留悬空 `conversationId`：删除后「这个 Bot 做过什么」不可
+  答，只留「删过什么」——由墓碑行的 `removalKind` / `removalAt` / `removalForced` / `removalReason` /
+  `removalReport` 承载，计数不含正文。未知结局按 `docs/contracts-and-lifecycle.md` 的「不标记为成功，
+  也不假定没有执行」处理：非终态 task 或未结算 submission **硬拒绝**（`force` 不放行）；终态但结局
+  未知者默认拒绝、显式 `force` 可越过并在留痕中记录；实现时若无法可靠区分，保守做法是要求 `force`。
+  删除只经控制台 API，**不暴露为模型工具**，模型参数不能指定范围或凭据；墓碑生效期内响应不得声称
+  物理擦除已完成（不伪造成功）。
+- **开放项**：保留 Bot 的可改性——今天 Bot 创建后无法改名（`inbox.ts` 没有 `setBotName`，只有
+  conversation / status / tools / catalog 四个 setter），而它的工作区仍是 `/workspaces` 本身上一层
+  （`src/main.ts` 记录的历史路径，改动需要显式数据迁移决策）；与删除语义无关，单独待定。
+  原 ① ② 已随本轮确认并解决：`inbox` / `deliveries` / `failures` 中属于该 Bot 的行随会话清理
+  （`inbox.text` 是用户正文，留着则「删除」名不副实，且 `pendingForBot` 会永久非零；`deliveries` /
+  `failures` 的引用行一并清理以免悬空），`VACUUM` 在同一启动窗口内、purge 之后、`openAgent()` 之前
+  执行，仅在本次确有删除时执行，失败不阻塞启动但要报告。
+- **上游与后续**：`earendil-works/pi` issue #11026 即请求该原语（open），本项目的用例与事实已于
+  2026-11-07 以明确标注 AI 生成的评论补入该 issue；接缝的验收标准是上游提供 `deleteConversation`
+  时能整体替换。本决策的实现契约见临时规格 `docs/spec-20261107-zero-setup-bot-runtime-deletion.md`
+  （按约定在完成后删除，长期结论已由本节承载）。
+- **相关缺陷**：已知代价（不是缺陷）：行级回收需要一次进程重启，可选的自重启把它收敛成单次请求，
+  默认仍不等。→ 本节所述实现已于 2026-11-08 落地，结果、与规格表格的差异及实现暴露的缺陷见下一节；
+  测试固定在已安装底座的 schema（1.3.0）上，升级底座时按 ADR-0013 先对未完成调用做兼容。
+
+### 2026-11-08：删除与重置的实现结果（决策 9 / 11 落地）
+
+- **交付**：`DELETE /api/bots/:id`（普通 Bot 墓碑／保留 Bot 重置）、启动窗口的行级回收、与启动共用
+  同一实现的离线入口 `npm run bots:purge`、`DATA_DIR/service.lock` 单写者判定、可选自重启
+  `purge: "now"`、以及墓碑行上的五列留痕。接缝按决策 9 收成单点：`src/conversation-purge.ts` 是唯一
+  执行这些删除语句的模块，`src/bot-removal.ts` 是唯一的一遍回收，`src/bot-purge.ts` 是离线入口，
+  `src/service-lock.ts` 是单写者判定。现行契约与限制写在
+  [契约与生命周期](../../contracts-and-lifecycle.md) 的「Bot 删除与重置」；临时规格
+  `docs/spec-20261107-zero-setup-bot-runtime-deletion.md` 第 10 节逐项标注了覆盖证据与未覆盖项
+  （按文档约定，该 spec 在功能开发完成后删除，长期结论与缺陷由本节与契约文档承载；上表与本节引用的
+  文件名保留为历史标识）。
+- **验证**（本地，2026-11-08）：`npm run check`、`npm run build` 退出 0；`npm test` 406 项、390 通过、
+  **0 失败**、16 项 POSIX／root 专属跳过。新增 `test/conversation-purge.test.ts`（9 项）与
+  `test/bot-deletion.test.ts`（9 项）：前者用真实底座行重开存储断言作用域与 id 水位，用构造行锁住
+  版本闸门、两个拒绝分支与行数上限；后者经真实 HTTP 路由与真实服务组合覆盖墓碑／重置、四类 409、
+  退役 id、`purge: "now"`、重复请求幂等与离线入口（以**子进程**运行真实命令）。**部署验收未执行**，
+  本节不把它记为已通过。
+- **对决策 9 / 11 的细化（实现时确定，与规格 §3.1 表格的差异）**：
+  1. 非终态工作与"终态但结局未知"是两个错误码：`work_in_flight`（带 `tasks`／`submissions` 计数，
+     `force` 不放行——"先去取消再重试"是可行动的下一步，合成一个码会让这条动作失去名字）与
+     `unknown_outcome`（带 `records` 计数，`force` 放行）。判定谓词按 1.3.0 的真实记录固定：
+     `tasks.status <> 'terminal'` 与 `submissions.status IN ('queued','placed')` 为在途；
+     `terminal` 且 `outcome.status <> 'completed'`、以及 `unanswered` 为结局未知。
+  2. 补入 `fork_survivor`：删掉被其它会话继承的历史会让继承者读不出来，因此默认拒绝、`force` 时
+     连同继承者一并删除。当前部署不产生分叉，但这一条在接缝处必须是显式拒绝。
+  3. `agent.sqlite` 的行与 `inbox.sqlite` 中该 Bot 的请求行**都在回收 pass 里删除**，不在请求时删除：
+     墓碑即时生效，而 `inbox.text` 是用户正文，属于被擦除的内容，物理上留到下一个进程边界。
+     响应文案因此必须承认"用户视角已移除、回收另有其时点"。
+  4. 每会话的 purge 报告不再携带 vacuum 字段；`VACUUM` 由 pass 拥有（确有删除时执行一次，位于删除
+     之后、`openAgent()` 之前），因为 `VACUUM` 需独占且不能在事务内。
+  5. 版本闸门是**精确的列集合**匹配：缺列与多列都拒绝。多一列意味着底座比本实现新（或库被迁移过），
+     而下面的谓词照样会运行——那正是闸门要挡的情况。库不匹配时删除被拒绝，服务照常启动。
+  6. 事件流路由在打开流之前做一次可寻址检查：流会先写出 200 头，否则墓碑 Bot 只能得到"200 + 错误帧"
+     而不是规格 §3.2 要求的 `410 bot_deleted`。
+- **相关缺陷**（本轮实现暴露、未修，全部记入契约文档的「已知限制」）：
+  1. 失败的删除没有控制台读出口：`views()` 过滤 `status = 'deleted'`，运维只能从部署日志
+     `Bot removal failed: <botId> (<CODE>)` 与 `inbox.sqlite.removalError` 查因，`/api/platform`
+     只给 `pendingPurge` 数量。
+  2. 锁的同 pid 接管规则（为测试内嵌两次 start 而设）使**同一进程内**调用 `purgeBots()` 时不会拒绝
+     正在运行的服务。发布的离线入口是独立进程，因此生产路径安全，但进程内调用不是受支持的用法；
+     没有选择在该处加判定，是因为"锁的 pid 等于自己"无法区分"本进程的服务持有"与"崩溃后被复用的
+     pid"，加判定会把罕见的 pid 复用变成一个没有 `--force` 出口的死锁。
+  3. 控制台与 `BotManager` 的日志走 `console.error`（进程 stderr），不经过宿主可注入的 `log`，
+     嵌入宿主无法从自己的 sink 拿到删除日志行（本次测试因此改为断言"宿主确实下线"而不是日志文本）。
+  4. 崩溃窗口（`agent.sqlite` 已删、`inbox.sqlite` 未删）只由"pass 可重跑且收敛"覆盖，没有做进程级
+     中断测试；`VACUUM` 的体积变化与 `integrity_check` 也没有断言。
+- **仍未验证**：容器重启策略拉起自重启、Docker 卷上的 `VACUUM` 行为、真实模型供应商下的端到端删除，
+  以及临时规格第 10 节标为 `[~]`／`[ ]` 的条目（进程级中断、`deliveries`／`failures` 历史行、工具目录
+  与 pin 的逐项对比、日志逐字断言）。

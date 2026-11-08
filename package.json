@@ -16,6 +16,7 @@
     "release:preflight": "tsx src/release-preflight.ts",
     "deployment:environment": "node dist/src/deployment-environment-check.js",
     "deployment:volume-preflight": "node dist/src/deployment-volume-preflight.js",
+    "bots:purge": "node --env-file-if-exists=.env dist/src/bot-purge.js",
     "mcp:auth": "node --env-file-if-exists=.env dist/src/mcp-auth.js",
     "mcp:check": "node --env-file-if-exists=.env dist/src/mcp-check.js",
     "execution:broker": "node --env-file-if-exists=.env dist/src/execution/broker-main.js",

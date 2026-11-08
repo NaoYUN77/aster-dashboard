@@ -9,8 +9,15 @@
 // external abort signal and a log sink. Nothing else is injectable: every path is derived from
 // DATA_DIR, and every model, tool and directory a bot may use is decided by the host.
 //
+// Removal: this process holds `DATA_DIR/service.lock` for as long as it runs, which is what makes
+// "am I the only writer?" answerable rather than a guess. Between taking that lock and opening the
+// agent it runs one bounded removal pass over the bots whose deletion was already accepted — the only
+// point at which the conversation store may be rewritten, because the harness keeps every
+// conversation open for the life of the process and the reclaim needs exclusive access.
+//
 // Errors: a configuration or startup failure rejects before the handle exists, after releasing
-// whatever had been opened. A failure of the request loop rejects `done` after cleanup.
+// whatever had been opened. A failure of the request loop rejects `done` after cleanup. A removal
+// that fails does neither: the intent stays pending, the reason is logged, and the service starts.
 
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -18,14 +25,17 @@ import { fileURLToPath } from "node:url";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { openAgent } from "./agent.js";
 import { BotManager } from "./bot-manager.js";
+import { runPendingRemovals } from "./bot-removal.js";
 import { ConfigurationError, configureEnvProxy, readConfig, readLegacyCatalogEnabled, readMemoryConfig } from "./config.js";
 import { startConsole, type ConsoleHandle } from "./console.js";
+import { openConversationPurger, type SqliteConversationPurger } from "./conversation-purge.js";
 import { failureCode, StateError } from "./errors.js";
 import { Inbox } from "./inbox.js";
 import {
   buildPlatformCapabilities, buildProvisioningRuntime,
   localWorkspaceCheck, verifiedRemoteWorkspaceCheck,
 } from "./platform-runtime.js";
+import { acquireServiceLock, type ServiceLock } from "./service-lock.js";
 import { startTrace, type TraceRuntime } from "./trace.js";
 
 export type ServiceConfig = ReturnType<typeof readConfig>;
@@ -67,6 +77,8 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
   const signal = stop.signal;
 
   let trace: TraceRuntime | undefined;
+  let serviceLock: ServiceLock | undefined;
+  let purger: SqliteConversationPurger | undefined;
   let inbox: Inbox | undefined;
   let agent: OpenServiceAgent | undefined;
   let bots: BotManager | undefined;
@@ -81,8 +93,12 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       // The console accepts no new work while the workers and the agent stop.
       await consoleHandle?.close().catch(() => undefined);
       await bots?.close().catch(() => undefined);
+      // The harness closes before the store does: the purger holds the same file the agent writes.
       await agent?.close().catch(() => undefined);
+      purger?.close();
       inbox?.close();
+      // The lock goes last: a second process must not be able to start while these are still closing.
+      serviceLock?.release();
       options.signal?.removeEventListener("abort", forward);
       await trace?.close().catch(() => undefined);
     })();
@@ -101,10 +117,30 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
     if (config.execution === undefined) {
       await mkdir(join(config.dataDir, "workspace"), { recursive: true, mode: 0o700 });
     }
+    // One writer per data directory. The lock is claimed before any store is opened and released
+    // last, so the offline removal command can tell a stopped service from a running one instead of
+    // guessing at the database's writability.
+    serviceLock = acquireServiceLock(config.dataDir);
     inbox = new Inbox(join(config.dataDir, "inbox.sqlite"));
     const inboxDb = inbox;
     // The console is the only ingress. Existing Telegram-era tables and their rows are kept as
     // they are: no polling checkpoint, bot identity or delivery state is read or rewritten here.
+
+    // The one window in which a bot's rows may be removed: the harness keeps every conversation open
+    // for the life of the process, so this has to happen before `openAgent()` and must never be
+    // added to the running path. The tombstone is the durable intent, and a pass that fails leaves it
+    // in place, reports why and keeps the deployment starting.
+    try {
+      purger = openConversationPurger(join(config.dataDir, "agent.sqlite"));
+    } catch (error) {
+      // A store whose layout this build does not recognize refuses removals rather than guessing at
+      // it. That is a reason to refuse deletion, never a reason to refuse to start.
+      log(`Conversation removal is unavailable: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+    if (purger !== undefined) {
+      const pass = runPendingRemovals({ store: inboxDb, purger, log });
+      if (pass.vacuumError !== null) log(`Reclaiming space did not complete: ${pass.vacuumError}`);
+    }
 
     // Host-verified deployment facts become one frozen manifest. The integration extension must
     // exist before openAgent(), so it joins the governed registry before the harness opens.
@@ -154,6 +190,8 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
       // DATA_DIR per user; the column and the workspace subtree keep the seam explicit.
       userId: "owner",
       ...(legacy ? { allowLegacyCatalog: true } : {}),
+      // The console can only accept a removal the host can carry out; without the seam it refuses.
+      ...(purger === undefined ? {} : { purger }),
       signal,
       log: console.error,
     });
@@ -166,6 +204,10 @@ export async function startService(options: ServiceOptions = {}): Promise<Servic
         signal,
         log: console.error,
         ...(legacy ? { allowLegacyCatalog: true } : {}),
+        // A removal that asked to reclaim now exits through the same graceful path as SIGTERM, from
+        // inside this process: the console writes and flushes its answer first, and the container's
+        // restart policy brings the service back to run the pass above.
+        onRequestShutdown: () => { void shutdown(); },
       });
       log(
         config.console.token === null
