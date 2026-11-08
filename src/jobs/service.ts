@@ -208,7 +208,7 @@ export class BackgroundJobs {
       this.#terminate(row, outcome, "the durable task settled while the row was still live");
     }
     if (rows.length > 0) {
-      this.#log(`Background jobs: reconciled ${rows.length} live row(s) (${linked} linked, ${finished} finished, ${anomalies} unreadable)`);
+      this.#log(`Background jobs: reconciled ${rows.length} live row(s) (${linked} linked, ${finished} finished, ${anomalies} anomalous)`);
     }
     return Object.freeze({ rows: rows.length, linked, finished, anomalies });
   }

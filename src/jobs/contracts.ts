@@ -12,8 +12,15 @@ export const JOB_COMMAND_MAX_CHARS = 4_000;
 export const JOB_OUTPUT_TAIL_BYTES = 4_096;
 /** Bound on the stored notice; the tail above already bounds the body. */
 export const JOB_NOTICE_MAX_CHARS = 2_000;
-/** How many jobs one bot may have unfinished at once. Dispatched work is real resource use. */
-export const JOB_LIVE_LIMIT = 4;
+/**
+ * How many jobs one bot may have unfinished at once (ADR-0024 decision 10). Dispatched work is real
+ * resource use: the shared execution host has four concurrent slots, and a job holds one of them for
+ * as long as it runs. One per bot is what keeps the request path usable while a job runs — the point
+ * of the feature is that the next message is answered, and a second live job from the same bot could
+ * take the slots a foreground command needs. A refusal names what is already live so the caller can
+ * cancel it instead of retrying blindly.
+ */
+export const JOB_LIVE_LIMIT = 1;
 /** Characters of a command quoted in a one-line listing or a notice heading. */
 export const JOB_COMMAND_DISPLAY_CHARS = 200;
 /** Registered name of the durable task one job runs under. */
