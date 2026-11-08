@@ -58,7 +58,7 @@
 
 - 相关 spec：`docs/spec-20261108-background-jobs.md`
 - 决策与取舍：见上。两处演变记在这里：完成通知最初定为"后台 reporter 以 follow-up input 回投、由模型用自己的话回报"，同日在实现前改为**宿主直接落确定性通知**——理由是通知渠道已限定在控制台内，未读徽标本身即完成"提醒"，而模型开口需要一条无请求的生成路径及其边界；模型用自己的话说明结果挪到下一次交互，事实由查询工具提供。另一次是并发上限的显式化：共享执行主机的 `EXECUTION_AGENT_MAX_CONCURRENT` 由 3 提到 4，与代码默认值一致，作业占 1 个槽位、前台留 3 个；`busy` 结果是 `not_started`，重试安全，但仍须在工具错误里与执行失败区分。
-- 相关缺陷：尚未发现。
+- 相关缺陷：**作业目录在远端执行面上 100% 建立失败（`JOB_WORKDIR`）**，见下。该缺陷在 2026-11-08 上线当天被上一条缺陷遮住（工具名里的点号让每个 bot 的每个请求都在模型运行前被 400 拒掉，作业工具从未真正被调用过），同日修复。
 - 实现期决策（与上文一并生效）：
   - **作业任务的每一条终态都提交 `completed`**，作业自己的终态（`done` / `failed` / `canceled` / `unknown`）放在 `result` 里。原因在删除门禁：`src/conversation-purge.ts` 的 `unknownOutcomes` 统计的是"终态任务里 outcome 不为 completed"的记录，若作业按业务结果提交 `failed`，每一个跑完的作业都会变成"无法解释的工作"，删 bot 必须 `force`。作业的成败是作业层的事实，不是底座任务执行的成败。
   - **重启只续跑尚未开始执行的作业。** 任务的 `execute` 阶段首行判断 `attempts`：大于 0 说明这条命令已经被交给过执行环境，进程被杀时它可能已产生副作用，重放不安全，因此提交 `unknown` + `JOB_INTERRUPTED`，并在通知与索引里如实保留。没有断点续跑语义的命令（`curl -C -`、`rsync --partial`）不因此变得安全，续跑留给后续 spec。
@@ -66,3 +66,4 @@
   - **命令时长上限按传输实际接受值派生。** 取 `EXECUTION_MAX_TIMEOUT_SECONDS` 会与线路封顶打架：RPC 直连的 `#maxTimeoutMs` 是 `min(配置值 × 1000, 3,540,000)`，默认配置 3600 s 正好超过它，请求会在命令启动前被判 `timeout`。因此 `jobTimeoutSeconds()` 复用环境自己的派生（`rpcMaxTimeoutSeconds`），本地部署无传输可派生，用 `JOB_LOCAL_TIMEOUT_SECONDS = 3600`。
   - **控制台如何"提醒"。** 通知是宿主写的确定文本，落在通知表；控制台的三个面都读它：bot 列表与对话头的未读数、作业面板（完整记录 + 标为已读）、时间线末尾的未读通知文本。作业完成不产生任何会话事件，所以 SSE 流在心跳里顺带读一次作业索引，变了才推一帧 `{type:"jobs"}`；页面只在时间线空闲时重绘，避免打断正在流式输出的回复。
   - **`job.*` 工具归入 `shell` 能力组。** 一个不能在请求内跑命令的 profile，也不该能把命令派发到请求之外。
+  - **作业目录由 shell 建立，不走环境的文件接口。** 远端两个传输面只实现模型自身 `read`/`write`/`edit` 需要的文件原语，`createDir` 一律 `not_supported`（`src/execution/remote-files.ts`、`remote-env.ts`），而 `exec` 在每个传输上都是完整的 shell——所以最初那行 `env.createDir(...)` 是在向一个明确不提供该原语的接口提问，两个远端传输下必然拿到 `not_supported`，作业在命令启动前就以 `JOB_WORKDIR` 收尾。改为 POSIX 工作区用 `mkdir -p -- '<目录>'` 建立（整词单引号，幂等，崩溃后无需回滚）；工作目录不是 POSIX 路径时（本地 Node 环境在 Windows 上）不猜那个 shell 的拼法，改用环境自己的 `createDir`，它也被拒绝时以 `JOB_WORKDIR` 收尾，不静默建到别处。这条同时暴露了测试盲点：作业的假环境曾把 `createDir` 打桩为成功，且 `RemoteRpcExecutionEnv` 与 `remote-files.ts` 此前没有任何测试引用。
